@@ -1,4 +1,4 @@
-FROM ollama/ollama:latest
+FROM alpine/ollama:latest
 
 # OpenShift runs containers as an arbitrary non-root UID with no /etc/passwd entry,
 # so HOME defaults to /. Set HOME to /tmp (always writable) for runtime key generation,
@@ -10,7 +10,7 @@ RUN mkdir -p /models && chmod 777 /models && \
     mkdir -p /tmp/.ollama && chmod 777 /tmp/.ollama
 
 # Pre-pull the model at build time
-RUN ollama serve & sleep 5 && ollama pull gemma:2b
+RUN ollama serve & sleep 5 && ollama pull gemma3:1b
 
 # Expose API port
 EXPOSE 11434

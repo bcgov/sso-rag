@@ -27,3 +27,16 @@ curl http://localhost:11434/api/generate -d '{
 ## Hardware
 
 Gemma 2B recommends [8GB Ram](https://github.com/google-deepmind/gemma#system-requirements). There is not a listed CPU requirement, but from usage it is very CPU thirsty, e.g. firing a request spikes it to 8 CPU usage. The image currently requests 2 CPU and has no limit set (as recommended by platform-services), so that it can handle those spikes. Under more frequent usage we would need to increase the requests to guarantee stability.
+
+You can test CPU perfermance based on threads used with the options parameter:
+
+``` bash
+curl http://localhost:11434/api/generate -d '{
+  "model": "gemma:2b",
+  "prompt": "What is OIDC?",
+  "stream": false,
+  "options":{
+    "num_thread": 4
+   }
+}'
+```
