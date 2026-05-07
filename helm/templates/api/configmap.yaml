@@ -1,0 +1,12 @@
+# ConfigMap holding non-sensitive environment variables for the API pods.
+# Sensitive values (DATABASE_URL) are injected from a Secret instead.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "sso-rag.fullname" . }}-api
+  labels:
+    {{- include "sso-rag.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+data:
+  # Points the API at the in-cluster Ollama service.
+  OLLAMA_BASE_URL: "http://{{ include "sso-rag.fullname" . }}-ollama:11434"

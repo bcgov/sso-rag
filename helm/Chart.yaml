@@ -1,6 +1,16 @@
 apiVersion: v2
-name: ollama
-description: Ollama with Gemma 2b model
+name: sso-rag
+description: RAG system with PostgreSQL (Patroni), Ollama inference server, and FastAPI
 type: application
 version: 0.1.0
-appVersion: "0.22.1"
+appVersion: "1.0.0"
+
+dependencies:
+  # Zalando Patroni chart provides HA PostgreSQL with pgvector support.
+  # Disable when supplying an external PostgreSQL cluster (set patroni.enabled=false).
+  - name: patroni
+    version: "1.6.1"
+    repository: "https://bcgov.github.io/sso-helm-charts"
+  - name: ollama
+    version: "0.1.0"    
+    repository: "https://bcgov.github.io/sso-helm-charts"

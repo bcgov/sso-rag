@@ -1,0 +1,9 @@
+dependencies:
+- name: patroni
+  repository: https://bcgov.github.io/sso-helm-charts
+  version: 1.6.1
+- name: ollama
+  repository: https://bcgov.github.io/sso-helm-charts
+  version: 0.1.0
+digest: sha256:f1081ec536559f6a419f01b0cb1970fc28b5315e3af4c01739da2fc490c91336
+generated: "2026-05-07T14:34:14.251445377-07:00"

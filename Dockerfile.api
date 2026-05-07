@@ -1,0 +1,25 @@
+FROM python:3.12-slim
+
+# Install system deps needed by psycopg2-binary
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies first to leverage Docker layer cache
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application source
+COPY parser.py api.py ./
+
+# Allow the random OpenShift UID (always in root group) to write to /app
+RUN chmod g+rwx /app
+
+EXPOSE 8000
+
+USER 1001
+
+# Use exec form so signals propagate correctly to uvicorn
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]

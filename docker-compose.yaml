@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: ghcr.io/zalando/spilo-18:4.1-p2
+    # Spilo runs internally as the 'postgres' user (UID 101, GID 101).
+    # Setting user here ensures the process matches the volume ownership so
+    # Patroni can write to /home/postgres/pgdata/data without a PermissionError.
+    user: "101:101"
+    ports:
+      - "5432:5432"
+    environment:
+      PGPASSWORD_SUPERUSER: postgres
+      PGUSER_SUPERUSER: postgres
+      PGDATA: /home/postgres/pgdata/data
+      SCOPE: local
+      PGVERSION: "14"
+    volumes:
+      - pgdata:/home/postgres/pgdata
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - rag_network
+
+  db-init:
+    image: postgres:18-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    volumes:
+      - ./init.sql:/init.sql:ro
+    command: psql -f /init.sql
+    restart: "no"
+    networks:
+      - rag_network
+
+  ollama:
+    image: ghcr.io/bcgov/sso-rag:v1.0.0-beta8
+    ports:
+      - "11434:11434"
+    environment:
+      OLLAMA_HOST: "0.0.0.0"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - rag_network
+
+volumes:
+  # tmpfs driver ensures the volume is created fresh with UID 101:101 ownership,
+  # avoiding the root-owned named-volume PermissionError for Spilo/Patroni.
+  # For a persistent dev environment swap this for a bind mount with
+  # `chown 101:101` applied to the host directory beforehand.
+  pgdata:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+  ollama_data:
+
+networks:
+  rag_network:
+    driver: bridge

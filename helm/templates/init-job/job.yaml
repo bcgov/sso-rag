@@ -1,0 +1,69 @@
+# Helm hook Job – runs after every install/upgrade to apply init.sql.
+# Uses before-hook-creation delete policy so re-runs are idempotent
+# (the SQL itself is written with IF NOT EXISTS throughout).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "sso-rag.fullname" . }}-init-db
+  labels:
+    {{- include "sso-rag.labels" . | nindent 4 }}
+    app.kubernetes.io/component: init-db
+  annotations:
+    # Run after all chart resources (including Patroni) have been applied.
+    "helm.sh/hook": post-install,post-upgrade
+    # Delete any previous instance before creating a new one so the job name
+    # does not collide across upgrades.
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  # Retain the completed job for debugging; garbage-collect after 1 hour.
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        {{- include "sso-rag.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: init-db
+    spec:
+      restartPolicy: OnFailure
+
+      # ── Init container: block until PostgreSQL accepts connections ────────
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "Waiting for PostgreSQL to be ready..."
+              until psql "$DATABASE_URL" -c "SELECT 1" > /dev/null 2>&1; do
+                echo "Waiting for database..."
+                sleep 2
+              done
+              echo "PostgreSQL is ready."
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.secretName }}
+                  key: {{ .Values.database.urlKey }}
+
+      # ── Main container: apply init.sql ────────────────────────────────────
+      containers:
+        - name: db-init
+          image: postgres:16-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - "psql $DATABASE_URL -f /sql/init.sql"
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.secretName }}
+                  key: {{ .Values.database.urlKey }}
+          volumeMounts:
+            - name: sql-scripts
+              mountPath: /sql
+              readOnly: true
+
+      volumes:
+        - name: sql-scripts
+          configMap:
+            name: {{ include "sso-rag.fullname" . }}-init-sql

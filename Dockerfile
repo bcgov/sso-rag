@@ -10,7 +10,7 @@ RUN mkdir -p /models && chmod 777 /models && \
     mkdir -p /tmp/.ollama && chmod 777 /tmp/.ollama
 
 # Pre-pull the model at build time
-RUN ollama serve & sleep 5 && ollama pull gemma3:1b
+RUN ollama serve & sleep 5 && ollama pull gemma3:1b && ollama pull nomic-embed-text
 
 # Expose API port
 EXPOSE 11434

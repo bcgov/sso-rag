@@ -1,19 +1,59 @@
-image:
-  repository: ghcr.io/bcgov/sso-rag
-  tag: v1.0.0-beta7
-  pullPolicy: IfNotPresent
+# ────────────────────────────────────────────────────────────────────────────
+# sso-rag Helm chart – default values
+# Override any of these with -f myvalues.yaml or --set key=value
+# ────────────────────────────────────────────────────────────────────────────
 
-replicaCount: 1
+# ── API (FastAPI) ─────────────────────────────────────────────────────────
+api:
+  image:
+    repository: ghcr.io/bcgov/sso-rag-api
+    tag: "v1.0.0-beta2"
+    pullPolicy: IfNotPresent
 
-service:
-  type: ClusterIP
-  port: 11434
+  # Number of API replicas. The API is stateless so horizontal scaling is safe.
+  replicas: 1
 
-resources:
-  requests:
-    cpu: "2"
-    memory: "8Gi"
-  limits:
-    cpu: "4"
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "250Mi"
 
-podAnnotations: {}
+# ── Ollama inference server ───────────────────────────────────────────────
+ollama:
+  image:
+    repository: ghcr.io/bcgov/sso-rag
+    tag: "v1.0.0-beta8"
+    pullPolicy: IfNotPresent
+
+  # Keep at 1; model shards cannot be split across replicas without additional tooling.
+  replicas: 1
+
+  resources:
+    requests:
+      cpu: "2"
+      memory: "8Gi"
+    limits:
+      cpu: "4"
+      memory: "16Gi"
+
+# ── Database credentials ──────────────────────────────────────────────────
+# The chart expects a Kubernetes Secret to exist (or be created externally)
+# that contains the following key (name is configurable below):
+#
+#   DATABASE_URL  – full PostgreSQL DSN used by both the API and the init job
+#
+# When patroni.enabled=true the Patroni sub-chart creates credentials; you
+# must still create the above Secret and populate it from those credentials
+# (e.g. via an ExternalSecret or a post-install hook).
+database:
+  secretName: "sso-rag-db-credentials"
+  urlKey: "DATABASE_URL"
+
+# ── Patroni (sub-chart) ───────────────────────────────────────────────────
+# Set enabled=false to use an external PostgreSQL cluster.
+patroni:
+  image:
+    repository: ghcr.io/zalando/spilo-18
+    tag: "4.1-p2"
+  postgresMajorVersion: "18"
+  replicaCount: 1
