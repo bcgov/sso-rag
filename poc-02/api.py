@@ -16,6 +16,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 from botocore.config import Config
@@ -76,6 +77,8 @@ class Settings(BaseSettings):
 
 
 settings = Settings()  # type: ignore[call-arg]
+
+_executor = ThreadPoolExecutor(max_workers=50, thread_name_prefix="bedrock-stream")
 
 
 # ---------------------------------------------------------------------------
@@ -329,12 +332,12 @@ async def _stream_bedrock_response(query: str) -> AsyncGenerator[str, None]:
         # boto3 stream iteration is synchronous and blocks the event loop.
         # Run each `next()` call in a thread so ASGI can flush each yielded
         # chunk to the client immediately rather than buffering the whole response.
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         sync_iter = iter(stream)
 
         while True:
             try:
-                event = await loop.run_in_executor(None, next, sync_iter)
+                event = await loop.run_in_executor(_executor, next, sync_iter)
             except StopIteration:
                 break
 
