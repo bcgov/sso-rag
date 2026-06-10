@@ -7,11 +7,20 @@ resource "aws_security_group" "alb" {
   vpc_id      = data.aws_vpc.selected.id
 
   ingress {
-    description = "HTTP from VPC"
+    description = "HTTP from VPC (covers VPC Link ENI traffic)"
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = [var.vpc_cidr]
+    cidr_blocks = [data.aws_vpc.selected.cidr_block]
+  }
+
+  # Self-referencing rule: allows VPC Link ENIs (which share this SG) to reach the ALB
+  ingress {
+    description = "HTTP from VPC Link ENIs (same SG)"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    self        = true
   }
 
   egress {
