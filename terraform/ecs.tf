@@ -80,7 +80,7 @@ resource "aws_ecs_task_definition" "api" {
       readonlyRootFilesystem = false
 
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+        command     = ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
         interval    = 30
         timeout     = 10
         retries     = 3
