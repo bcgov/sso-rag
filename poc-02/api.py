@@ -132,6 +132,13 @@ def get_bedrock_runtime_client() -> boto3.client:
         logger.info("Bedrock agent-runtime client initialised (region=%s)", settings.aws_region)
     return _bedrock_client_runtime
 
+def get_executor() -> ThreadPoolExecutor:
+    """Return the global thread pool executor (created in lifespan startup)."""
+    global _executor
+    if _executor is None:
+        raise RuntimeError("Executor not initialized – app may not be fully started")
+    return _executor
+
 def get_knowledge_base_data_sources() -> list[dict]:
     """Helper function to list data sources for a given knowledge base."""
     client = get_bedrock_client()
@@ -174,10 +181,45 @@ def delete_knowledge_base_documents() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    logger.info("Starting up – pre-warming Bedrock client …")
-    get_bedrock_runtime_client()
+    """Startup and shutdown hooks for the FastAPI application."""
+    global _executor
+    
+    logger.info("Starting up – initializing resources …")
+    
+    # Initialize ThreadPoolExecutor
+    _executor = ThreadPoolExecutor(
+        max_workers=20,
+        thread_name_prefix="bedrock-stream",
+    )
+    logger.info("ThreadPoolExecutor initialized with 20 workers")
+    
+    # Pre-warm Bedrock clients
+    try:
+        get_bedrock_runtime_client()
+        get_bedrock_client()
+        logger.info("Bedrock clients pre-warmed successfully")
+    except Exception as exc:
+        logger.exception("Failed to initialize Bedrock clients: %s", exc)
+        if _executor:
+            _executor.shutdown(wait=True)
+        raise
+    
     yield
-    logger.info("Shutting down.")
+    
+    # Shutdown
+    logger.info("Shutting down – cleaning up resources …")
+    
+    # Close AWS clients (boto3 will handle connection cleanup)
+    global _bedrock_client, _bedrock_client_runtime
+    _bedrock_client = None
+    _bedrock_client_runtime = None
+    
+    # Shutdown executor gracefully
+    if _executor:
+        _executor.shutdown(wait=True, timeout=10)
+        logger.info("ThreadPoolExecutor shut down successfully")
+    
+    logger.info("Shutdown complete")
 
 
 # ---------------------------------------------------------------------------
@@ -387,11 +429,12 @@ async def _stream_bedrock_response(query: str) -> AsyncGenerator[str, None]:
         # Run each `next()` call in a thread so ASGI can flush each yielded
         # chunk to the client immediately rather than buffering the whole response.
         loop = asyncio.get_running_loop()
+        executor = get_executor()
         sync_iter = iter(stream)
 
         while True:
             try:
-                event = await loop.run_in_executor(_executor, next, sync_iter)
+                event = await loop.run_in_executor(executor, next, sync_iter)
             except StopIteration:
                 break
 
