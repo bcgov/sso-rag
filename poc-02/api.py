@@ -216,7 +216,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     
     # Shutdown executor gracefully
     if _executor:
-        _executor.shutdown(wait=True, timeout=10)
+        _executor.shutdown(wait=True)
         logger.info("ThreadPoolExecutor shut down successfully")
     
     logger.info("Shutdown complete")
