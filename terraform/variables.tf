@@ -1,3 +1,15 @@
+variable "web_subnet_a" {
+  type        = string
+  description = "Value of the name tag for the web subnet in AZ a"
+  default     = "Dev-Web-MainTgwAttach-A"
+}
+
+variable "web_subnet_b" {
+  type        = string
+  description = "Value of the name tag for the web subnet in AZ b"
+  default     = "Dev-Web-MainTgwAttach-B"
+}
+
 variable "subnet_a" {
   type        = string
   description = "Value of the name tag for the app subnet in AZ a"

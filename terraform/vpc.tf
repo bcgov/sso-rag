@@ -17,3 +17,17 @@ data "aws_subnet" "subnet_b" {
     values = [var.subnet_b]
   }
 }
+
+data "aws_subnet" "web_subnet_a" {
+  filter {
+    name   = "tag:Name"
+    values = [var.web_subnet_a]
+  }
+}
+
+data "aws_subnet" "web_subnet_b" {
+  filter {
+    name   = "tag:Name"
+    values = [var.web_subnet_b]
+  }
+}

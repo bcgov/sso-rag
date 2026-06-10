@@ -150,7 +150,7 @@ resource "aws_ecs_service" "api" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = [data.aws_subnet.subnet_a.id, data.aws_subnet.subnet_b.id]
+    subnets          = [data.aws_subnet.web_subnet_a.id, data.aws_subnet.web_subnet_b.id]
     security_groups  = [aws_security_group.api.id]
     assign_public_ip = false
   }
@@ -181,7 +181,7 @@ resource "aws_ecs_service" "ui" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = [data.aws_subnet.subnet_a.id, data.aws_subnet.subnet_b.id]
+    subnets          = [data.aws_subnet.web_subnet_a.id, data.aws_subnet.web_subnet_b.id]
     security_groups  = [aws_security_group.ui.id]
     assign_public_ip = false
   }
