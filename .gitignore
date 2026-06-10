@@ -66,3 +66,4 @@ test_*.md
 Thumbs.db
 desktop.ini
 node_modules/
+**.tfvars

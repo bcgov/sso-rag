@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -85,19 +85,12 @@ _executor = ThreadPoolExecutor(max_workers=50, thread_name_prefix="bedrock-strea
 # AWS Bedrock client (singleton, created once at startup)
 # ---------------------------------------------------------------------------
 
+_bedrock_client_runtime: boto3.client | None = None
+
 _bedrock_client: boto3.client | None = None
 
-
 def get_bedrock_client() -> boto3.client:
-    """Return a cached bedrock-agent-runtime client.
-
-    boto3 uses the standard credential provider chain:
-      1. Environment variables (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN)
-      2. AWS config file (~/.aws/credentials)
-      3. IAM instance role / ECS task role / EKS service account (IRSA)
-
-    No credentials are ever stored in this file.
-    """
+    """Return a cached bedrock client."""
     global _bedrock_client
     if _bedrock_client is None:
         boto_config = Config(
@@ -107,12 +100,73 @@ def get_bedrock_client() -> boto3.client:
             read_timeout=60,
         )
         _bedrock_client = boto3.client(
+            "bedrock-agent",
+            config=boto_config,
+        )
+        logger.info("Bedrock client initialised (region=%s)", settings.aws_region)
+    return _bedrock_client
+
+
+def get_bedrock_runtime_client() -> boto3.client:
+    """Return a cached bedrock-agent-runtime client.
+
+    boto3 uses the standard credential provider chain:
+      1. Environment variables (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN)
+      2. AWS config file (~/.aws/credentials)
+      3. IAM instance role / ECS task role / EKS service account (IRSA)
+
+    No credentials are ever stored in this file.
+    """
+    global _bedrock_client_runtime
+    if _bedrock_client_runtime is None:
+        boto_config = Config(
+            region_name=settings.aws_region,
+            retries={"max_attempts": 3, "mode": "adaptive"},
+            connect_timeout=10,
+            read_timeout=60,
+        )
+        _bedrock_client_runtime = boto3.client(
             "bedrock-agent-runtime",
             config=boto_config,
         )
         logger.info("Bedrock agent-runtime client initialised (region=%s)", settings.aws_region)
-    return _bedrock_client
+    return _bedrock_client_runtime
 
+def get_knowledge_base_data_sources() -> list[dict]:
+    """Helper function to list data sources for a given knowledge base."""
+    client = get_bedrock_client()
+    knowledge_base_id = settings.knowledge_base_id
+    response = client.list_data_sources(knowledgeBaseId=knowledge_base_id)
+    return response.get("dataSourceSummaries", [])
+
+def get_knowledge_base_documents() -> list[dict]:
+    """Helper function to list documents for a given knowledge base data source."""
+    client = get_bedrock_client()
+    knowledge_base_id = settings.knowledge_base_id
+    data_sources = get_knowledge_base_data_sources()
+    if not data_sources:
+        return []
+    data_source_id = data_sources[0]["dataSourceId"]
+    response = client.list_knowledge_base_documents(knowledgeBaseId=knowledge_base_id, dataSourceId=data_source_id)
+    logger.info("Documents in knowledge base %s, data source %s: %s", knowledge_base_id, data_source_id, response)
+    return response.get("documentDetails", [])
+
+def delete_knowledge_base_documents() -> None:
+    """Helper function to delete all documents from the knowledge base data source."""
+    client = get_bedrock_client()
+    knowledge_base_id = settings.knowledge_base_id
+    if len(get_knowledge_base_data_sources()) == 0:
+        logger.info("No data sources found in knowledge base %s – skipping document cleanup", knowledge_base_id)
+        return
+    documents = get_knowledge_base_documents()
+    if len(documents) != 0:
+        client.delete_knowledge_base_documents(knowledgeBaseId=knowledge_base_id, dataSourceId=get_knowledge_base_data_sources()[0]["dataSourceId"], documentIdentifiers=[{
+            "dataSourceType": doc["identifier"]["dataSourceType"],
+            "s3": {
+                "uri": doc["identifier"]["s3"]["uri"],
+            },
+        } for doc in documents])
+        
 
 # ---------------------------------------------------------------------------
 # Lifespan
@@ -121,7 +175,7 @@ def get_bedrock_client() -> boto3.client:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Starting up – pre-warming Bedrock client …")
-    get_bedrock_client()
+    get_bedrock_runtime_client()
     yield
     logger.info("Shutting down.")
 
@@ -296,7 +350,7 @@ async def _stream_bedrock_response(query: str) -> AsyncGenerator[str, None]:
     response_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
-    client = get_bedrock_client()
+    client = get_bedrock_runtime_client()
     rag_config = _build_retrieve_and_generate_config()
 
     try:
@@ -432,6 +486,24 @@ async def query(request: QueryRequest) -> StreamingResponse:
         },
     )
 
+@app.delete("/documents", tags=["Operations"])
+async def cleanup_docs(response: Response):
+    """Clean up S3 vector store and indexes"""
+    try:
+        delete_knowledge_base_documents()
+        response.status_code = status.HTTP_204_NO_CONTENT
+    except Exception as exc:
+        logger.exception("Error deleting documents: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error deleting knowledge base documents.",
+        ) from exc
+
+@app.get("/documents", tags=["Operations"])
+async def list_documents():
+    """List documents in the knowledge base."""
+    documents = get_knowledge_base_documents()
+    return {"documents": documents}
 
 # ---------------------------------------------------------------------------
 # Entrypoint (development only – use gunicorn+uvicorn workers in production)

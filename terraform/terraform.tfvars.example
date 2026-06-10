@@ -1,0 +1,12 @@
+# Copy this file to terraform.tfvars and fill in the required values.
+
+aws_region        = "ca-central-1"
+project_name      = "sso-rag"
+environment       = "sandbox"
+
+# Required — your Bedrock Knowledge Base ID
+knowledge_base_id = "REPLACE_WITH_YOUR_KNOWLEDGE_BASE_ID"
+
+# Optional — override with full ECR URI after first push
+# api_image = "123456789012.dkr.ecr.ca-central-1.amazonaws.com/sso-rag-dev-api:latest"
+# ui_image  = "123456789012.dkr.ecr.ca-central-1.amazonaws.com/sso-rag-dev-ui:latest"
