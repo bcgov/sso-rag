@@ -16,19 +16,20 @@ resource "aws_lb" "main" {
 # ── Target Groups ─────────────────────────────────────────────────────────────
 
 resource "aws_lb_target_group" "api" {
-  name        = "${local.name_prefix}-api-tg"
-  port        = 8000
-  protocol    = "HTTP"
-  vpc_id      = data.aws_vpc.selected.id
-  target_type = "ip"
+  name                          = "${local.name_prefix}-api-tg"
+  port                          = 8000
+  protocol                      = "HTTP"
+  vpc_id                        = data.aws_vpc.selected.id
+  target_type                   = "ip"
+  deregistration_delay          = 30
 
   health_check {
     enabled             = true
     path                = "/health"
     protocol            = "HTTP"
     matcher             = "200"
-    interval            = 30
-    timeout             = 10
+    interval            = 15
+    timeout             = 5
     healthy_threshold   = 2
     unhealthy_threshold = 3
   }
