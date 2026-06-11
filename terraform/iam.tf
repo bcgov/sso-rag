@@ -32,7 +32,7 @@ resource "aws_iam_role" "api_task" {
 
 data "aws_iam_policy_document" "api_bedrock" {
   statement {
-    sid    = "BedrockRetrieveAndGenerate"
+    sid    = "BedrockInvokeRetrieveRerankAndGenerate"
     effect = "Allow"
     actions = [
       "bedrock:RetrieveAndGenerate",
@@ -42,7 +42,7 @@ data "aws_iam_policy_document" "api_bedrock" {
       "bedrock:InvokeModel",
       "bedrock:Rerank"
     ]
-    resources = ["arn:aws:bedrock:${var.aws_region}:*:knowledge-base/${var.knowledge_base_id}"]
+    resources = ["arn:aws:bedrock:${var.aws_region}:*:knowledge-base/${var.knowledge_base_id}", var.model_arn, var.reranker_model_arn]
   }
 
   statement {
@@ -55,7 +55,7 @@ data "aws_iam_policy_document" "api_bedrock" {
       "bedrock:DeleteKnowledgeBaseDocuments",
     ]
     resources = [
-      "arn:aws:bedrock:${var.aws_region}:*:knowledge-base/${var.knowledge_base_id}",
+      "arn:aws:bedrock:${var.aws_region}:*:knowledge-base/${var.knowledge_base_id}", var.model_arn, var.reranker_model_arn
     ]
   }
 }
