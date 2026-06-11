@@ -36,9 +36,11 @@ data "aws_iam_policy_document" "api_bedrock" {
     effect = "Allow"
     actions = [
       "bedrock:RetrieveAndGenerate",
+      "bedrock:RetrieveAndGenerateStream",
       "bedrock:Retrieve",
       "bedrock:InvokeModelWithResponseStream",
       "bedrock:InvokeModel",
+      "bedrock:Rerank"
     ]
     resources = ["arn:aws:bedrock:${var.aws_region}:*:knowledge-base/${var.knowledge_base_id}"]
   }
@@ -49,6 +51,8 @@ data "aws_iam_policy_document" "api_bedrock" {
     actions = [
       "bedrock:GetKnowledgeBase",
       "bedrock:ListDataSources",
+      "bedrock:ListKnowledgeBaseDocuments",
+      "bedrock:DeleteKnowledgeBaseDocuments",
     ]
     resources = [
       "arn:aws:bedrock:${var.aws_region}:*:knowledge-base/${var.knowledge_base_id}",
