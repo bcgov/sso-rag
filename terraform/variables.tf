@@ -58,7 +58,19 @@ variable "knowledge_base_id" {
 variable "model_arn" {
   description = "ARN of the Bedrock foundation model used for RetrieveAndGenerate"
   type        = string
-  default     = "arn:aws:bedrock:ca-central-1::foundation-model/mistral.mistral-7b-instruct-v0:2"
+  default     = "arn:aws:bedrock:ca-central-1::foundation-model/meta.llama3-8b-instruct-v1:0"
+}
+
+variable "reranker_model_arn" {
+  description = "ARN of the Bedrock foundation model used for Reranking"
+  type        = string
+  default     = "arn:aws:bedrock:ca-central-1::foundation-model/amazon.rerank-v1:0"
+}
+
+variable "number_of_reranked_results" {
+  description = "Number of retrieved results to rerank in the API"
+  type        = number
+  default     = 5
 }
 
 # ── ECS ───────────────────────────────────────────────────────────────────────

@@ -64,7 +64,9 @@ resource "aws_ecs_task_definition" "api" {
       environment = [
         { name = "AWS_REGION", value = var.aws_region },
         { name = "KNOWLEDGE_BASE_ID", value = var.knowledge_base_id },
+        { name = "RERANKER_MODEL_ARN", value = var.reranker_model_arn },
         { name = "MODEL_ARN", value = var.model_arn },
+        { name = "NUMBER_OF_RERANKED_RESULTS", value = var.number_of_reranked_results },
       ]
 
       logConfiguration = {
