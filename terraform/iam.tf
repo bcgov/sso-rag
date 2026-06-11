@@ -40,23 +40,13 @@ data "aws_iam_policy_document" "api_bedrock" {
       "bedrock:Retrieve",
       "bedrock:InvokeModelWithResponseStream",
       "bedrock:InvokeModel",
-      "bedrock:Rerank"
-    ]
-    resources = ["arn:aws:bedrock:${var.aws_region}:*:knowledge-base/${var.knowledge_base_id}", var.model_arn, var.reranker_model_arn]
-  }
-
-  statement {
-    sid    = "BedrockKnowledgeBase"
-    effect = "Allow"
-    actions = [
+      "bedrock:Rerank",
       "bedrock:GetKnowledgeBase",
       "bedrock:ListDataSources",
       "bedrock:ListKnowledgeBaseDocuments",
       "bedrock:DeleteKnowledgeBaseDocuments",
     ]
-    resources = [
-      "arn:aws:bedrock:${var.aws_region}:*:knowledge-base/${var.knowledge_base_id}", var.model_arn, var.reranker_model_arn
-    ]
+    resources = ["*"]
   }
 }
 

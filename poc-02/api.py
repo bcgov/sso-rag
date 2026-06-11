@@ -424,6 +424,15 @@ async def _stream_bedrock_response(query: str) -> AsyncGenerator[str, None]:
     has_citations = False
     has_output = False
 
+    _SENTINEL = object()
+
+    def _next_event(it):
+        """Return the next event or _SENTINEL if exhausted. Avoids StopIteration crossing an async boundary (PEP 479)."""
+        try:
+            return next(it)
+        except StopIteration:
+            return _SENTINEL
+
     try:
         # boto3 stream iteration is synchronous and blocks the event loop.
         # Run each `next()` call in a thread so ASGI can flush each yielded
@@ -433,9 +442,8 @@ async def _stream_bedrock_response(query: str) -> AsyncGenerator[str, None]:
         sync_iter = iter(stream)
 
         while True:
-            try:
-                event = await loop.run_in_executor(executor, next, sync_iter)
-            except StopIteration:
+            event = await loop.run_in_executor(executor, _next_event, sync_iter)
+            if event is _SENTINEL:
                 break
 
             if "output" in event:
