@@ -70,7 +70,7 @@ variable "reranker_model_arn" {
 variable "number_of_reranked_results" {
   description = "Number of retrieved results to rerank in the API"
   type        = string
-  default     = "5"
+  default     = "10"
 }
 
 # ── ECS ───────────────────────────────────────────────────────────────────────
