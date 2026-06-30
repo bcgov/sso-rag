@@ -58,7 +58,7 @@ variable "knowledge_base_id" {
 variable "model_arn" {
   description = "ARN of the Bedrock foundation model used for RetrieveAndGenerate"
   type        = string
-  default     = "arn:aws:bedrock:ca-central-1::foundation-model/meta.llama3-8b-instruct-v1:0"
+  default     = "arn:aws:bedrock:ca-central-1:820251787117:inference-profile/ca.amazon.nova-lite-v1:0"
 }
 
 variable "reranker_model_arn" {

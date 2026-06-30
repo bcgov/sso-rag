@@ -313,7 +313,6 @@ def _build_retrieve_and_generate_config() -> dict:
                             "numberOfRerankedResults": settings.number_of_reranked_results,
                         },
                     },
-                    'overrideSearchType': 'HYBRID',
                 }
             },
             "generationConfiguration": {
