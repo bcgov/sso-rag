@@ -45,6 +45,7 @@ data "aws_iam_policy_document" "api_bedrock" {
       "bedrock:ListDataSources",
       "bedrock:ListKnowledgeBaseDocuments",
       "bedrock:DeleteKnowledgeBaseDocuments",
+      "bedrock:InvokeInferenceProfile",
     ]
     resources = ["*"]
   }
