@@ -1,0 +1,72 @@
+name: Terraform
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "poc-02/**"
+      - "ui/**"
+      - "terraform/**"
+env:
+  TF_VERSION: 1.15.5
+  TF_VAR_knowledge_base_id: ${{ secrets.AWS_BEDROCK_KNOWLEDGE_BASE_ID }}
+
+jobs:
+  terraform:
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS Credentials
+        env:
+          TERRAFORM_DEPLOY_ROLE_ARN: ${{ secrets.TERRAFORM_DEPLOY_ROLE_ARN_SANDBOX }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.TERRAFORM_DEPLOY_ROLE_ARN }}
+          aws-region: ca-central-1
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push API Image to ECR
+        env:
+          AWS_ECR_SSO_RAG_API_REPO_URI: ${{ secrets.AWS_ECR_SSO_RAG_API_REPO_URI }}
+        working-directory: ./poc-02
+        run: |
+          docker build -t ${{ env.AWS_ECR_SSO_RAG_API_REPO_URI }}:latest .
+          docker push ${{ env.AWS_ECR_SSO_RAG_API_REPO_URI }}:latest
+
+      - name: Build, Tag, and Push UI Image to ECR
+        env:
+          AWS_ECR_SSO_RAG_UI_REPO_URI: ${{ secrets.AWS_ECR_SSO_RAG_UI_REPO_URI }}
+        working-directory: ./ui
+        run: |
+          docker build -t ${{ env.AWS_ECR_SSO_RAG_UI_REPO_URI }}:latest .
+          docker push ${{ env.AWS_ECR_SSO_RAG_UI_REPO_URI }}:latest
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: |
+          cat <<EOF > backend.hcl
+          bucket = "sso-rag-tfstate"
+          key = "tfstate"
+          region = "ca-central-1"
+          EOF
+          terraform init -backend-config=backend.hcl
+
+      - name: Terraform Plan
+        run: terraform plan -no-color
+        working-directory: ./terraform
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+        working-directory: ./terraform
