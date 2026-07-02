@@ -4,8 +4,11 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - SSOTEAM-2842
-
+      - main
+    paths:
+      - "poc-02/**"
+      - "ui/**"
+      - "terraform/**"
 env:
   TF_VERSION: 1.15.5
   TF_VAR_knowledge_base_id: ${{ secrets.AWS_BEDROCK_KNOWLEDGE_BASE_ID }}

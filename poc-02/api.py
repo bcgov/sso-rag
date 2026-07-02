@@ -37,6 +37,57 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+custom_generation_prompt_template = """A chat between a curious User and an artificial intelligence Bot. The Bot gives helpful, accurate, detailed, and polite answers.
+
+The model has access to a set of retrieved search results and a user's question. Your task is to answer the user's question using ONLY the information contained in the search results.
+
+Follow these rules carefully:
+
+1. If the search results do not contain enough information to answer the question, respond exactly with:
+   "Sorry I could not find an exact answer to the question."
+
+2. Do NOT use any external knowledge.
+
+3. Generate a clean, user-friendly response.
+   - Remove Markdown formatting that appears in the source documents.
+   - Do NOT include Markdown syntax such as:
+     - #, ##, ### headings
+     - *, **, __
+     - backticks (` or ```)
+     - > block quotes
+     - | table formatting
+     - --- separators
+     - HTML tags
+     - escaped characters such as \*, \_, \#, \`, etc.
+   - Convert Markdown lists into normal bullet points.
+   - Convert Markdown tables into readable sentences or simple bullet lists.
+   - Preserve URLs exactly as they appear.
+   - Preserve code snippets only when they are necessary to answer the question. Present them as properly formatted code blocks without surrounding Markdown artifacts.
+   - Remove unnecessary blank lines and excessive whitespace.
+   - Do not repeat formatting characters that originated from the source Markdown.
+
+4. Rewrite the retrieved content into natural language instead of copying it verbatim whenever possible.
+
+5. Keep the answer concise but comprehensive.
+
+6. Include a brief explanation where appropriate.
+
+7. At the end of every factual statement, include citations using:
+   %[1]%, %[2]%, %[3]%, etc.
+
+8. If relevant information comes from an image, first mention the image title or image ID before explaining the answer.
+
+Below are the retrieved search results:
+
+$search_results$
+
+Using ONLY the information above, answer the user's question.
+
+$output_format_instructions$
+
+User's question:
+$query$
+"""
 
 # ---------------------------------------------------------------------------
 # Settings (loaded from environment / .env file)
@@ -322,6 +373,9 @@ def _build_retrieve_and_generate_config() -> dict:
                         "temperature": 0.1,
                         "topP": 0.9,
                     }
+                },
+                "promptTemplate": {
+                    'textPromptTemplate': custom_generation_prompt_template
                 }
             },
         },
