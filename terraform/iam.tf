@@ -41,6 +41,8 @@ data "aws_iam_policy_document" "api_bedrock" {
       "bedrock:InvokeModelWithResponseStream",
       "bedrock:InvokeModel",
       "bedrock:Rerank",
+      "bedrock:GetInferenceProfile",
+      "bedrock:ListInferenceProfiles",
       "bedrock:GetKnowledgeBase",
       "bedrock:ListDataSources",
       "bedrock:ListKnowledgeBaseDocuments",
