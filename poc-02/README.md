@@ -72,6 +72,79 @@ The API uses the **boto3 default credential provider chain** — no credentials 
 
 ---
 
+## Bedrock Knowledge Base Setup
+
+> **The knowledge base is created and managed manually in the AWS Console. It is not provisioned by the Terraform in this repository.**
+> After creation, copy the Knowledge Base ID into the GitHub repository secret `AWS_BEDROCK_KNOWLEDGE_BASE_ID`. The CI/CD pipeline passes it to Terraform as `TF_VAR_knowledge_base_id`.
+
+### Overview
+
+The knowledge base is configured with:
+
+| Setting | Value |
+|---|---|
+| **Vector store** | Amazon S3 (native Bedrock vector index — no external OpenSearch/Aurora required) |
+| **Data source** | Amazon S3 bucket containing the documents to index |
+| **Embeddings model** | Amazon Titan Embeddings (configured in the knowledge base) |
+| **Chunking** | Default semantic chunking |
+
+### Step-by-step: Create the knowledge base in the AWS Console
+
+1. **Create an S3 bucket** to hold your source documents (e.g. PDFs, plain text, Word files).  
+   Upload the documents you want the RAG to answer questions about.
+
+2. Open the **Amazon Bedrock console** → **Knowledge bases** → **Create knowledge base**.
+
+3. **Knowledge base details**
+   - Name: e.g. `sso-rag-kb`
+   - IAM permissions: let the console create a new service role, or attach an existing one that has `s3:GetObject` on your bucket and `bedrock:InvokeModel` on the embeddings model.
+
+4. **Set up data source** → choose **Amazon S3**
+   - S3 URI: `s3://<your-bucket-name>/` (or a prefix path)
+   - Leave parsing and chunking at defaults, or enable advanced parsing if your documents are PDFs with complex layouts.
+
+5. **Select embeddings model**
+   - Recommended: **Amazon Titan Embeddings G1 – Text** (`amazon.titan-embed-text-v1`)
+
+6. **Configure vector store** → choose **Amazon S3** (Bedrock-managed vector store)
+   - Bedrock creates and manages the vector index in S3 automatically — no additional infrastructure needed.
+
+7. Review and **Create knowledge base**. Initial sync (ingestion) runs automatically.
+
+8. Once created, copy the **Knowledge Base ID** (e.g. `NVDUCAWMJW`) shown on the knowledge base detail page.
+
+### Wire the Knowledge Base ID into CI/CD
+
+Go to your GitHub repository → **Settings → Secrets and variables → Actions** and create (or update) the secret:
+
+| Secret name | Value |
+|---|---|
+| `AWS_BEDROCK_KNOWLEDGE_BASE_ID` | The Knowledge Base ID from the console |
+
+The workflow file passes it to Terraform automatically:
+
+```yaml
+env:
+  TF_VAR_knowledge_base_id: ${{ secrets.AWS_BEDROCK_KNOWLEDGE_BASE_ID }}
+```
+
+### Re-syncing the data source
+
+Whenever you upload new documents to S3, trigger a sync from the console:
+
+**Bedrock console → Knowledge bases → `<your kb>` → Data sources → Sync**
+
+Or via the CLI:
+
+```bash
+aws bedrock-agent start-ingestion-job \
+  --knowledge-base-id <KNOWLEDGE_BASE_ID> \
+  --data-source-id <DATA_SOURCE_ID> \
+  --region ca-central-1
+```
+
+---
+
 ## Running Locally
 
 ### Prerequisites
