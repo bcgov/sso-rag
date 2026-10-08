@@ -11,5 +11,6 @@ dependencies = [
     "gunicorn>=23.0.0",
     "pydantic>=2.11.0",
     "pydantic-settings>=2.9.0",
+    "tiktoken>=0.14.0",
     "uvicorn[standard]>=0.34.0",
 ]
