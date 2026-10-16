@@ -6,7 +6,7 @@ on:
     branches:
       - main
     paths:
-      - "poc-02/**"
+      - "legacy/poc-02/**"
       - "ui/**"
       - "terraform/**"
 env:
@@ -40,7 +40,7 @@ jobs:
       - name: Build, Tag, and Push API Image to ECR
         env:
           AWS_ECR_SSO_RAG_API_REPO_URI: ${{ secrets.AWS_ECR_SSO_RAG_API_REPO_URI }}
-        working-directory: ./poc-02
+        working-directory: ./legacy/poc-02
         run: |
           docker build -t ${{ env.AWS_ECR_SSO_RAG_API_REPO_URI }}:latest .
           docker push ${{ env.AWS_ECR_SSO_RAG_API_REPO_URI }}:latest
