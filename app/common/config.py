@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     )
 
     number_of_results: int = Field(
-        default=5,
+        default=25,
         alias="NUMBER_OF_RESULTS"
     )
 
@@ -36,13 +36,23 @@ class Settings(BaseSettings):
     )
 
     number_of_reranked_results: int = Field(
-        default=3,
+        default=6,
         alias="NUMBER_OF_RERANKED_RESULTS"
     )
 
     cors_origins: list[str] = Field(
         default=["*"],
         alias="CORS_ORIGINS"
+    )
+
+    min_rerank_score: float = Field(
+        default=0.05,
+        alias="MIN_RERANK_SCORE"
+    )
+
+    search_type: str = Field(
+        default="HYBRID",
+        alias="SEARCH_TYPE"
     )
 
 
