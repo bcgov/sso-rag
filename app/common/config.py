@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     )
 
     search_type: str = Field(
-        default="HYBRID",
+        default="SEMANTIC",
         alias="SEARCH_TYPE"
     )
 

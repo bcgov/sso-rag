@@ -18,10 +18,15 @@ model = BedrockModel(
     region_name=settings.aws_region
 )
 
-agent = Agent(
-    model=model,
-    tools=[
-        search_knowledge_base
-    ],
-    system_prompt=SYSTEM_PROMPT
-)
+
+def create_agent() -> Agent:
+    """A fresh agent per conversation: Agent keeps its message history, so
+    sharing one instance would leak context between users."""
+
+    return Agent(
+        model=model,
+        tools=[
+            search_knowledge_base
+        ],
+        system_prompt=SYSTEM_PROMPT
+    )

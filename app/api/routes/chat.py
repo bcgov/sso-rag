@@ -16,9 +16,11 @@ router = APIRouter()
     "/chat",
     response_model=ChatResponse
 )
-async def chat(
+def chat(
     request: ChatRequest
 ):
+    # Sync handler: FastAPI runs it in a threadpool, so the blocking agent
+    # call doesn't stall the event loop.
 
     answer = chat_service.ask(
         request.prompt

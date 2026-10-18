@@ -56,7 +56,7 @@ variable "knowledge_base_id" {
 }
 
 variable "model_arn" {
-  description = "ARN of the Bedrock foundation model used for RetrieveAndGenerate"
+  description = "ARN of the Bedrock model or inference profile the agent uses"
   type        = string
   default     = "arn:aws:bedrock:ca-central-1:820251787117:inference-profile/ca.amazon.nova-lite-v1:0"
 }
@@ -68,9 +68,27 @@ variable "reranker_model_arn" {
 }
 
 variable "number_of_reranked_results" {
-  description = "Number of retrieved results to rerank in the API"
+  description = "Results kept after reranking for a single query (+2 per extra query, max 12)"
   type        = string
   default     = "10"
+}
+
+variable "number_of_results" {
+  description = "Total candidates retrieved per search tool call, split across queries"
+  type        = string
+  default     = "25"
+}
+
+variable "min_rerank_score" {
+  description = "Drop reranked results below this relevance score"
+  type        = string
+  default     = "0.05"
+}
+
+variable "search_type" {
+  description = "Bedrock KB overrideSearchType; S3 Vectors supports SEMANTIC only"
+  type        = string
+  default     = "SEMANTIC"
 }
 
 # ── ECS ───────────────────────────────────────────────────────────────────────
@@ -90,13 +108,13 @@ variable "ui_image" {
 variable "api_cpu" {
   description = "vCPU units for the API Fargate task (1 vCPU = 1024)"
   type        = number
-  default     = 256
+  default     = 512
 }
 
 variable "api_memory" {
-  description = "Memory (MiB) for the API Fargate task"
+  description = "Memory (MiB) for the API Fargate task (2 uvicorn workers)"
   type        = number
-  default     = 512
+  default     = 1024
 }
 
 variable "ui_cpu" {

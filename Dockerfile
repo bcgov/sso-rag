@@ -6,17 +6,16 @@ FROM python:3.14-slim AS builder
 WORKDIR /app
 
 # Pull uv from its official image — no pip required
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /usr/local/bin/uv
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
 
 # Copy dependency files first for layer-cache efficiency
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies into /app/.venv without installing the project itself
+# Install dependencies into /app/.venv (the project itself is not a package)
 RUN uv sync --frozen --no-install-project --no-dev
-
-# Copy source and run a final sync to install the project package
-COPY api.py ./
-RUN uv sync --frozen --no-dev
 
 # ---------------------------------------------------------------------------
 # Runtime stage – minimal image
@@ -29,9 +28,10 @@ RUN groupadd --gid 1001 appgroup \
 
 WORKDIR /app
 
-# Copy the virtual environment and application source from the builder
+# Copy the virtual environment from the builder and the application source
 COPY --from=builder --chown=appuser:appgroup /app/.venv /app/.venv
-COPY --from=builder --chown=appuser:appgroup /app/api.py /app/api.py
+COPY --chown=appuser:appgroup main.py ./
+COPY --chown=appuser:appgroup app/ ./app/
 
 # Activate the venv by prepending it to PATH
 ENV PATH="/app/.venv/bin:$PATH" \
@@ -43,16 +43,15 @@ USER appuser
 
 EXPOSE 8000
 
-# Gunicorn with UvicornWorker for production:
-#   - Multiple workers = parallelism
-#   - UvicornWorker = async ASGI support
-#   - Graceful timeout, keep-alive, access log to stdout
-CMD ["gunicorn", "api:app", \
-    "--worker-class", "uvicorn.workers.UvicornWorker", \
+# Uvicorn with multiple worker processes:
+#   - Keep-alive longer than the ALB idle timeout (120s) to avoid 502s from
+#     the ALB reusing a connection uvicorn has just closed
+#   - Proxy headers trusted from the ALB
+CMD ["uvicorn", "main:app", \
+    "--host", "0.0.0.0", \
+    "--port", "8000", \
     "--workers", "2", \
-    "--bind", "0.0.0.0:8000", \
-    "--timeout", "120", \
-    "--keep-alive", "5", \
-    "--access-logfile", "-", \
-    "--error-logfile", "-", \
+    "--timeout-keep-alive", "125", \
+    "--proxy-headers", \
+    "--forwarded-allow-ips", "*", \
     "--log-level", "info"]

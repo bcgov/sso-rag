@@ -1,0 +1,16 @@
+# Only main.py, app/, pyproject.toml and uv.lock are needed in the API image.
+# Keep secrets and local environments out of the build context.
+.env
+.env.*
+.venv/
+.git/
+.github/
+**/__pycache__/
+*.py[cod]
+
+# Not part of the API image
+legacy/
+ui/
+terraform/
+chunker/
+*.md

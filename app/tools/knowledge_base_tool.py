@@ -3,11 +3,8 @@ import logging
 
 from strands import tool
 
-from app.common.config import settings
-from app.retrieval.bedrock_client import get_bedrock_runtime_client
 from app.retrieval.knowledge_base import (
-    expand_query,
-    retrieve
+    multi_search
 )
 
 logger = logging.getLogger(__name__)
@@ -15,7 +12,8 @@ logger = logging.getLogger(__name__)
 
 @tool
 def search_knowledge_base(
-    question: str
+    question: str,
+    queries: list[str]
 ) -> str:
     """Search the BC Gov SSO (Keycloak / CSS app) documentation.
 
@@ -24,55 +22,49 @@ def search_knowledge_base(
     redirects, OIDC/SAML, custom realms, service accounts, errors and uptime.
 
     Args:
-        question: A standalone, specific search query in the documentation's own
-            vocabulary. Resolve pronouns from the conversation first
-            ("what about prod?" -> "PROD environment approval for BCeID
-            integration"). One topic per query; call again for each part of a
-            multi-part question.
+        question: The user's need as one standalone sentence, with pronouns
+            resolved from the conversation ("what about prod?" -> "How do I
+            get PROD approval for my BCeID integration?"). Results are ranked
+            against this.
+        queries: 1 to 4 search queries in the documentation's own vocabulary.
+            Use a single query for a single-topic question. Use one query per
+            facet only when the question has genuinely independent parts
+            (e.g. "BCeID PROD approval" and "service account client roles"),
+            or for troubleshooting (exact error text, then the feature).
 
     Returns:
-        Numbered result blocks separated by "---", each with the doc title and
-        section, source, score and text; or a string starting with "NO_MATCH"
-        if nothing relevant was found.
+        Numbered result blocks separated by "---", each with the page and
+        section, source URL, score and text, followed by a note naming any
+        query that found nothing relevant; or a string starting with
+        "NO_MATCH" if nothing relevant was found for any query.
     """
 
-    expanded = expand_query(question)
-    reranked = bool(settings.reranker_model_arn)
-
-    try:
-        results = retrieve(expanded)
-    except get_bedrock_runtime_client().exceptions.ValidationException as e:
-        # e.g. reranker or HYBRID not available for this region / vector store
-        logger.warning("retrieve config rejected (%s); falling back to plain search", e)
-        results = retrieve(expanded, advanced=False)[:settings.number_of_reranked_results]
-        reranked = False
-
-    # min_rerank_score is calibrated for reranker scores, not raw vector scores
-    if reranked:
-        hits = [r for r in results if r.score >= settings.min_rerank_score]
-    else:
-        hits = results
-
-    logger.info(json.dumps({
-        "query": question,
-        "expanded": expanded != question,
-        "reranked": reranked,
-        "scores": [round(r.score, 3) for r in results],
-        "kept": len(hits),
-    }))
+    hits, stats = multi_search(question, queries)
+    logger.info(json.dumps({"question": question, "kept": len(hits), **stats}))
 
     if not hits:
-        return ("NO_MATCH: nothing relevant for this query. Try different "
+        return ("NO_MATCH: nothing relevant for these queries. Try different "
                 "wording (the docs' own terms, the identity provider name, or "
                 "the error message text) before telling the user.")
 
     blocks = []
     for i, r in enumerate(hits, 1):
         meta = r.metadata
+        title = meta.get("section") or meta.get("page_title", "")
         blocks.append(
-            f"[{i}] {meta.get('doc_title', '')} > {meta.get('section', '')}\n"
-            f"source: {meta.get('source_url', r.source)}\n"
+            f"[{i}] {title}\n"
+            f"source: {meta.get('source_url') or r.source}\n"
             f"score: {r.score:.3f}\n"
             f"{r.text}"
         )
+
+    found = {q for r in hits for q in r.metadata.get("_queries", [])}
+    missing = [q for q in stats["queries"] if q not in found]
+    if missing:
+        blocks.append(
+            "NOTE: no relevant results for: "
+            + "; ".join(f'"{q}"' for q in missing)
+            + ". Retry those with different wording if they matter to the answer."
+        )
+
     return "\n\n---\n\n".join(blocks)
