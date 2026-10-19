@@ -30,25 +30,36 @@ resource "aws_iam_role" "api_task" {
   assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume_role.json
 }
 
+data "aws_caller_identity" "current" {}
+
 data "aws_iam_policy_document" "api_bedrock" {
+  # search_knowledge_base tool and /documents/search
   statement {
-    sid    = "BedrockInvokeRetrieveRerankAndGenerate"
+    sid       = "KnowledgeBaseRetrieve"
+    effect    = "Allow"
+    actions   = ["bedrock:Retrieve"]
+    resources = ["arn:aws:bedrock:${var.aws_region}:${data.aws_caller_identity.current.account_id}:knowledge-base/${var.knowledge_base_id}"]
+  }
+
+  # Agent model (Converse / ConverseStream) and reranker model. Cross-region
+  # inference profiles route to foundation models in other regions, so model
+  # resources are not pinned to one region.
+  statement {
+    sid    = "InvokeModels"
     effect = "Allow"
     actions = [
-      "bedrock:RetrieveAndGenerate",
-      "bedrock:RetrieveAndGenerateStream",
-      "bedrock:Retrieve",
-      "bedrock:InvokeModelWithResponseStream",
       "bedrock:InvokeModel",
-      "bedrock:Rerank",
+      "bedrock:InvokeModelWithResponseStream",
       "bedrock:GetInferenceProfile",
-      "bedrock:ListInferenceProfiles",
-      "bedrock:GetKnowledgeBase",
-      "bedrock:ListDataSources",
-      "bedrock:ListKnowledgeBaseDocuments",
-      "bedrock:DeleteKnowledgeBaseDocuments",
-      "bedrock:InvokeInferenceProfile",
     ]
+    resources = ["*"]
+  }
+
+  # Rerank does not support resource-level permissions
+  statement {
+    sid       = "Rerank"
+    effect    = "Allow"
+    actions   = ["bedrock:Rerank"]
     resources = ["*"]
   }
 }
@@ -65,4 +76,34 @@ resource "aws_iam_role_policy" "api_bedrock" {
 resource "aws_iam_role" "ui_task" {
   name               = "${local.name_prefix}-ui-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume_role.json
+}
+
+# agent storage s3 bucket permissions for the api task role
+resource "aws_iam_policy" "api_agent_storage" {
+  name        = "${local.name_prefix}-api-agent-storage"
+  description = "Allow API task role to access the agent storage S3 bucket"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "arn:aws:s3:::${var.environment}-${local.name_prefix}-agent-context-store",
+          "arn:aws:s3:::${var.environment}-${local.name_prefix}-agent-context-store/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "api_agent_storage" {
+  role       = aws_iam_role.api_task.name
+  policy_arn = aws_iam_policy.api_agent_storage.arn
 }

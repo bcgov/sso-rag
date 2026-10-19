@@ -10,6 +10,9 @@ resource "aws_lb" "main" {
 
   enable_deletion_protection = false
 
+  # Agent answers can take several model and tool round trips
+  idle_timeout = 120
+
   tags = { Name = "${local.name_prefix}-alb" }
 }
 
@@ -72,7 +75,7 @@ resource "aws_lb_listener" "http" {
   }
 }
 
-# ── Listener Rules: route /query* and /health* to the API target group ────────
+# ── Listener Rules: route API paths and /health* to the API target group ──────
 
 resource "aws_lb_listener_rule" "api_query" {
   listener_arn = aws_lb_listener.http.arn
@@ -85,7 +88,8 @@ resource "aws_lb_listener_rule" "api_query" {
 
   condition {
     path_pattern {
-      values = ["/query", "/query/*"]
+      # /chat and /documents/* are the agentic API; /query is the UI's endpoint
+      values = ["/chat", "/documents/*", "/query", "/query/*"]
     }
   }
 }

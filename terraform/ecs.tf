@@ -62,11 +62,15 @@ resource "aws_ecs_task_definition" "api" {
       ]
 
       environment = [
+        { name = "ENVIRONMENT", value = var.environment },
         { name = "AWS_REGION", value = var.aws_region },
         { name = "KNOWLEDGE_BASE_ID", value = var.knowledge_base_id },
         { name = "RERANKER_MODEL_ARN", value = var.reranker_model_arn },
         { name = "MODEL_ARN", value = var.model_arn },
         { name = "NUMBER_OF_RERANKED_RESULTS", value = var.number_of_reranked_results },
+        { name = "NUMBER_OF_RESULTS", value = var.number_of_results },
+        { name = "MIN_RERANK_SCORE", value = var.min_rerank_score },
+        { name = "SEARCH_TYPE", value = var.search_type },
       ]
 
       logConfiguration = {
@@ -166,8 +170,17 @@ resource "aws_ecs_service" "api" {
   deployment_minimum_healthy_percent = 100
   deployment_maximum_percent         = 200
 
+  # Roll back automatically if new tasks fail to become healthy
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = true
+  }
+
+  # task_definition is not ignored, so env var and sizing changes roll out on
+  # apply. New :latest images are rolled out by the workflow's
+  # force-new-deployment step.
   lifecycle {
-    ignore_changes = [task_definition, desired_count]
+    ignore_changes = [desired_count]
   }
 
   depends_on = [aws_lb_listener_rule.api_query, aws_iam_role_policy_attachment.ecs_task_execution_managed]

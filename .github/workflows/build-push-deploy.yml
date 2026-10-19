@@ -6,9 +6,15 @@ on:
     branches:
       - main
     paths:
-      - "poc-02/**"
+      - "app/**"
+      - "main.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "Dockerfile"
+      - ".dockerignore"
       - "ui/**"
       - "terraform/**"
+      - ".github/workflows/build-push-deploy.yml"
 env:
   TF_VERSION: 1.15.5
   TF_VAR_knowledge_base_id: ${{ secrets.AWS_BEDROCK_KNOWLEDGE_BASE_ID }}
@@ -40,7 +46,7 @@ jobs:
       - name: Build, Tag, and Push API Image to ECR
         env:
           AWS_ECR_SSO_RAG_API_REPO_URI: ${{ secrets.AWS_ECR_SSO_RAG_API_REPO_URI }}
-        working-directory: ./poc-02
+        working-directory: .
         run: |
           docker build -t ${{ env.AWS_ECR_SSO_RAG_API_REPO_URI }}:latest .
           docker push ${{ env.AWS_ECR_SSO_RAG_API_REPO_URI }}:latest
@@ -70,3 +76,14 @@ jobs:
       - name: Terraform Apply
         run: terraform apply -auto-approve
         working-directory: ./terraform
+
+      # Images are pushed as :latest, which doesn't change the task definition,
+      # so ECS has to be told to pull the new images.
+      - name: Roll out new images
+        working-directory: ./terraform
+        run: |
+          CLUSTER=$(terraform output -raw ecs_cluster_name)
+          for SERVICE in sso-rag-api sso-rag-ui; do
+            aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment > /dev/null
+          done
+          aws ecs wait services-stable --cluster "$CLUSTER" --services sso-rag-api sso-rag-ui

@@ -41,26 +41,31 @@ ui/
 
 **`src/types.ts`**  
 Defines all types used across the app:
-- `ChatCompletionChunk` / `StreamChoice` / `DeltaContent` — mirrors the OpenAI-compatible SSE format emitted by the API
+- `ChatRequest` — the `/chat` request body
+- `ChatCompletionChunk` / `StreamChoice` / `DeltaContent` — mirrors the OpenAI-compatible SSE format streamed by `/chat`
+- `StreamError` — in-band error event sent if the stream fails after it starts
 - `Citation` / `CitationLocation` — the custom citation payload attached to retrieval results
 - `ChatMessage` — the UI-level message model with `streaming` flag for the blinking cursor
 
 **`src/hooks/useChat.ts`**  
 Core logic hook:
-- Sends `POST /query` with `{ query: string }`
+- Sends `POST /chat` with `{ prompt: string }`
 - Reads the response body as a `ReadableStream`, decodes SSE lines, and parses each `data: …` chunk
 - Uses `flushSync` to force React to re-render on every token so text appears progressively
-- Detects `data: [DONE]` and `finish_reason: "stop"` to cancel the reader and close the connection cleanly
-- Accumulates `citations` from retrieval result chunks and attaches them to the completed message
+- Detects `data: [DONE]` and `finish_reason: "stop"` to cancel the reader and close the connection cleanly; a `{ "error": … }` event is shown as an error
+- Conversation history is kept server-side, keyed by an `HttpOnly` session cookie the API sets on the first response plus an `X-Tab-Id` header; the browser sends the cookie back automatically because the UI is served from the same origin
+- The tab id is a UUID in `sessionStorage`, so each tab has its own conversation and keeps it across reloads (a duplicated tab copies it and continues the same conversation until cleared)
+- Collects the `citations` chunk sent after the answer and shows the sources' titles as links
+- **Clear** calls `DELETE /chat` for this tab's history and then switches to a new tab id
 
 **`src/components/ChatMessageBubble.tsx`**  
-Renders a single message. User messages are right-aligned (blue), assistant messages left-aligned (gray). Shows a blinking cursor while streaming. Renders citation sources with links once streaming is complete.
+Renders a single message. User messages are right-aligned (blue), assistant messages left-aligned (gray). Assistant messages are rendered as Markdown (GitHub-flavoured: lists, tables, code, links) with `react-markdown` + `remark-gfm` and styled with `@tailwindcss/typography`; raw HTML in answers is not rendered, and links open in a new tab. User messages are shown as plain text. Shows a blinking cursor while streaming. Renders citation sources with links once streaming is complete.
 
 **`src/components/ChatInput.tsx`**  
 Auto-growing textarea capped at 10 lines. Submits on `Enter` (new line on `Shift+Enter`). Disabled while the assistant is streaming.
 
 **`vite.config.ts`**  
-Dev server runs on port `5173` and proxies `/query` and `/health` to `http://localhost:8000`, avoiding CORS issues during local development.
+Dev server runs on port `5173` and proxies `/chat` and `/health` to `http://localhost:8000`, avoiding CORS issues during local development.
 
 ---
 
@@ -115,7 +120,7 @@ The app will be available at [http://localhost:8080](http://localhost:8080).
 |---|---|---|
 | `API_URL` | `http://localhost:8000` | Base URL of the FastAPI backend (used by the nginx proxy) |
 
-> **Note:** The Docker image serves the pre-built static files via nginx. The `API_URL` variable is injected at build time via `--build-arg` to configure the nginx reverse proxy for the `/query` and `/health` routes.
+> **Note:** The Docker image serves the pre-built static files via nginx. The `API_URL` variable is injected at build time via `--build-arg` to configure the nginx reverse proxy for the `/chat` and `/health` routes.
 
 ```bash
 docker build --build-arg API_URL=https://api.example.com -t sso-rag-ui .

@@ -68,3 +68,4 @@ desktop.ini
 node_modules/
 **.tfvars
 .terraform/
+.agent-store/
