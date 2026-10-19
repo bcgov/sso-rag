@@ -69,6 +69,8 @@ a text version in [docs/architecture/architecture.md](docs/architecture/architec
                    └──────────────────────┘
 ```
 
+Visit [link](https://htmlpreview.github.io/?https://github.com/bcgov/sso-rag/blob/feat/agentic-rag-init/docs/architecture/architecture.html) to view the architecture diagram
+
 ---
 
 # Key Features
