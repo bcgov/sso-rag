@@ -16,6 +16,12 @@ The application uses AWS Bedrock Knowledge Bases as the retrieval layer and Stra
 
 # Architecture
 
+An interactive, click-through diagram of all components and data flows (chat,
+cookie sessions, cleanup, ingestion/deploy, and the proposed MS Teams
+integration via MCP) is in
+[docs/architecture/architecture.html](docs/architecture/architecture.html), with
+a text version in [docs/architecture/architecture.md](docs/architecture/architecture.md).
+
 ```text
                    ┌──────────────────────┐
                    │ Source Documents     │
@@ -131,7 +137,7 @@ Future tools can include:
 
 Provides:
 
-- Chat endpoint
+- Streaming chat endpoint (SSE) with per-browser-tab conversation history and cited sources
 - Health endpoint
 - Document retrieval endpoint
 
@@ -161,6 +167,9 @@ sso-rag/
 │   │   ├── constants.py      # acronym expansions
 │   │   └── logging.py
 │   │
+│   ├── jobs/
+│   │   └── cleanup_sessions.py  # one-off session cleanup CLI
+│   │
 │   ├── prompts/
 │   │   └── system_prompt.py
 │   │
@@ -170,7 +179,8 @@ sso-rag/
 │   │   └── models.py
 │   │
 │   ├── services/
-│   │   └── chat_service.py
+│   │   ├── chat_service.py
+│   │   └── session_cleanup.py   # deletes inactive sessions
 │   │
 │   ├── tools/
 │   │   └── knowledge_base_tool.py
@@ -205,7 +215,9 @@ sso-rag/
 
 ## Agent Execution
 
-A new agent is created for each request (see [Agent Configuration](#agent-configuration)).
+A fresh agent is created for each request and restored from the
+conversation's stored history (session cookie + browser tab id; see
+[Agent Configuration](#agent-configuration)).
 
 ```text
 Agent
@@ -220,15 +232,19 @@ Ranked chunks with source URLs (+ NOTE for any query with no results)
   ↓
 Agent (retries empty queries once, then answers)
   ↓
-Response with cited sources
+Streamed answer (SSE) + cited sources; conversation snapshot saved
 ```
 
 ## Response
 
-```json
-{
-  "answer": "To get PROD approval for BCeID... ([Requesting BCeID in PROD](https://bcgov.github.io/sso-docs/...))"
-}
+The answer is streamed as server-sent events, followed by the sources it
+links to (see [Chat](#chat) for the full format):
+
+```text
+data: {... "delta": {"content": "To get PROD approval for BCeID... ([Requesting BCeID in PROD](https://bcgov.github.io/sso-docs/...))"} ...}
+data: {... "delta": {"citations": [{"title": "Requesting BCeID in PROD", "location": {"uri": "https://bcgov.github.io/sso-docs/..."}, "score": 0.81}]} ...}
+data: {... "delta": {}, "finish_reason": "stop" ...}
+data: [DONE]
 ```
 
 ---
@@ -283,6 +299,9 @@ uv sync
 Create a `.env` file in the project root.
 
 ```env
+ENVIRONMENT=local
+SESSION_COOKIE_SECURE=false
+
 AWS_REGION=ca-central-1
 
 KNOWLEDGE_BASE_ID=<knowledge-base-id>
@@ -294,6 +313,7 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `ENVIRONMENT` | `sandbox` | `local` stores conversations in `./.agent-store/`; anything else uses `AGENT_STORAGE_S3_BUCKET` |
 | `AWS_REGION` | `ca-central-1` | Region for Bedrock calls |
 | `KNOWLEDGE_BASE_ID` | – (required) | Bedrock Knowledge Base to search |
 | `MODEL_ARN` | – | Foundation model the agent uses |
@@ -302,7 +322,13 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `NUMBER_OF_RERANKED_RESULTS` | `6` | Results kept after reranking for a single query (+2 per extra query, max 12) |
 | `MIN_RERANK_SCORE` | `0.05` | Drop reranked results below this relevance score |
 | `SEARCH_TYPE` | `SEMANTIC` | Bedrock `overrideSearchType`; keep `SEMANTIC` on S3 Vectors |
-| `CORS_ORIGINS` | `["*"]` | Allowed origins for the UI |
+| `CORS_ORIGINS` | `["*"]` | Allowed origins for the UI (answers `OPTIONS` preflight). Cookies are only allowed cross-origin when this lists explicit origins, e.g. `["https://ui.example.gov.bc.ca"]` |
+| `AGENT_STORAGE_S3_BUCKET` | `sandbox-sso-rag-agent-context-store` | Bucket for conversation history when `ENVIRONMENT` is not `local` |
+| `SESSION_COOKIE_NAME` | `strands_session` | Name of the session cookie |
+| `SESSION_COOKIE_MAX_AGE` | `86400` | Session cookie lifetime in seconds (refreshed on every chat request) |
+| `SESSION_COOKIE_SECURE` | `true` | Send the cookie over HTTPS only; set `false` for plain-HTTP localhost |
+| `SESSION_RETENTION_DAYS` | `3` | Delete stored conversations with no activity for longer than this many days |
+| `SESSION_CLEANUP_INTERVAL_HOURS` | `24` | How often the API runs the session cleanup; `0` disables the in-process job |
 
 ---
 
@@ -370,12 +396,59 @@ Request:
 }
 ```
 
-Response:
+The response is a `text/event-stream` of OpenAI-compatible
+`chat.completion.chunk` events, ending with `data: [DONE]`:
 
-```json
-{
-  "answer": "..."
-}
+```text
+data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}], …}
+data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "MFA is…"}, "finish_reason": null}], …}
+data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"citations": [{"title": "…", "location": {"uri": "https://…"}, "score": 0.82}]}, "finish_reason": null}], …}
+data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], …}
+data: [DONE]
+```
+
+The `citations` chunk is sent once, after the answer text, when the knowledge
+base was searched. It lists the retrieved sources the answer links to, or all
+retrieved sources if it links none, deduplicated by URL.
+
+If the agent fails after streaming has started, a `data: {"error": "…"}`
+event is sent before `[DONE]`.
+
+Conversation history is kept per session. The response sets an `HttpOnly`
+`strands_session` cookie (name, lifetime and `Secure` flag via
+`SESSION_COOKIE_NAME`, `SESSION_COOKIE_MAX_AGE`, `SESSION_COOKIE_SECURE`);
+send it back to continue the conversation. A missing or malformed cookie
+starts a new session.
+
+The cookie is shared by every tab in a browser, so the UI also sends an
+`X-Tab-Id: <uuid>` header (kept in the tab's `sessionStorage`). History is
+stored per cookie + tab id, so each tab has its own conversation; without the
+header, the cookie alone is used.
+
+```http
+DELETE /chat
+```
+
+With `X-Tab-Id`, deletes that tab's stored history and keeps the cookie (other
+tabs still use it). Without it, deletes the cookie-level history and clears
+the cookie.
+
+### Session cleanup
+
+Conversations are kept in the agent storage (`.agent-store/` locally, the
+`AGENT_STORAGE_S3_BUCKET` bucket otherwise) under `session/<id>/` and
+`context/<id>/`. A background job in the API deletes every conversation whose
+newest object is older than `SESSION_RETENTION_DAYS` (default 3), running
+shortly after startup and then every `SESSION_CLEANUP_INTERVAL_HOURS`
+(default 24). Each API worker runs it; deletes are idempotent. Only ids in
+the format the API issues are touched.
+
+To run it from an external scheduler instead, set
+`SESSION_CLEANUP_INTERVAL_HOURS=0` and run:
+
+```bash
+python -m app.jobs.cleanup_sessions            # uses SESSION_RETENTION_DAYS
+python -m app.jobs.cleanup_sessions --days 30
 ```
 
 ---
@@ -400,25 +473,27 @@ app/agents/rag_agent.py
 ```
 
 A Strands `Agent` keeps its message history, so sharing one instance would
-leak conversation context between users. `create_agent()` returns a fresh
-agent; the Bedrock model object is created once and shared.
+leak conversation context between users. `create_agent(session_id)` returns a
+fresh agent whose history is restored from, and saved back to, that session's
+snapshot via `SnapshotSessionManager`; the Bedrock model object is created
+once and shared.
 
 ```python
-def create_agent() -> Agent:
+def create_agent(session_id: str) -> Agent:
     return Agent(
         model=model,
         tools=[
             search_knowledge_base
         ],
-        system_prompt=SYSTEM_PROMPT
+        system_prompt=SYSTEM_PROMPT,
+        context_manager="auto",
+        session_manager=SnapshotSessionManager(session_id, storage=storage),
+        callback_handler=None,
     )
 ```
 
-`ChatService` currently creates one agent per request, so follow-up questions
-don't see earlier turns. Per-session history is on the [roadmap](#memory).
-
-The `/chat` route is a synchronous handler, so FastAPI runs the blocking agent
-call in its threadpool instead of on the event loop.
+The `/chat` route is async and streams `agent.stream_async()` output. If the
+client disconnects, the agent invocation is cancelled.
 
 ---
 
@@ -487,10 +562,15 @@ Purpose:
 - Flag queries that found nothing so the agent can retry them
 
 ```python
-@tool
-def search_knowledge_base(question: str, queries: list[str]) -> str:
+@tool(context=True)
+def search_knowledge_base(question: str, queries: list[str], tool_context: ToolContext) -> str:
     ...
 ```
+
+`tool_context` is injected by Strands and isn't part of the model-facing
+schema. If the caller passes `invocation_state={"citations": [...]}`, each
+returned result's title, source URL and score is appended to that list; this
+is how `/chat` builds its citations.
 
 - `question` – the user's need as one standalone sentence, pronouns resolved;
   results are reranked against it.
@@ -558,13 +638,14 @@ Client
 API Gateway (HTTP API, $default route)
   ↓  VPC Link
 Internal ALB (port 80, idle timeout 120s)
-  ├── /chat, /documents/*, /query, /health  →  API service (Fargate, :8000)
-  └── everything else                      →  UI service  (Fargate, :8080)
-                                                 nginx proxies /query, /health back to the ALB
+  ├── /chat, /documents/*, /health  →  API service (Fargate, :8000)
+  └── everything else              →  UI service  (Fargate, :8080)
+                                         nginx proxies /chat, /health back to the ALB
 API service
   ├── Bedrock Knowledge Base (Retrieve)
   ├── Bedrock Rerank
-  └── Bedrock agent model (Converse)
+  ├── Bedrock agent model (ConverseStream)
+  └── S3 agent storage bucket (conversation history)
 ```
 
 | Resource | Name | File |
@@ -574,6 +655,7 @@ API service
 | ECR repositories | `sso-rag-api`, `sso-rag-ui` | `ecr.tf` |
 | Internal ALB + target groups | `sso-rag-alb` | `alb.tf` |
 | API Gateway + VPC Link | `sso-rag-api-gw` | `apigateway.tf` |
+| Agent storage bucket | `<environment>-sso-rag-agent-context-store` | `s3.tf` |
 | Task roles | `sso-rag-api-task`, `sso-rag-ui-task` | `iam.tf` |
 | Log groups | `/ecs/sso-rag/api`, `/ecs/sso-rag/ui`, `/aws/apigateway/sso-rag` | `ecs.tf`, `apigateway.tf` |
 
@@ -651,7 +733,7 @@ variables. See `terraform/terraform.tfvars.example`.
 | `model_arn` | Nova Lite `ca.` inference profile | Agent model |
 | `reranker_model_arn` | `amazon.rerank-v1:0` | Reranker model |
 | `number_of_results` | `25` | → `NUMBER_OF_RESULTS` |
-| `number_of_reranked_results` | `10` | → `NUMBER_OF_RERANKED_RESULTS` |
+| `number_of_reranked_results` | `6` | → `NUMBER_OF_RERANKED_RESULTS` |
 | `min_rerank_score` | `0.05` | → `MIN_RERANK_SCORE` |
 | `search_type` | `SEMANTIC` | → `SEARCH_TYPE` |
 | `api_cpu` / `api_memory` | `512` / `1024` | API task size |
@@ -692,7 +774,7 @@ aws ecs wait services-stable --cluster sso-rag-cluster --services sso-rag-api ss
 URL=$(terraform -chdir=terraform output -raw api_gateway_url)
 
 curl "$URL/health"
-curl -X POST "$URL/chat" -H "Content-Type: application/json" \
+curl -N -c cookies.txt -b cookies.txt -X POST "$URL/chat" -H "Content-Type: application/json" \
   -d '{"prompt": "How do I request a new integration?"}'
 ```
 
@@ -705,11 +787,6 @@ Logs: CloudWatch `/ecs/sso-rag/api` (app and tool logs) and
   integration timeout. Agent answers that need several searches can exceed
   it and return 504. If that becomes common, front the ALB with CloudFront or
   a public ALB instead of API Gateway.
-- **UI endpoint.** The UI posts `{"query": ...}` to `/query` and expects a
-  streamed (SSE) response; the agentic API currently exposes `/chat` with a
-  JSON response. The ALB already routes `/query` to the API, but the endpoint
-  itself still needs to be added (or the UI pointed at `/chat`).
-
 ---
 
 # Security Considerations
@@ -726,6 +803,8 @@ bedrock:InvokeModel                    # agent model and reranker model
 bedrock:InvokeModelWithResponseStream  # agent model (ConverseStream)
 bedrock:GetInferenceProfile            # cross-region inference profile
 bedrock:Rerank                         # reranking merged results
+s3:GetObject, s3:PutObject             # conversation history (agent storage bucket)
+s3:DeleteObject, s3:ListBucket         # DELETE /chat and session cleanup
 ```
 
 These are defined for the API task role in `terraform/iam.tf`. Model
@@ -748,8 +827,8 @@ Avoid storing secrets in source control.
 
 ## Memory
 
-- Per-session conversation history (an agent per session instead of per request)
-- User memory
+- User memory across conversations
+- Restoring the visible chat history in the UI after a page reload (history is kept server-side)
 
 ## Retrieval
 

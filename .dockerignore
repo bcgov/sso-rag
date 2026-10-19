@@ -14,3 +14,4 @@ ui/
 terraform/
 chunker/
 *.md
+.agent-store/

@@ -1,7 +1,7 @@
 import json
 import logging
 
-from strands import tool
+from strands import ToolContext, tool
 
 from app.retrieval.knowledge_base import (
     multi_search
@@ -9,11 +9,16 @@ from app.retrieval.knowledge_base import (
 
 logger = logging.getLogger(__name__)
 
+# invocation_state key: pass a list here when invoking the agent to collect
+# the sources this tool returned (see ChatService.stream).
+CITATIONS_KEY = "citations"
 
-@tool
+
+@tool(context=True)
 def search_knowledge_base(
     question: str,
-    queries: list[str]
+    queries: list[str],
+    tool_context: ToolContext
 ) -> str:
     """Search the BC Gov SSO (Keycloak / CSS app) documentation.
 
@@ -47,10 +52,18 @@ def search_knowledge_base(
                 "wording (the docs' own terms, the identity provider name, or "
                 "the error message text) before telling the user.")
 
+    citations = tool_context.invocation_state.get(CITATIONS_KEY)
+
     blocks = []
     for i, r in enumerate(hits, 1):
         meta = r.metadata
         title = meta.get("section") or meta.get("page_title", "")
+        if isinstance(citations, list):
+            citations.append({
+                "title": title,
+                "uri": meta.get("source_url") or r.source,
+                "score": r.score
+            })
         blocks.append(
             f"[{i}] {title}\n"
             f"source: {meta.get('source_url') or r.source}\n"

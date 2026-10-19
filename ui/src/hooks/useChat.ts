@@ -1,15 +1,43 @@
 import { useCallback, useState } from "react";
 import { flushSync } from "react-dom";
-import type { ChatCompletionChunk, ChatMessage, Citation } from "../types";
+import type {
+  ChatCompletionChunk,
+  ChatMessage,
+  ChatRequest,
+  Citation,
+  StreamError,
+} from "../types";
 
-const API_URL = "/query";
+// The API keeps conversation history server-side, keyed by an HttpOnly
+// session cookie it sets on the /chat response plus this tab's id. The UI is
+// served from the same origin (nginx / Vite proxy), so the browser sends the
+// cookie back automatically; `credentials: "same-origin"` makes that explicit.
+const API_URL = "http://localhost:8080/chat";
 const DONE_SENTINEL = "[DONE]";
+const TAB_ID_HEADER = "X-Tab-Id";
+const TAB_ID_KEY = "sso-rag-tab-id";
 
-function parseChunk(line: string): ChatCompletionChunk | null {
+// sessionStorage is per tab and survives reloads, so each tab keeps its own
+// conversation. (Duplicating a tab copies sessionStorage, so a duplicated tab
+// continues the original's conversation until it is cleared.)
+function getTabId(): string {
+  let tabId = sessionStorage.getItem(TAB_ID_KEY);
+  if (!tabId) {
+    tabId = crypto.randomUUID();
+    sessionStorage.setItem(TAB_ID_KEY, tabId);
+  }
+  return tabId;
+}
+
+function rotateTabId(): void {
+  sessionStorage.setItem(TAB_ID_KEY, crypto.randomUUID());
+}
+
+function parseChunk(line: string): ChatCompletionChunk | StreamError | null {
   const stripped = line.replace(/^data:\s*/, "");
   if (stripped === DONE_SENTINEL || stripped === "") return null;
   try {
-    return JSON.parse(stripped) as ChatCompletionChunk;
+    return JSON.parse(stripped) as ChatCompletionChunk | StreamError;
   } catch {
     return null;
   }
@@ -20,13 +48,13 @@ export function useChat() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const sendMessage = useCallback(async (query: string) => {
+  const sendMessage = useCallback(async (prompt: string) => {
     setError(null);
 
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: "user",
-      content: query,
+      content: prompt,
     };
 
     const assistantId = crypto.randomUUID();
@@ -41,10 +69,16 @@ export function useChat() {
     setIsStreaming(true);
 
     try {
+      const body: ChatRequest = { prompt };
       const response = await fetch(API_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query }),
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          [TAB_ID_HEADER]: getTabId(),
+        },
+        credentials: "same-origin",
+        body: JSON.stringify(body),
       });
 
       if (!response.ok) {
@@ -82,6 +116,12 @@ export function useChat() {
           const chunk = parseChunk(trimmed);
           if (!chunk) continue;
 
+          // The status is already 200 once streaming starts, so the server
+          // reports failures in-band.
+          if ("error" in chunk) {
+            throw new Error(chunk.error);
+          }
+
           const choice = chunk.choices[0];
           if (!choice) continue;
 
@@ -92,9 +132,7 @@ export function useChat() {
           }
 
           const { content, citations } = choice.delta;
-
-          if (content)
-            console.debug("[stream] chunk:", JSON.stringify(content));
+          if (!content && !citations) continue;
 
           flushSync(() => {
             setMessages((prev) =>
@@ -118,7 +156,7 @@ export function useChat() {
       const message =
         err instanceof Error ? err.message : "An unexpected error occurred.";
       setError(message);
-      // Remove the empty assistant placeholder on error
+      // Remove the assistant placeholder (and any partial answer) on error
       setMessages((prev) => prev.filter((m) => m.id !== assistantId));
     } finally {
       // Mark streaming done
@@ -131,10 +169,24 @@ export function useChat() {
     }
   }, []);
 
-  function clearMessages() {
+  const clearMessages = useCallback(async () => {
     setMessages([]);
     setError(null);
-  }
+
+    // Delete this tab's stored history, then switch to a new tab id so the
+    // next message starts a fresh conversation even if the delete failed.
+    try {
+      await fetch(API_URL, {
+        method: "DELETE",
+        headers: { [TAB_ID_HEADER]: getTabId() },
+        credentials: "same-origin",
+      });
+    } catch {
+      // Not fatal: the new tab id below already starts a new conversation.
+    } finally {
+      rotateTabId();
+    }
+  }, []);
 
   return { messages, isStreaming, error, sendMessage, clearMessages };
 }

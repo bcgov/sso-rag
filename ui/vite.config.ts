@@ -6,10 +6,9 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/query": {
+      "/chat": {
         target: "http://localhost:8000",
         changeOrigin: true,
-        selfHandleResponse: false,
         configure: (proxy) => {
           // Forward SSE chunks immediately — disable http-proxy's internal buffering.
           proxy.on("proxyRes", (proxyRes) => {

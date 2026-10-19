@@ -62,6 +62,7 @@ resource "aws_ecs_task_definition" "api" {
       ]
 
       environment = [
+        { name = "ENVIRONMENT", value = var.environment },
         { name = "AWS_REGION", value = var.aws_region },
         { name = "KNOWLEDGE_BASE_ID", value = var.knowledge_base_id },
         { name = "RERANKER_MODEL_ARN", value = var.reranker_model_arn },

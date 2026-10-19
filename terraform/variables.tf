@@ -35,7 +35,7 @@ variable "project_name" {
 }
 
 variable "environment" {
-  description = "Deployment environment (dev, staging, prod)"
+  description = "Deployment environment (sandbox, prod)"
   type        = string
   default     = "sandbox"
 }
@@ -70,7 +70,7 @@ variable "reranker_model_arn" {
 variable "number_of_reranked_results" {
   description = "Results kept after reranking for a single query (+2 per extra query, max 12)"
   type        = string
-  default     = "10"
+  default     = "6"
 }
 
 variable "number_of_results" {

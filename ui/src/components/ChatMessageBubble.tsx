@@ -1,8 +1,22 @@
+import Markdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { ChatMessage, Citation } from "../types";
 
 interface Props {
   message: ChatMessage;
 }
+
+// Answers link to the docs site; open those outside the chat.
+const markdownComponents: Components = {
+  a: ({ node: _node, ...props }) => (
+    <a {...props} target="_blank" rel="noopener noreferrer" />
+  ),
+  table: ({ node: _node, ...props }) => (
+    <div className="overflow-x-auto">
+      <table {...props} />
+    </div>
+  ),
+};
 
 export function ChatMessageBubble({ message }: Props) {
   const isUser = message.role === "user";
@@ -16,7 +30,17 @@ export function ChatMessageBubble({ message }: Props) {
             : "bg-gray-100 text-gray-900 rounded-bl-sm"
         }`}
       >
-        <p className="whitespace-pre-wrap break-words">{message.content}</p>
+        {isUser ? (
+          <p className="whitespace-pre-wrap break-words">{message.content}</p>
+        ) : (
+          // react-markdown doesn't render raw HTML, so model output can't
+          // inject markup.
+          <div className="prose prose-sm max-w-none break-words prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5 prose-pre:my-2 prose-headings:mt-3 prose-headings:mb-2 prose-a:text-blue-700 first:prose-p:mt-0 last:prose-p:mb-0">
+            <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+              {message.content}
+            </Markdown>
+          </div>
+        )}
 
         {message.streaming && (
           <span className="inline-block w-2 h-4 ml-1 bg-current opacity-70 animate-pulse rounded-sm align-middle" />
@@ -47,10 +71,10 @@ function CitationList({ citations }: { citations: Citation[] }) {
               rel="noopener noreferrer"
               className="underline hover:text-blue-700 break-all"
             >
-              {c.location.uri}
+              {c.title || c.location.uri}
             </a>
           ) : (
-            <span className="italic">Source {i + 1}</span>
+            <span className="italic">{c.title || `Source ${i + 1}`}</span>
           )}
           {c.location?.pageNumber !== undefined && (
             <span className="ml-1 text-gray-400">

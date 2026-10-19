@@ -23,6 +23,19 @@ export interface ChatCompletionChunk {
 }
 
 // ---------------------------------------------------------------------------
+// /chat request / response
+// ---------------------------------------------------------------------------
+
+export interface ChatRequest {
+  prompt: string;
+}
+
+/** In-band error event sent if the stream fails after it has started. */
+export interface StreamError {
+  error: string;
+}
+
+// ---------------------------------------------------------------------------
 // Citation shape returned by the API
 // ---------------------------------------------------------------------------
 
@@ -32,6 +45,8 @@ export interface CitationLocation {
 }
 
 export interface Citation {
+  /** Page / section title of the source */
+  title?: string;
   content?: string;
   location?: CitationLocation;
   score?: number;

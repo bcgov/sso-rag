@@ -77,3 +77,33 @@ resource "aws_iam_role" "ui_task" {
   name               = "${local.name_prefix}-ui-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume_role.json
 }
+
+# agent storage s3 bucket permissions for the api task role
+resource "aws_iam_policy" "api_agent_storage" {
+  name        = "${local.name_prefix}-api-agent-storage"
+  description = "Allow API task role to access the agent storage S3 bucket"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "arn:aws:s3:::${var.environment}-${local.name_prefix}-agent-context-store",
+          "arn:aws:s3:::${var.environment}-${local.name_prefix}-agent-context-store/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "api_agent_storage" {
+  role       = aws_iam_role.api_task.name
+  policy_arn = aws_iam_policy.api_agent_storage.arn
+}
