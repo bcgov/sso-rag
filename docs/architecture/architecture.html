@@ -969,7 +969,7 @@
         <div class="icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></div>
         <div class="label">Teams bridge</div>
         <div class="tech">PROPOSED · poll + reply</div>
-        <div class="port" data-port-aws="API / ECS task" data-port-local="local worker">API / ECS task</div>
+        <div class="port" data-port-aws="ECS svc · 1 task" data-port-local="local worker">ECS svc · 1 task</div>
         <span class="step-badge">·</span>
       </div>
 
@@ -1009,7 +1009,7 @@
         <div class="icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></div>
         <div class="label">Teams MCP server</div>
         <div class="tech">PROPOSED · Graph channel tools</div>
-        <div class="port" data-port-aws="ECS sidecar :8090" data-port-local="localhost:8090">ECS sidecar :8090</div>
+        <div class="port" data-port-aws="sidecar · localhost:8090" data-port-local="localhost:8090">sidecar · localhost:8090</div>
         <span class="step-badge">·</span>
       </div>
 
@@ -1711,7 +1711,7 @@ const flows = {
         "color": "--c-embed",
         "title": "Bridge polls via MCP",
         "route": "tools/call list_channel_messages",
-        "desc": "The bridge is an MCP client. On an interval (or a Graph change notification) it calls the Teams MCP server's read tool with a delta cursor.",
+        "desc": "The bridge is an MCP client running as its own ECS service (desired count 1, same API image, different command). The MCP server is a sidecar container in the same task, reached on <code>localhost:8090<\/code>. On an interval it calls the read tool with a delta cursor.",
         "payload": "{\n    \"jsonrpc\": \"2.0\", \"method\": \"tools/call\",\n    \"params\": {\n        \"name\": \"list_channel_messages\",\n        \"arguments\": { \"team_id\": \"…\", \"channel_id\": \"…\", \"since\": \"<delta token>\" }\n    }\n}",
         "chips": [
           "streamable HTTP",
@@ -1767,7 +1767,7 @@ const flows = {
         "color": "--c-orch",
         "title": "Ask the same agent",
         "route": "ChatService.stream()",
-        "desc": "The bridge reuses <code>ChatService<\/code>, so retrieval, citations and session storage behave exactly as for the web UI.",
+        "desc": "The bridge imports <code>ChatService<\/code> in-process (same image as the API), so retrieval, citations and session storage behave exactly as for the web UI — without going through API Gateway, so the 30s timeout doesn't apply.",
         "payload": "async for item in chat_service.stream(text, conversation_id):\n    collect text + citations",
         "from": "bridge"
       },

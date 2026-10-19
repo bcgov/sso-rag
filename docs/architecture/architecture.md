@@ -27,8 +27,8 @@ not implemented yet). Everything else reflects the current code.
 | Session cleanup | Job | FastAPI lifespan loop, or `python -m app.jobs.cleanup_sessions` | Each API worker |
 | Docs chunker | Pipeline | `chunker/preprocess.py` → chunks + `.metadata.json` → S3 → KB sync | Manual |
 | GitHub Actions | Pipeline | Build/push images to ECR, `terraform apply`, ECS force-new-deployment | On push to `main` |
-| Teams bridge *(proposed)* | Job | MCP client; polls the channel, calls `ChatService`, posts replies | API lifespan task or separate ECS task |
-| Teams MCP server *(proposed)* | Integration | MCP server exposing Teams channel tools over Microsoft Graph | ECS sidecar / separate service |
+| Teams bridge *(proposed)* | Job | MCP client; polls the channel, calls `ChatService` in-process, posts replies | Dedicated ECS service `sso-rag-teams-bridge` (desired count 1), API image with a different command |
+| Teams MCP server *(proposed)* | Integration | MCP server exposing Teams channel tools over Microsoft Graph | Sidecar container in the bridge task, `localhost:8090` |
 | MS Teams channel *(proposed)* | Channel | SSO support channel | Microsoft 365 |
 
 ## Modes
@@ -91,7 +91,7 @@ sends the session cookie automatically.
 4. **Teams → MCP server**: new messages and replies.
 5. **MCP server → Bridge**: structured tool result. The bridge skips its own posts.
 6. **Bridge → Bridge**: maps the thread to a conversation id, `session_<uuid5(team:channel:thread)>`. This gives one conversation per thread, and it passes the existing validation without a cookie.
-7. **Bridge → Agent**: `ChatService.stream(text, conversation_id)`, the same path as the web UI.
+7. **Bridge → Agent**: `ChatService.stream(text, conversation_id)` is called in-process, the same code path as the web UI but without API Gateway, so the 30s limit doesn't apply.
 8. **Storage → Agent**: the thread's history is restored.
 9. **Agent → KB tool → Knowledge Base → KB tool → Agent**: search, as in flow 1.
 10. **Agent → Bedrock model**: the answer is generated.
@@ -105,7 +105,12 @@ Design notes for the proposal:
 - **Graph permissions.** Reading channel messages app-only needs `ChannelMessage.Read.All`, or resource-specific consent per team.
 - **Posting needs a different auth approach.** Graph only allows posting channel messages with **delegated** `ChannelMessage.Send`; app-only posting is limited to migration. So the MCP server needs a service account / delegated token, or replies could go through a Teams bot (Bot Framework) or a Workflows webhook instead.
 - **Secrets.** Entra app credentials go in AWS Secrets Manager and are read by the MCP server only.
-- **Deployment.** The MCP server could run as a sidecar in the API task (streamable HTTP on `localhost:8090`) or as its own ECS service. The bridge could be an API lifespan task, like session cleanup. With 2 workers and N tasks that needs a leader lock or a single dedicated ECS task, so each message is answered once.
+- **Deployment.** Run the bridge as its own ECS Fargate service, for example `sso-rag-teams-bridge`, in the existing cluster and private subnets, with `desired_count = 1`:
+  - **Image:** the same API image, so it imports `ChatService` in-process, with a different command, e.g. `python -m app.jobs.teams_bridge`.
+  - **MCP server:** a second container in the same task definition (a sidecar), reached on `localhost:8090` over streamable HTTP, so it's never exposed outside the task.
+  - **Networking:** no ALB rule or API Gateway route. The task only makes outbound calls to Graph, Bedrock and S3.
+  - **IAM:** its task role needs the same Bedrock and agent-storage S3 permissions as the API, plus `secretsmanager:GetSecretValue` for the Entra app secret, which only the MCP container receives.
+  - **Why not inside the API service:** every uvicorn worker (2 per task) on every API task would poll and reply, so each message could be answered several times. API scaling and the Teams poller also shouldn't be coupled. If it ever needs more than one task, add a lease (e.g. a conditional write on an S3 or DynamoDB lock object) or switch from polling to Graph change notifications behind a queue.
 - **Limits and retention.** Teams replies aren't limited by the API Gateway 30s timeout, because the bridge calls the agent in-process. Teams conversations are cleaned up by the same retention job, since their ids use the same format.
 
 ### 5. Session cleanup (background job)
