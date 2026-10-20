@@ -88,8 +88,9 @@ resource "aws_lb_listener_rule" "api_query" {
 
   condition {
     path_pattern {
-      # /chat and /documents/* are the agentic API; /query is the UI's endpoint
-      values = ["/chat", "/documents/*", "/query", "/query/*"]
+      # /chat, /chat/* (e.g. DELETE /chat/history) and /documents/* are the
+      # agentic API; /query is the UI's endpoint. ALB allows at most 5 values.
+      values = ["/chat", "/chat/*", "/documents/*", "/query", "/query/*"]
     }
   }
 }

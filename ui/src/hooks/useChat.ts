@@ -15,6 +15,7 @@ import type {
 // Relative (no leading slash) so it resolves under the API Gateway stage path
 // in AWS (/<stage>/chat) and to /chat locally.
 const API_URL = "chat";
+const HISTORY_URL = "chat/history";
 const DONE_SENTINEL = "[DONE]";
 const TAB_ID_HEADER = "X-Tab-Id";
 const TAB_ID_KEY = "sso-rag-tab-id";
@@ -50,11 +51,22 @@ export function useChat() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const typewriterRef = useRef<Typewriter | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
-  useEffect(() => () => typewriterRef.current?.cancel(), []);
+  // Stops the in-flight answer, if any (the server cancels the agent run
+  // when the client disconnects).
+  const stopStreaming = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    typewriterRef.current?.cancel();
+  }, []);
+
+  useEffect(() => stopStreaming, [stopStreaming]);
 
   const sendMessage = useCallback(async (prompt: string) => {
     setError(null);
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
@@ -96,6 +108,7 @@ export function useChat() {
         },
         credentials: "same-origin",
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -164,6 +177,9 @@ export function useChat() {
       });
     } catch (err) {
       typewriter.cancel();
+      // Stopped on purpose (new chat / delete history): the messages are
+      // already gone, so there is nothing to report.
+      if (controller.signal.aborted) return;
       const message =
         err instanceof Error ? err.message : "An unexpected error occurred.";
       setError(message);
@@ -171,12 +187,16 @@ export function useChat() {
       setMessages((prev) => prev.filter((m) => m.id !== assistantId));
     } finally {
       if (typewriterRef.current === typewriter) typewriterRef.current = null;
-      setIsStreaming(false);
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+        setIsStreaming(false);
+      }
     }
   }, []);
 
   const clearMessages = useCallback(async () => {
-    typewriterRef.current?.cancel();
+    stopStreaming();
+    setIsStreaming(false);
     setMessages([]);
     setError(null);
 
@@ -193,7 +213,41 @@ export function useChat() {
     } finally {
       rotateTabId();
     }
-  }, []);
+  }, [stopStreaming]);
 
-  return { messages, isStreaming, error, sendMessage, clearMessages };
+  // Permanently deletes this browser's stored history (every tab's
+  // conversation) and its session cookie. Throws if the server couldn't
+  // delete everything, leaving the current conversation on screen so the
+  // user can retry.
+  const deleteHistory = useCallback(async () => {
+    const response = await fetch(HISTORY_URL, {
+      method: "DELETE",
+      credentials: "same-origin",
+    });
+    if (!response.ok) {
+      let detail = `HTTP ${response.status}: ${response.statusText}`;
+      try {
+        const body = (await response.json()) as { detail?: unknown };
+        if (typeof body.detail === "string") detail = body.detail;
+      } catch {
+        // Keep the status text.
+      }
+      throw new Error(detail);
+    }
+
+    stopStreaming();
+    setIsStreaming(false);
+    setMessages([]);
+    setError(null);
+    rotateTabId();
+  }, [stopStreaming]);
+
+  return {
+    messages,
+    isStreaming,
+    error,
+    sendMessage,
+    clearMessages,
+    deleteHistory,
+  };
 }

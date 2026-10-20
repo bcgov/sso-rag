@@ -435,7 +435,16 @@ With `X-Tab-Id`, deletes that tab's stored history and keeps the cookie (other
 tabs still use it). Without it, deletes the cookie-level history and clears
 the cookie.
 
-### Session cleanup
+```http
+DELETE /chat/history
+```
+
+Deletes all of the browser's stored history — the cookie-level conversation
+and every tab's — and clears the cookie, so the next `/chat` call starts a new
+session. Returns `204` (also when nothing is stored). If some conversations
+can't be deleted it returns `500` with `{"detail": "..."}` and keeps the
+cookie so the request can be retried. The UI's **Delete history** button calls
+it after a confirmation dialog.
 
 Conversations are kept in the agent storage (`.agent-store/` locally, the
 `AGENT_STORAGE_S3_BUCKET` bucket otherwise) under `session/<id>/` and
@@ -821,7 +830,7 @@ bedrock:InvokeModelWithResponseStream  # agent model (ConverseStream)
 bedrock:GetInferenceProfile            # cross-region inference profile
 bedrock:Rerank                         # reranking merged results
 s3:GetObject, s3:PutObject             # conversation history (agent storage bucket)
-s3:DeleteObject, s3:ListBucket         # DELETE /chat and session cleanup
+s3:DeleteObject, s3:ListBucket         # DELETE /chat, DELETE /chat/history, session cleanup
 ```
 
 These are defined for the API task role in `terraform/iam.tf`. Model

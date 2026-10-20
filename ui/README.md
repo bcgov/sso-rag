@@ -56,7 +56,11 @@ Core logic hook:
 - Conversation history is kept server-side, keyed by an `HttpOnly` session cookie the API sets on the first response plus an `X-Tab-Id` header; the browser sends the cookie back automatically because the UI is served from the same origin
 - The tab id is a UUID in `sessionStorage`, so each tab has its own conversation and keeps it across reloads (a duplicated tab copies it and continues the same conversation until cleared)
 - Collects the `citations` chunk sent after the answer and shows the sources' titles as links
-- **Clear** calls `DELETE /chat` for this tab's history and then switches to a new tab id
+- **New chat** stops any in-flight answer, calls `DELETE /chat` for this tab's history and then switches to a new tab id
+- **Delete history** opens a confirmation dialog (`src/components/DeleteHistoryDialog.tsx`); confirming calls `DELETE /chat/history`, which erases every tab's stored conversation and the session cookie, then clears the screen and announces "Your chat history was deleted." If the server fails, the error is shown in the dialog with a **Try again** button and the conversation is kept
+
+**`src/components/DeleteHistoryDialog.tsx`**  
+Confirmation for the destructive delete, built on the native `<dialog>` (`showModal()` traps focus, makes the page inert, closes on `Escape` and returns focus to the opener). Focus starts on **Cancel**; the dialog can't be dismissed while the delete is in progress.
 
 **`src/components/ChatMessageBubble.tsx`**  
 Renders a single message. User messages are right-aligned (blue), assistant messages left-aligned (gray). Assistant messages are rendered as Markdown (GitHub-flavoured: lists, tables, code, links) with `react-markdown` + `remark-gfm` and styled with `@tailwindcss/typography`; raw HTML in answers is not rendered, and links open in a new tab. User messages are shown as plain text. While streaming, the text goes through `stabilizeStreamingMarkdown` (`src/lib/markdown.ts`), which shows an unfinished link as plain label text and drops or temporarily closes open `**`/`*`/`` ` ``/code-fence markers, so raw Markdown syntax never flashes on screen. The component is memoized so only the streaming bubble re-renders each frame. Shows a blinking cursor while streaming. Renders citation sources with links once streaming is complete.

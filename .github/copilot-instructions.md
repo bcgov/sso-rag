@@ -26,7 +26,7 @@ Ignore the `legacy/` folder; it is not part of the application.
 main.py                          FastAPI app: CORS middleware, lifespan (session cleanup loop), routers
 app/
   agents/rag_agent.py            BedrockModel, agent storage, create_agent(), session-id helpers, delete_session()
-  api/routes/chat.py             POST /chat (SSE stream), DELETE /chat (reset); session cookie + X-Tab-Id
+  api/routes/chat.py             POST /chat (SSE stream), DELETE /chat (reset), DELETE /chat/history; session cookie + X-Tab-Id
   api/routes/documents.py        GET /documents/search — raw single-query KB retrieval (debugging)
   api/routes/health.py           GET /health
   common/config.py               Settings (pydantic-settings, env vars / .env)
@@ -39,10 +39,11 @@ app/
   retrieval/models.py            RetrievedChunk
   schemas/                       Pydantic request/response models
   services/chat_service.py       ChatService.stream(), ThinkingFilter, select_citations
-  services/session_cleanup.py    deletes sessions inactive > SESSION_RETENTION_DAYS
+  services/session_cleanup.py    deletes sessions inactive > SESSION_RETENTION_DAYS; delete_browser_history()
   tools/knowledge_base_tool.py   @tool search_knowledge_base
 ui/src/
-  hooks/useChat.ts               fetch + SSE parsing, tab id, clear/reset
+  hooks/useChat.ts               fetch + SSE parsing, tab id, new chat / delete history, stream abort
+  components/DeleteHistoryDialog.tsx  native <dialog> confirmation for DELETE /chat/history
   components/ChatMessageBubble.tsx  Markdown rendering, citation list
   components/ChatInput.tsx       auto-growing input
   types.ts                       stream chunk / citation / message types
@@ -91,7 +92,16 @@ change `chat.py`, `ui/src/types.ts` and `useChat.ts` together.
 
 With `X-Tab-Id`: deletes that tab's stored conversation, keeps the cookie.
 Without it: deletes the cookie-level conversation and clears the cookie. The UI
-calls it on "Clear" and then rotates its tab id.
+calls it on "New chat" and then rotates its tab id.
+
+### `DELETE /chat/history`
+
+Deletes every conversation of the browser session (`session_<uuid>` and all
+`session_<uuid>__<tab>` ids, found by listing the `session/` and `context/`
+prefixes for that id) and clears the cookie; 204 even when nothing is stored.
+On a partial failure: 500 `{"detail"}` and the cookie is kept for a retry. The
+ALB listener rule must route `/chat/*` to the API for this path. The UI calls it
+from "Delete history" after a confirmation dialog.
 
 ## Sessions and storage
 

@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Header, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agents.rag_agent import (
     conversation_id,
@@ -25,6 +25,10 @@ from app.schemas.chat import (
 
 from app.services.chat_service import (
     chat_service
+)
+
+from app.services.session_cleanup import (
+    delete_browser_history
 )
 
 logger = logging.getLogger(__name__)
@@ -166,6 +170,37 @@ async def reset_chat(
     if is_valid_tab_id(tab_id):
         return
 
+    _clear_session_cookie(response)
+
+
+@router.delete(
+    "/chat/history",
+    status_code=204,
+    responses={500: {"description": "Some stored history could not be deleted"}}
+)
+async def delete_history(request: Request, response: Response):
+    """Deletes all of this browser's stored chat history — the conversations
+    of every tab — and clears the session cookie so the next /chat call
+    starts a new session. Idempotent: succeeds when nothing is stored."""
+
+    session_id = request.cookies.get(settings.session_cookie_name)
+
+    if is_valid_session_id(session_id):
+        try:
+            deleted = await delete_browser_history(session_id)
+        except Exception:
+            logger.exception("deleting chat history failed")
+            # Keep the cookie so the user can retry deleting what remains.
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Some history could not be deleted. Please try again."}
+            )
+        logger.info("deleted %d stored conversations on request", len(deleted))
+
+    _clear_session_cookie(response)
+
+
+def _clear_session_cookie(response: Response) -> None:
     response.delete_cookie(
         key=settings.session_cookie_name,
         httponly=True,

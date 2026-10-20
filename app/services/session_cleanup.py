@@ -1,5 +1,6 @@
-"""Deletes stored conversations that have been inactive for longer than
-SESSION_RETENTION_DAYS.
+"""Deletes stored conversations: those inactive for longer than
+SESSION_RETENTION_DAYS (scheduled cleanup), or all of one browser's
+conversations on request (DELETE /chat/history).
 
 Strands keeps each conversation under two prefixes of the agent storage:
 ``session/<id>/`` (agent snapshots, rewritten after every invocation) and
@@ -81,6 +82,73 @@ def list_session_activity() -> dict[str, datetime]:
     if settings.environment == "local":
         return _local_activity(LOCAL_STORAGE_DIR)
     return _s3_activity(settings.agent_storage_s3_bucket)
+
+
+def _belongs_to(conversation_id: str, session_id: str) -> bool:
+    return conversation_id == session_id or conversation_id.startswith(f"{session_id}__")
+
+
+def list_browser_conversations(session_id: str) -> set[str]:
+    """Every stored conversation of one browser session: the cookie-level one
+    (`session_<uuid>`) and each tab's (`session_<uuid>__<tab uuid>`). Listing
+    is scoped to the session's key prefix rather than the whole bucket."""
+
+    if not is_valid_session_id(session_id):
+        return set()
+
+    found: set[str] = set()
+    if settings.environment == "local":
+        for prefix in SESSION_PREFIXES:
+            root = os.path.join(LOCAL_STORAGE_DIR, prefix)
+            try:
+                names = os.listdir(root)
+            except FileNotFoundError:
+                continue
+            # Strands deletes files but leaves their directories behind.
+            found.update(
+                name for name in names
+                if any(files for _, _, files in os.walk(os.path.join(root, name)))
+            )
+    else:
+        import boto3
+
+        client = boto3.client("s3", region_name=settings.aws_region)
+        paginator = client.get_paginator("list_objects_v2")
+        for prefix in SESSION_PREFIXES:
+            pages = paginator.paginate(
+                Bucket=settings.agent_storage_s3_bucket,
+                Prefix=f"{prefix}/{session_id}"
+            )
+            for page in pages:
+                for obj in page.get("Contents", []):
+                    parts = obj["Key"].split("/")
+                    if len(parts) >= 2:
+                        found.add(parts[1])
+
+    return {
+        cid for cid in found
+        if _is_managed_id(cid) and _belongs_to(cid, session_id)
+    }
+
+
+async def delete_browser_history(session_id: str) -> list[str]:
+    """Deletes every stored conversation of one browser session (all of its
+    tabs). Returns the deleted conversation ids; raises if any delete fails
+    so the caller can report that history may remain."""
+
+    conversations = await asyncio.to_thread(list_browser_conversations, session_id)
+
+    failed = []
+    for cid in sorted(conversations):
+        try:
+            await delete_session(cid)
+        except Exception:
+            logger.exception("failed to delete conversation %s", cid)
+            failed.append(cid)
+
+    if failed:
+        raise RuntimeError(f"{len(failed)} of {len(conversations)} conversations could not be deleted")
+    return sorted(conversations)
 
 
 async def cleanup_expired_sessions(
