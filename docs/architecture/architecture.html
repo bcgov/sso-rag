@@ -793,7 +793,7 @@
   <!-- 1. Top-of-page text. Change SYSTEM_NAME, the accented words, and the subtitle. -->
   <span class="eyebrow"><span class="dot"></span> bcgov/sso-rag</span>
   <h1>SSO RAG Assistant <span class="accent">architecture &amp; data flows</span></h1>
-  <p class="sub">Agentic RAG for BC Gov SSO docs — React chat UI, FastAPI + Strands agent on ECS Fargate, Bedrock Knowledge Base, cookie + per-tab sessions in S3, and a proposed Microsoft Teams channel integration through an MCP server. Dashed nodes are proposed.</p>
+  <p class="sub">Agentic RAG for BC Gov SSO docs — React chat UI, FastAPI + Strands agent on ECS Fargate behind a streaming API Gateway REST API, Bedrock Knowledge Base, cookie + per-tab sessions in S3, and a proposed Microsoft Teams channel integration through an MCP server. Dashed nodes are proposed.</p>
 </header></header>
 
 <div class="controls">
@@ -928,8 +928,8 @@
       <div class="node" data-role="orch" data-id="apigw" data-modes="aws" style="left: 17%; top: 27%;">
         <div class="icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg></div>
         <div class="label">API Gateway</div>
-        <div class="tech">HTTP API · VPC Link</div>
-        <div class="port">public HTTPS</div>
+        <div class="tech">REST API · STREAM</div>
+        <div class="port">/&lt;stage&gt;/ · public HTTPS</div>
         <span class="step-badge">·</span>
       </div>
 
@@ -1119,13 +1119,13 @@ const flows = {
       {
         "to": "alb",
         "color": "--c-orch",
-        "title": "API Gateway → ALB over VPC Link",
-        "route": "$default · HTTP_PROXY",
-        "desc": "The HTTP API forwards the request unchanged to the internal ALB through the VPC Link. CORS preflight (<code>OPTIONS<\/code>) is answered at this layer for cross-origin callers.",
-        "payload": "$default route → integration \"alb\"\n    type:   HTTP_PROXY (payload format 1.0)\n    target: internal ALB listener :80 via VPC Link\n    CORS:   GET, POST, DELETE, OPTIONS\n            Content-Type, Authorization, X-Tab-Id",
+        "title": "API Gateway → ALB over VPC Link v2",
+        "route": "ANY /{proxy+} · HTTP_PROXY",
+        "desc": "The REST API strips the stage prefix (<code>/sandbox/chat<\/code> → <code>/chat<\/code>) and proxies the request to the internal ALB through VPC Link v2. Its integration uses <code>response_transfer_mode = STREAM<\/code>, so SSE chunks are forwarded as they arrive.",
+        "payload": "ANY /{proxy+}  →  integration (HTTP_PROXY)\n    connection:  VPC_LINK (v2) → integration_target = internal ALB\n    uri:         http://<alb-dns>/{proxy}\n    transfer:    STREAM   (HTTP APIs can't stream)\n    timeout:     300000 ms",
         "chips": [
-          "30s hard timeout",
-          "VPC Link"
+          "STREAM",
+          "VPC Link v2"
         ],
         "from": "apigw"
       },
@@ -1315,10 +1315,11 @@ const flows = {
         "color": "--c-user",
         "title": "Back through ALB → API Gateway",
         "route": "streamed, unbuffered",
-        "desc": "The response streams back through the ALB and API Gateway. The whole stream must finish within API Gateway's 30-second integration timeout.",
+        "desc": "Chunks stream back through the ALB and the REST API as they are produced (STREAM mode). A stream may last up to 5 minutes; the ALB's 120s idle timeout applies between chunks.",
         "payload": "HTTP/1.1 200 OK\nContent-Type: text/event-stream\nCache-Control: no-cache\nX-Accel-Buffering: no\nSet-Cookie: strands_session=session_9b1c…; HttpOnly; Max-Age=86400;\n            Path=/; SameSite=lax; Secure\n\ndata: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\ndata: {\"choices\":[{\"delta\":{\"content\":\"To get PROD approval…\"}}]}\ndata: {\"choices\":[{\"delta\":{\"citations\":[{\"title\":\"Requesting BCeID in PROD\",\n        \"location\":{\"uri\":\"https://bcgov.github.io/sso-docs/…\"},\"score\":0.81}]}}]}\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\ndata: [DONE]",
         "chips": [
-          "≤ 30s total"
+          "≤ 5 min stream",
+          "idle 120s"
         ],
         "from": "alb"
       },
@@ -1379,13 +1380,13 @@ const flows = {
       {
         "to": "alb",
         "color": "--c-orch",
-        "title": "API Gateway → ALB over VPC Link",
-        "route": "$default · HTTP_PROXY",
-        "desc": "The HTTP API forwards the request unchanged to the internal ALB through the VPC Link. CORS preflight (<code>OPTIONS<\/code>) is answered at this layer for cross-origin callers.",
-        "payload": "$default route → integration \"alb\"\n    type:   HTTP_PROXY (payload format 1.0)\n    target: internal ALB listener :80 via VPC Link\n    CORS:   GET, POST, DELETE, OPTIONS\n            Content-Type, Authorization, X-Tab-Id",
+        "title": "API Gateway → ALB over VPC Link v2",
+        "route": "ANY /{proxy+} · HTTP_PROXY",
+        "desc": "The REST API strips the stage prefix (<code>/sandbox/chat<\/code> → <code>/chat<\/code>) and proxies the request to the internal ALB through VPC Link v2. Its integration uses <code>response_transfer_mode = STREAM<\/code>, so SSE chunks are forwarded as they arrive.",
+        "payload": "ANY /{proxy+}  →  integration (HTTP_PROXY)\n    connection:  VPC_LINK (v2) → integration_target = internal ALB\n    uri:         http://<alb-dns>/{proxy}\n    transfer:    STREAM   (HTTP APIs can't stream)\n    timeout:     300000 ms",
         "chips": [
-          "30s hard timeout",
-          "VPC Link"
+          "STREAM",
+          "VPC Link v2"
         ],
         "from": "apigw"
       },
@@ -1503,10 +1504,11 @@ const flows = {
         "color": "--c-user",
         "title": "Back through ALB → API Gateway",
         "route": "streamed, unbuffered",
-        "desc": "The response streams back through the ALB and API Gateway. The whole stream must finish within API Gateway's 30-second integration timeout.",
+        "desc": "Chunks stream back through the ALB and the REST API as they are produced (STREAM mode). A stream may last up to 5 minutes; the ALB's 120s idle timeout applies between chunks.",
         "payload": "HTTP/1.1 200 OK\nContent-Type: text/event-stream\nSet-Cookie: strands_session=session_9b1c…; HttpOnly; Max-Age=86400; …; Secure\n\ndata: …",
         "chips": [
-          "≤ 30s total"
+          "≤ 5 min stream",
+          "idle 120s"
         ],
         "from": "alb"
       },
@@ -1567,13 +1569,13 @@ const flows = {
       {
         "to": "alb",
         "color": "--c-orch",
-        "title": "API Gateway → ALB over VPC Link",
-        "route": "$default · HTTP_PROXY",
-        "desc": "The HTTP API forwards the request unchanged to the internal ALB through the VPC Link. CORS preflight (<code>OPTIONS<\/code>) is answered at this layer for cross-origin callers.",
-        "payload": "$default route → integration \"alb\"\n    type:   HTTP_PROXY (payload format 1.0)\n    target: internal ALB listener :80 via VPC Link\n    CORS:   GET, POST, DELETE, OPTIONS\n            Content-Type, Authorization, X-Tab-Id",
+        "title": "API Gateway → ALB over VPC Link v2",
+        "route": "ANY /{proxy+} · HTTP_PROXY",
+        "desc": "The REST API strips the stage prefix (<code>/sandbox/chat<\/code> → <code>/chat<\/code>) and proxies the request to the internal ALB through VPC Link v2. Its integration uses <code>response_transfer_mode = STREAM<\/code>, so SSE chunks are forwarded as they arrive.",
+        "payload": "ANY /{proxy+}  →  integration (HTTP_PROXY)\n    connection:  VPC_LINK (v2) → integration_target = internal ALB\n    uri:         http://<alb-dns>/{proxy}\n    transfer:    STREAM   (HTTP APIs can't stream)\n    timeout:     300000 ms",
         "chips": [
-          "30s hard timeout",
-          "VPC Link"
+          "STREAM",
+          "VPC Link v2"
         ],
         "from": "apigw"
       },
@@ -1645,10 +1647,11 @@ const flows = {
         "color": "--c-user",
         "title": "Back through ALB → API Gateway",
         "route": "streamed, unbuffered",
-        "desc": "The response streams back through the ALB and API Gateway. The whole stream must finish within API Gateway's 30-second integration timeout.",
+        "desc": "Chunks stream back through the ALB and the REST API as they are produced (STREAM mode). A stream may last up to 5 minutes; the ALB's 120s idle timeout applies between chunks.",
         "payload": "HTTP/1.1 204 No Content\n// with X-Tab-Id: cookie kept\n\n// without X-Tab-Id:\nSet-Cookie: strands_session=\"\"; Max-Age=0;\n            HttpOnly; Path=/; SameSite=lax; Secure",
         "chips": [
-          "≤ 30s total"
+          "≤ 5 min stream",
+          "idle 120s"
         ],
         "from": "alb"
       },
@@ -1767,7 +1770,7 @@ const flows = {
         "color": "--c-orch",
         "title": "Ask the same agent",
         "route": "ChatService.stream()",
-        "desc": "The bridge imports <code>ChatService<\/code> in-process (same image as the API), so retrieval, citations and session storage behave exactly as for the web UI — without going through API Gateway, so the 30s timeout doesn't apply.",
+        "desc": "The bridge imports <code>ChatService<\/code> in-process (same image as the API), so retrieval, citations and session storage behave exactly as for the web UI, without going through API Gateway.",
         "payload": "async for item in chat_service.stream(text, conversation_id):\n    collect text + citations",
         "from": "bridge"
       },

@@ -12,7 +12,9 @@ import type {
 // session cookie it sets on the /chat response plus this tab's id. The UI is
 // served from the same origin (nginx / Vite proxy), so the browser sends the
 // cookie back automatically; `credentials: "same-origin"` makes that explicit.
-const API_URL = "/chat";
+// Relative (no leading slash) so it resolves under the API Gateway stage path
+// in AWS (/<stage>/chat) and to /chat locally.
+const API_URL = "chat";
 const DONE_SENTINEL = "[DONE]";
 const TAB_ID_HEADER = "X-Tab-Id";
 const TAB_ID_KEY = "sso-rag-tab-id";

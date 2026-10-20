@@ -4,6 +4,13 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SSO RAG Chat</title>
+    <script>
+      // Assets and API calls are relative to this page, so the stage URL must
+      // end in "/" (…/sandbox → …/sandbox/), or they would resolve to the host root.
+      if (!location.pathname.endsWith("/") && !/\.[a-z0-9]+$/i.test(location.pathname)) {
+        location.replace(location.pathname + "/" + location.search + location.hash);
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>

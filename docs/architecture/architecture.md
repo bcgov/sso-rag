@@ -16,7 +16,7 @@ not implemented yet). Everything else reflects the current code.
 | Browser · Chat UI | User | React SPA, `useChat` hook, Markdown rendering | Browser |
 | UI service | Edge | nginx serving the built SPA; proxies `/chat`, `/health` to the ALB | ECS Fargate `:8080` (AWS) |
 | Vite dev server | Edge | Dev server proxying `/chat`, `/health` to uvicorn | `localhost:5173` (Local) |
-| API Gateway | Edge | HTTP API, `$default` route, VPC Link, CORS, 30s timeout | AWS |
+| API Gateway | Edge | REST API, stage `/<environment>/`, `ANY /` + `ANY /{proxy+}` HTTP_PROXY integrations with `response_transfer_mode = STREAM`, VPC Link v2 to the ALB | AWS |
 | Internal ALB | Edge | Path rules: `/chat`, `/documents/*`, `/health` → API; rest → UI; idle 120s | AWS |
 | FastAPI API | API | `POST/DELETE /chat` (SSE), `/health`, `/documents/search`; session cookie + `X-Tab-Id` | ECS Fargate `:8000`, 2 workers / `uvicorn :8000` |
 | Strands Agent | Agent | New `Agent` per request, `SnapshotSessionManager`, `ThinkingFilter` | In the API process |
@@ -35,7 +35,7 @@ not implemented yet). Everything else reflects the current code.
 
 | | AWS | Local |
 | --- | --- | --- |
-| Request path | Browser → API Gateway → ALB → API | Browser → Vite dev server → uvicorn |
+| Request path | Browser → API Gateway REST API (`/<stage>/…`) → ALB → API | Browser → Vite dev server → uvicorn |
 | UI | nginx UI service on Fargate | Vite dev server |
 | Agent storage | `S3Storage` (`AGENT_STORAGE_S3_BUCKET`) | `LocalFileStorage("./.agent-store/")` (`ENVIRONMENT=local`) |
 | Cookie | `Secure` | `SESSION_COOKIE_SECURE=false` (plain HTTP) |
@@ -51,7 +51,7 @@ sends the session cookie automatically.
 ### 1. New chat → session cookie (`POST /chat`)
 
 1. **Browser → API Gateway** (Local: **→ Vite**): `POST /chat` with `{"prompt"}` and `X-Tab-Id: <uuid>` from the tab's `sessionStorage`. There's no cookie yet.
-2. **API Gateway → ALB** over the VPC Link. CORS preflight (`OPTIONS`) is answered here.
+2. **API Gateway → ALB** over VPC Link v2. The REST API strips the stage prefix (`/sandbox/chat` → `/chat`), and its integration streams the response (`STREAM`). `OPTIONS` is proxied to FastAPI's CORS middleware.
 3. **ALB → API** via the `/chat` path rule (Local: **Vite → uvicorn**).
 4. **API → API**: `strands_session` is missing or invalid, so a new `session_<uuid4>` is created. With a valid tab id, the conversation id becomes `session_<uuid>__<tab uuid>`.
 5. **API → Agent**: `create_agent(conversation_id)` builds a fresh agent with `SnapshotSessionManager`.
@@ -91,7 +91,7 @@ sends the session cookie automatically.
 4. **Teams → MCP server**: new messages and replies.
 5. **MCP server → Bridge**: structured tool result. The bridge skips its own posts.
 6. **Bridge → Bridge**: maps the thread to a conversation id, `session_<uuid5(team:channel:thread)>`. This gives one conversation per thread, and it passes the existing validation without a cookie.
-7. **Bridge → Agent**: `ChatService.stream(text, conversation_id)` is called in-process, the same code path as the web UI but without API Gateway, so the 30s limit doesn't apply.
+7. **Bridge → Agent**: `ChatService.stream(text, conversation_id)` is called in-process, the same code path as the web UI but without going through API Gateway.
 8. **Storage → Agent**: the thread's history is restored.
 9. **Agent → KB tool → Knowledge Base → KB tool → Agent**: search, as in flow 1.
 10. **Agent → Bedrock model**: the answer is generated.
@@ -111,7 +111,7 @@ Design notes for the proposal:
   - **Networking:** no ALB rule or API Gateway route. The task only makes outbound calls to Graph, Bedrock and S3.
   - **IAM:** its task role needs the same Bedrock and agent-storage S3 permissions as the API, plus `secretsmanager:GetSecretValue` for the Entra app secret, which only the MCP container receives.
   - **Why not inside the API service:** every uvicorn worker (2 per task) on every API task would poll and reply, so each message could be answered several times. API scaling and the Teams poller also shouldn't be coupled. If it ever needs more than one task, add a lease (e.g. a conditional write on an S3 or DynamoDB lock object) or switch from polling to Graph change notifications behind a queue.
-- **Limits and retention.** Teams replies aren't limited by the API Gateway 30s timeout, because the bridge calls the agent in-process. Teams conversations are cleaned up by the same retention job, since their ids use the same format.
+- **Limits and retention.** Teams replies aren't subject to API Gateway limits, because the bridge calls the agent in-process. Teams conversations are cleaned up by the same retention job, since their ids use the same format.
 
 ### 5. Session cleanup (background job)
 
@@ -149,4 +149,4 @@ To run it externally instead, set `SESSION_CLEANUP_INTERVAL_HOURS=0` and schedul
 - **"Can JavaScript steal the session?"** Flow 1, last steps: the cookie is `HttpOnly`, and the tab id alone can't open another browser's history.
 - **"What happens after a page reload?"** Same cookie and the same `sessionStorage` tab id, so the history is still on the server. The UI doesn't re-display old messages yet.
 - **"How would Teams users get the same answers?"** Flow 4: the bridge reuses `ChatService`, so retrieval, citations and storage are shared.
-- **"Where can a long answer fail?"** Flow 1, "Back through ALB → API Gateway": the 30-second API Gateway timeout.
+- **"Why does the answer stream in AWS?"** Flow 1, "API Gateway → ALB": the REST API integration uses `STREAM` mode (an HTTP API would buffer the whole answer). Streams are capped at 5 minutes, with the ALB's 120s idle timeout between chunks.

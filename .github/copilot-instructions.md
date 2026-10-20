@@ -14,7 +14,7 @@ streams the answer to a React chat UI.
 - **UI:** React 18 + TypeScript, Vite, Tailwind CSS (+ `@tailwindcss/typography`),
   `react-markdown` + `remark-gfm`. Uses **yarn** (`ui/yarn.lock`); served by nginx in Docker.
 - **Infra:** Terraform (`terraform/`) — ECS Fargate (API + UI), internal ALB,
-  API Gateway HTTP API via VPC Link, ECR, S3, IAM. Deployed by GitHub Actions.
+  API Gateway REST API (response streaming) via VPC Link v2, ECR, S3, IAM. Deployed by GitHub Actions.
 - **Chunker:** standalone script (`chunker/preprocess.py`) that turns the
   `bcgov/sso-docs` Markdown into Bedrock-KB chunks with `.metadata.json` sidecars.
 
@@ -179,7 +179,7 @@ excluded by `.dockerignore`.
 
 ### UI
 - Follow `.github/skills/react`. Function components and hooks; Tailwind classes, no CSS files beyond `index.css`.
-- All API calls are same-origin relative paths (`/chat`, `/health`) with
+- All API calls are same-origin, page-relative paths (`chat`, not `/chat`) with
   `credentials: "same-origin"`; never store the session id in JS (it is HttpOnly).
 - Assistant messages render as Markdown (`react-markdown`, no raw HTML); user
   messages stay plain text. Links open in a new tab.
@@ -190,8 +190,8 @@ excluded by `.dockerignore`.
 - **New API path:** `ui/vite.config.ts` proxy, `ui/nginx.conf` location regex,
   and the ALB listener rule in `terraform/alb.tf` (paths are matched exactly —
   `/chat` does not cover `/chat/x`).
-- **New request header or HTTP method from the UI:** CORS in `main.py` and
-  `cors_configuration` in `terraform/apigateway.tf`.
+- **New request header or HTTP method from the UI:** CORS in `main.py`
+  (`terraform/apigateway.tf` needs no change — the REST API proxies `OPTIONS` to FastAPI).
 - **New env var:** `config.py`, the README env table, and the API task
   `environment` list in `terraform/ecs.tf` if it must differ from the default.
 - **New AWS call:** API task role in `terraform/iam.tf`.
@@ -242,6 +242,9 @@ questions (including multi-part ones).
   --timeout-keep-alive 125` (longer than the 120s ALB idle timeout).
 - UI image: nginx on :8080; `API_URL` is substituted into `nginx.conf` at
   container start; proxy buffering is off for SSE.
-- API Gateway HTTP APIs have a hard 30s integration timeout — long multi-search
-  answers can be cut off mid-stream.
+- API Gateway is a **REST API** with `response_transfer_mode = "STREAM"` on its
+  `HTTP_PROXY` integrations — don't switch back to an HTTP API (it buffers SSE).
+  Streams can run up to `timeout_milliseconds` (300s). The invoke URL ends in
+  `/<environment>/`, so UI assets and API calls must stay relative (`base: "./"`,
+  `fetch("chat")`); never use root-absolute paths in the UI.
 - Terraform state: S3 backend, region `ca-central-1`. `*.tfvars` are git-ignored.

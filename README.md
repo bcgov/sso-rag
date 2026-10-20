@@ -629,16 +629,21 @@ uv run pytest
 # Deployment
 
 The API and UI run as two ECS Fargate services behind an internal ALB, exposed
-publicly through an API Gateway HTTP API. Infrastructure is in `terraform/`
+publicly through an API Gateway REST API. Infrastructure is in `terraform/`
 and deployed by GitHub Actions.
+
+API Gateway is a **REST API** (not an HTTP API) because only REST APIs can
+stream integration responses (`response_transfer_mode = "STREAM"`). An HTTP
+API buffers the whole `/chat` SSE response, so the answer would appear all at
+once. Streaming needs AWS provider ≥ 6.26.
 
 ## AWS Topology
 
 ```text
 Client
   ↓
-API Gateway (HTTP API, $default route)
-  ↓  VPC Link
+API Gateway (REST API, stage /<environment>/, ANY / and /{proxy+}, STREAM)
+  ↓  VPC Link v2 → ALB (integration_target)
 Internal ALB (port 80, idle timeout 120s)
   ├── /chat, /documents/*, /health  →  API service (Fargate, :8000)
   └── everything else              →  UI service  (Fargate, :8080)
@@ -656,7 +661,8 @@ API service
 | ECS services | `sso-rag-api`, `sso-rag-ui` | `ecs.tf` |
 | ECR repositories | `sso-rag-api`, `sso-rag-ui` | `ecr.tf` |
 | Internal ALB + target groups | `sso-rag-alb` | `alb.tf` |
-| API Gateway + VPC Link | `sso-rag-api-gw` | `apigateway.tf` |
+| API Gateway REST API + stage + VPC Link v2 | `sso-rag-api-gw`, stage `<environment>` | `apigateway.tf` |
+| API Gateway CloudWatch role (account setting, for access logs) | `sso-rag-apigw-cloudwatch` | `apigateway.tf` |
 | Agent storage bucket | `<environment>-sso-rag-agent-context-store` | `s3.tf` |
 | Task roles | `sso-rag-api-task`, `sso-rag-ui-task` | `iam.tf` |
 | Log groups | `/ecs/sso-rag/api`, `/ecs/sso-rag/ui`, `/aws/apigateway/sso-rag` | `ecs.tf`, `apigateway.tf` |
@@ -773,10 +779,10 @@ aws ecs wait services-stable --cluster sso-rag-cluster --services sso-rag-api ss
 ## Verifying a Deployment
 
 ```bash
-URL=$(terraform -chdir=terraform output -raw api_gateway_url)
+URL=$(terraform -chdir=terraform output -raw api_gateway_url)   # https://<id>.execute-api.ca-central-1.amazonaws.com/<environment>/
 
-curl "$URL/health"
-curl -N -c cookies.txt -b cookies.txt -X POST "$URL/chat" -H "Content-Type: application/json" \
+curl "${URL}health"
+curl -N -c cookies.txt -b cookies.txt -X POST "${URL}chat" -H "Content-Type: application/json" \
   -d '{"prompt": "How do I request a new integration?"}'
 ```
 
@@ -785,10 +791,19 @@ Logs: CloudWatch `/ecs/sso-rag/api` (app and tool logs) and
 
 ## Known Limitations
 
-- **30-second request limit.** API Gateway HTTP APIs have a fixed 30s
-  integration timeout. Agent answers that need several searches can exceed
-  it and return 504. If that becomes common, front the ALB with CloudFront or
-  a public ALB instead of API Gateway.
+- **Stage path in the URL.** The REST API invoke URL ends in `/<environment>/`.
+  The UI is built with a relative base (`base: "./"`) and calls `chat`
+  relatively, and `index.html` adds a missing trailing slash. A custom domain
+  with a base path mapping would remove the stage segment.
+- **Streaming limits.** A streamed response can last up to 5 minutes here
+  (`timeout_milliseconds = 300000`; the API Gateway maximum is 15). The idle gap
+  between chunks is limited by the ALB idle timeout (120s) and API Gateway's
+  5-minute idle timeout for Regional endpoints.
+- **No CORS at API Gateway.** `OPTIONS` requests are proxied to FastAPI's
+  `CORSMiddleware` (configured via `CORS_ORIGINS`).
+- **Account-wide setting.** REST API access logs need a CloudWatch role in the
+  account's API Gateway settings; `aws_api_gateway_account` sets it for the
+  whole account/region, and destroying it resets that setting.
 ---
 
 # Security Considerations
