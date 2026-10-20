@@ -69,6 +69,17 @@ async def delete_session(session_id: str) -> None:
     await SnapshotSessionManager(session_id, storage=storage).delete_session()
 
 
+async def replace_last_answer(agent: Agent, session_id: str, text: str) -> None:
+    """Swaps the text of the agent's last reply and re-saves the session, so
+    a rejected answer isn't kept as context for the next turn."""
+
+    for message in reversed(agent.messages):
+        if message["role"] == "assistant":
+            message["content"] = [{"text": text}]
+            break
+    await SnapshotSessionManager(session_id, storage=storage).save_snapshot(agent, is_latest=True)
+
+
 def create_agent(session_id: str) -> Agent:
     """A fresh agent per request, restored from the session's stored snapshot:
     Agent keeps its message history, so sharing one instance would leak

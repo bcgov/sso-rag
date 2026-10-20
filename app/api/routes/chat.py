@@ -24,6 +24,8 @@ from app.schemas.chat import (
 )
 
 from app.services.chat_service import (
+    Heartbeat,
+    Status,
     chat_service
 )
 
@@ -80,17 +82,24 @@ async def _event_stream(prompt: str, session_id: str) -> AsyncIterator[str]:
         yield _sse(completion_id, {"role": "assistant"})
 
         async for item in chat_service.stream(prompt, session_id, cancel_signal=cancel):
-            if isinstance(item, str):
-                yield _sse(completion_id, {"content": item})
+            if isinstance(item, Heartbeat):
+                # SSE comment: ignored by clients, keeps proxies from timing out.
+                yield ": keepalive\n\n"
+            elif isinstance(item, Status):
+                yield _sse(completion_id, {"status": item.value})
             else:
-                yield _sse(completion_id, {"citations": [
-                    {
-                        "title": c["title"],
-                        "location": {"uri": c["uri"]},
-                        "score": c["score"]
-                    }
-                    for c in item
-                ]})
+                yield _sse(completion_id, {"content": item.text})
+                if item.grounding_status:
+                    yield _sse(completion_id, {"grounding_status": item.grounding_status})
+                if item.citations:
+                    yield _sse(completion_id, {"citations": [
+                        {
+                            "title": c["title"],
+                            "location": {"uri": c["uri"]},
+                            "score": c["score"]
+                        }
+                        for c in item.citations
+                    ]})
 
         yield _sse(completion_id, {}, finish_reason="stop")
     except Exception:
@@ -112,9 +121,15 @@ async def chat(
     tab_id: str | None = Header(default=None, alias=TAB_ID_HEADER)
 ) -> StreamingResponse:
     """Streams the answer as server-sent events in the OpenAI
-    `chat.completion.chunk` format, terminated by `data: [DONE]`. When
-    sources were used, a chunk with `delta.citations` precedes the final
-    `finish_reason: "stop"` chunk.
+    `chat.completion.chunk` format, terminated by `data: [DONE]`.
+
+    The answer is checked against the retrieved documentation before it is
+    sent (app/services/grounding.py), so it arrives as one `content` chunk,
+    preceded by `delta.status` progress chunks ("searching", "writing") and
+    followed by `delta.grounding_status` (SUPPORTED, PARTIALLY_SUPPORTED or
+    NOT_SUPPORTED; omitted for greetings and clarifying questions) and, when
+    sources were used, `delta.citations`, then the `finish_reason: "stop"`
+    chunk. Rejected answers are replaced with the no-documentation reply.
 
     History is kept per browser (session cookie) and, when the
     `X-Tab-Id` header is sent, per tab within that browser."""

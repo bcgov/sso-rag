@@ -1,3 +1,24 @@
+# Sent instead of the model's answer when the documentation doesn't cover the
+# question (grounding_status NOT_SUPPORTED) or the answer fails the grounding
+# checks in app/services/grounding.py. The system prompt quotes it verbatim.
+NO_DOCUMENTATION_RESPONSE = """
+The available SSO documentation does not appear to cover this scenario.
+
+For further assistance, contact:
+
+- Microsoft Teams: [Keycloak How-to](https://teams.microsoft.com/l/channel/19%3A35d0b3389e39479590ba45a19a67a3ba%40thread.tacv2/SSOKeycloak-howto?groupId=a80418da-c27b-406e-89ab-7695b61924d8&tenantId=6fdb5200-3d0d-4a8a-b036-d3685e359adc)
+- Email: bcgov.sso@gov.bc.ca
+
+Include the following details, with secrets and tokens removed:
+
+- Integration ID
+- Environment
+- Identity provider
+- Client ID
+- Exact error message
+- Timestamp
+""".strip()
+
 # Acronyms and shorthand that the docs usually spell out. When a query uses
 # the short form, the expansion is appended so the embedding also matches the
 # documentation's wording. Keep this to genuine abbreviations: general words

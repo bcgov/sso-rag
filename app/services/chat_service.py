@@ -1,10 +1,17 @@
 import asyncio
-import re
+import json
+import logging
 import threading
+import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
-from app.agents.rag_agent import create_agent
+from app.agents.rag_agent import create_agent, replace_last_answer
+from app.common.constants import NO_DOCUMENTATION_RESPONSE
+from app.services.grounding import NOT_SUPPORTED, grounding_block, verify
 from app.tools.knowledge_base_tool import CITATIONS_KEY
+
+logger = logging.getLogger(__name__)
 
 OPEN_TAG = "<thinking>"
 CLOSE_TAG = "</thinking>"
@@ -97,28 +104,29 @@ class ThinkingFilter:
             out.append(ch)
         return "".join(out)
 
-
-def _links_to(answer: str, uri: str) -> bool:
-    """True if the answer contains `uri` (with or without its #fragment) as a
-    whole URL, not as a prefix of a longer one."""
-    for candidate in {uri, uri.split("#", 1)[0]}:
-        if re.search(re.escape(candidate) + r"(?=[)#\s>\"'\]]|$)", answer):
-            return True
-    return False
+@dataclass(frozen=True)
+class Status:
+    """Progress while the answer is prepared: "searching" (a knowledge base
+    search is running) or "writing" (the model is writing the answer, which
+    is checked before it is sent)."""
+    value: str
 
 
-def select_citations(retrieved: list[dict], answer: str) -> list[dict]:
-    """Sources for the answer: the retrieved results the answer links to
-    (the prompt asks for markdown links from each result's "source:" line),
-    or every retrieved result if it links none. Deduplicated by URL."""
-    unique: dict[str, dict] = {}
-    for c in retrieved:
-        uri = c.get("uri")
-        if uri and (uri not in unique or c["score"] > unique[uri]["score"]):
-            unique[uri] = c
+@dataclass(frozen=True)
+class Heartbeat:
+    """Nothing to send yet; keeps idle proxies from closing the stream."""
 
-    cited = [c for uri, c in unique.items() if _links_to(answer, uri)]
-    return cited or list(unique.values())
+
+@dataclass(frozen=True)
+class Answer:
+    """The checked answer: the model's text, or the no-documentation reply
+    if it was rejected."""
+    text: str
+    grounding_status: str | None
+    citations: list[dict]
+
+
+HEARTBEAT_SECONDS = 10
 
 
 class ChatService:
@@ -128,34 +136,63 @@ class ChatService:
         question: str,
         session_id: str,
         cancel_signal: threading.Event | None = None
-    ) -> AsyncIterator[str | list[dict]]:
-        """Yields the answer text (str) as it is generated, minus <thinking>
-        blocks, then once at the end the list of cited sources, if any."""
+    ) -> AsyncIterator[Status | Heartbeat | Answer]:
+        """Runs the agent, buffering its reply (minus <thinking> blocks) so it
+        can be checked against the retrieved documentation before anything
+        is shown. Yields progress, then exactly one Answer."""
 
         # Agent construction restores the session snapshot synchronously, so
         # keep that storage I/O off the event loop.
         agent = await asyncio.to_thread(create_agent, session_id)
         thinking = ThinkingFilter()
         retrieved: list[dict] = []
-        answer: list[str] = []
+        reply: list[str] = []
+        status: str | None = None
+        last_sent = time.monotonic()
 
         async for event in agent.stream_async(
             question,
             invocation_state={CITATIONS_KEY: retrieved},
             cancel_signal=cancel_signal
         ):
-            text = event.get("data") if isinstance(event, dict) else None
-            if text:
+            if not isinstance(event, dict):
+                continue
+
+            phase = None
+            if event.get("current_tool_use"):
+                phase = "searching"
+            elif text := event.get("data"):
                 if visible := thinking.feed(text):
-                    answer.append(visible)
-                    yield visible
+                    reply.append(visible)
+                    phase = "writing"
 
-        if tail := thinking.flush():
-            answer.append(tail)
-            yield tail
+            if phase and phase != status:
+                status = phase
+                last_sent = time.monotonic()
+                yield Status(phase)
+            elif time.monotonic() - last_sent >= HEARTBEAT_SECONDS:
+                last_sent = time.monotonic()
+                yield Heartbeat()
 
-        if citations := select_citations(retrieved, "".join(answer)):
-            yield citations
+        reply.append(thinking.flush())
+
+        verdict = verify("".join(reply), retrieved, question)
+        if verdict.rejected:
+            logger.warning(json.dumps({
+                "event": "answer_rejected",
+                "reasons": verdict.reasons,
+                "retrieved": len(retrieved),
+            }))
+        if verdict.replaced:
+            # Keep the delivered reply, not the rejected one, as context for
+            # the next turn.
+            await replace_last_answer(
+                agent,
+                session_id,
+                f"{NO_DOCUMENTATION_RESPONSE}\n\n{grounding_block(NOT_SUPPORTED)}"
+            )
+
+        yield Answer(verdict.text, verdict.status, verdict.citations)
 
 
 chat_service = ChatService()

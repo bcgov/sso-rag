@@ -5,6 +5,7 @@ import type {
   ChatMessage,
   ChatRequest,
   Citation,
+  GroundingStatus,
   StreamError,
 } from "../types";
 
@@ -96,6 +97,7 @@ export function useChat() {
     );
     typewriterRef.current = typewriter;
     const citations: Citation[] = [];
+    let grounding: GroundingStatus | undefined;
 
     try {
       const body: ChatRequest = { prompt };
@@ -161,9 +163,16 @@ export function useChat() {
             break;
           }
 
-          const { content, citations: newCitations } = choice.delta;
+          const {
+            content,
+            citations: newCitations,
+            status,
+            grounding_status: groundingStatus,
+          } = choice.delta;
+          if (status) updateAssistant({ status });
           if (content) typewriter.push(content);
           if (newCitations) citations.push(...newCitations);
+          if (groundingStatus) grounding = groundingStatus;
         }
       }
 
@@ -173,6 +182,8 @@ export function useChat() {
       await typewriter.finish();
       updateAssistant({
         streaming: false,
+        status: undefined,
+        groundingStatus: grounding,
         citations: citations.length ? citations : undefined,
       });
     } catch (err) {

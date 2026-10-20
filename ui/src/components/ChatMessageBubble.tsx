@@ -2,11 +2,18 @@ import { memo } from "react";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { stabilizeStreamingMarkdown } from "../lib/markdown";
-import type { ChatMessage, Citation } from "../types";
+import type { ChatMessage, Citation, ProgressStatus } from "../types";
 
 interface Props {
   message: ChatMessage;
 }
+
+const PROGRESS_LABELS: Record<ProgressStatus | "thinking", string> = {
+  thinking: "Thinking…",
+  searching: "Searching the documentation…",
+  // The answer is buffered and verified against the sources before display.
+  writing: "Checking sources…",
+};
 
 // Answers link to the docs site; open those outside the chat.
 const markdownComponents: Components = {
@@ -50,9 +57,31 @@ export const ChatMessageBubble = memo(function ChatMessageBubble({
           </div>
         )}
 
-        {message.streaming && (
+        {message.streaming && !message.content && (
+          // Announced politely as each phase changes.
+          <p
+            role="status"
+            aria-live="polite"
+            className="flex items-center gap-2 text-gray-500"
+          >
+            <span
+              aria-hidden="true"
+              className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-gray-300 border-t-gray-500 motion-reduce:animate-none"
+            />
+            {PROGRESS_LABELS[message.status ?? "thinking"]}
+          </p>
+        )}
+
+        {message.streaming && message.content && (
           <span className="inline-block w-2 h-4 ml-1 bg-current opacity-70 animate-pulse rounded-sm align-middle" />
         )}
+
+        {!message.streaming &&
+          message.groundingStatus === "PARTIALLY_SUPPORTED" && (
+            <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              The documentation covers only part of this question.
+            </p>
+          )}
 
         {!message.streaming &&
           message.citations &&

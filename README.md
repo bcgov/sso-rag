@@ -232,18 +232,24 @@ Bedrock Knowledge Base + Reranker
   ↓
 Ranked chunks with source URLs (+ NOTE for any query with no results)
   ↓
-Agent (retries empty queries once, then answers)
+Agent (retries empty queries once, then answers + grounding block)
   ↓
-Streamed answer (SSE) + cited sources; conversation snapshot saved
+Grounding checks (citations, URLs, code/config values vs retrieved text)
+  ↓
+Checked answer (SSE) + grounding status + cited sources; snapshot saved
 ```
 
 ## Response
 
-The answer is streamed as server-sent events, followed by the sources it
-links to (see [Chat](#chat) for the full format):
+The answer is checked against the retrieved documentation, then sent as
+server-sent events with its grounding status and sources (see
+[Chat](#chat) for the full format):
 
 ```text
+data: {... "delta": {"status": "searching"} ...}
+data: {... "delta": {"status": "writing"} ...}
 data: {... "delta": {"content": "To get PROD approval for BCeID... ([Requesting BCeID in PROD](https://bcgov.github.io/sso-docs/...))"} ...}
+data: {... "delta": {"grounding_status": "SUPPORTED"} ...}
 data: {... "delta": {"citations": [{"title": "Requesting BCeID in PROD", "location": {"uri": "https://bcgov.github.io/sso-docs/..."}, "score": 0.81}]} ...}
 data: {... "delta": {}, "finish_reason": "stop" ...}
 data: [DONE]
@@ -403,15 +409,60 @@ The response is a `text/event-stream` of OpenAI-compatible
 
 ```text
 data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}], …}
+data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"status": "searching"}, "finish_reason": null}], …}
+data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"status": "writing"}, "finish_reason": null}], …}
+: keepalive
 data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"content": "MFA is…"}, "finish_reason": null}], …}
+data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"grounding_status": "SUPPORTED"}, "finish_reason": null}], …}
 data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {"citations": [{"title": "…", "location": {"uri": "https://…"}, "score": 0.82}]}, "finish_reason": null}], …}
 data: {"id": "chatcmpl-…", "object": "chat.completion.chunk", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], …}
 data: [DONE]
 ```
 
-The `citations` chunk is sent once, after the answer text, when the knowledge
-base was searched. It lists the retrieved sources the answer links to, or all
-retrieved sources if it links none, deduplicated by URL.
+- `status` chunks report progress while the answer is prepared: `searching`
+  (a knowledge base search is running) and `writing` (the model is writing
+  the answer). `: keepalive` comments are sent every 10s of silence.
+- The answer is buffered and checked before it is sent (see
+  [Grounding checks](#grounding-checks)), so it arrives as a single
+  `content` chunk.
+- `grounding_status` is `SUPPORTED`, `PARTIALLY_SUPPORTED` or
+  `NOT_SUPPORTED`; it is omitted for greetings and clarifying questions.
+- `citations` lists the sources the answer cites or links, deduplicated by
+  URL; it is omitted when there are none.
+
+### Grounding checks
+
+The system prompt makes the model end every reply with a block the user
+never sees:
+
+```text
+<grounding>{"response_type": "answer", "grounding_status": "SUPPORTED", "citations": ["https://bcgov.github.io/sso-docs/..."]}</grounding>
+```
+
+`response_type` is `answer`, `clarification` or `conversational`.
+`app/services/grounding.py` strips the block and compares the reply with the
+results `search_knowledge_base` returned in this turn. The reply is replaced
+with `NO_DOCUMENTATION_RESPONSE` (`app/common/constants.py`: the "documentation
+does not appear to cover this scenario" text with the Teams and email
+contacts) when:
+
+- `grounding_status` is `NOT_SUPPORTED`;
+- `grounding_status` is `SUPPORTED` but `citations` is empty;
+- a citation URL was not returned by the retrieval tool;
+- retrieval returned no results but the reply contains factual guidance (an
+  `answer`, or any URL, code or endpoint path);
+- the reply contains a URL, endpoint path, inline code (roles, claims,
+  configuration keys and values) or quoted string/path in a code block that
+  appears neither in the retrieved text nor in the user's message
+  (`<placeholders>` are ignored);
+- the grounding block is missing or malformed.
+
+Rejections are logged as `answer_rejected` with the reasons. The stored
+conversation keeps the delivered reply rather than the rejected one.
+
+The checks are exact string matches, not a semantic judge: plain-prose
+statements aren't verified. The prompt asks the model to write every role,
+claim, configuration value and endpoint as `code`, so those are checked.
 
 If the agent fails after streaming has started, a `data: {"error": "…"}`
 event is sent before `[DONE]`.
@@ -503,8 +554,9 @@ def create_agent(session_id: str) -> Agent:
     )
 ```
 
-The `/chat` route is async and streams `agent.stream_async()` output. If the
-client disconnects, the agent invocation is cancelled.
+The `/chat` route is async and runs `agent.stream_async()`, buffering the
+reply for the grounding checks. If the client disconnects, the agent
+invocation is cancelled.
 
 ---
 
@@ -524,8 +576,10 @@ The prompt lives in `app/prompts/system_prompt.py`. It covers:
   legacy, partial answers that state what isn't covered.
 - **Safety** – retrieved text is treated as data, not instructions; never ask
   for or repeat secrets, and tell users to rotate any they paste.
-- **Escalation** – Teams (Keycloak How-to) and `bcgov.sso@gov.bc.ca`, with the
-  details support needs.
+- **Escalation** – the exact `NO_DOCUMENTATION_RESPONSE` text (Teams: Keycloak
+  How-to, `bcgov.sso@gov.bc.ca`, and the details support needs).
+- **Grounding report** – the `<grounding>` block that ends every reply, and
+  the rules the automatic [grounding checks](#grounding-checks) enforce.
 
 ---
 
@@ -580,8 +634,8 @@ def search_knowledge_base(question: str, queries: list[str], tool_context: ToolC
 
 `tool_context` is injected by Strands and isn't part of the model-facing
 schema. If the caller passes `invocation_state={"citations": [...]}`, each
-returned result's title, source URL and score is appended to that list; this
-is how `/chat` builds its citations.
+returned result's title, source URL, score and text is appended to that list;
+`/chat` builds its citations and grounding checks from it.
 
 - `question` – the user's need as one standalone sentence, pronouns resolved;
   results are reranked against it.

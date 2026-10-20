@@ -61,9 +61,9 @@ sends the session cookie automatically.
 9. **KB tool → Knowledge Base**: acronyms are expanded, queries are retrieved in parallel, results are deduped, then reranked against the question.
 10. **Knowledge Base → KB tool**: ranked chunks come back with `section` and `source_url`.
 11. **KB tool → Agent**: the model gets numbered result blocks, and `{title, uri, score}` is recorded for citations.
-12. **Bedrock model → Agent**: the Markdown answer streams back. `ThinkingFilter` strips `<thinking>` blocks.
+12. **Bedrock model → Agent**: the Markdown answer, ending in a `<grounding>` block (status + cited URLs), streams back. `ThinkingFilter` strips `<thinking>` blocks; the API only sends `status` progress events meanwhile.
 13. **Agent → Storage**: the snapshot is saved on `AfterInvocationEvent`.
-14. **Agent → API**: text is yielded as it arrives, then the cited sources (`select_citations`).
+14. **Agent → API**: the buffered reply goes through `grounding.verify` — citations must be retrieved URLs, and URLs, endpoints and code values must appear in the retrieved text. A rejected or NOT_SUPPORTED reply is replaced with the no-documentation message (and re-saved in the snapshot).
 15. **API → ALB → API Gateway → Browser** (Local: **API → Vite → Browser**): `200 text/event-stream` with `Set-Cookie: strands_session=…; HttpOnly; SameSite=lax; Secure`. The UI renders the Markdown and a Sources list.
 
 ### 2. Follow-up in the same tab (cookie + `X-Tab-Id`)

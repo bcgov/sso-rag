@@ -1,6 +1,6 @@
 # SSO RAG – Chat UI
 
-A minimalist streaming chat interface for the [SSO RAG FastAPI backend](../poc-02/README.md). Queries are sent to the API and responses are rendered token-by-token as they arrive over a server-sent events (SSE) stream.
+A minimalist chat interface for the [SSO RAG FastAPI backend](../poc-02/README.md). Queries are sent to the API over a server-sent events (SSE) stream; progress ("Searching the documentation…", "Checking sources…") is shown while the API checks the answer against the documentation, then the answer is revealed smoothly.
 
 ---
 
@@ -52,6 +52,8 @@ Core logic hook:
 - Sends `POST /chat` with `{ prompt: string }`
 - Reads the response body as a `ReadableStream`, decodes SSE lines, and parses each `data: …` chunk
 - Feeds received text into a typewriter (`src/lib/typewriter.ts`) instead of painting each chunk: text is revealed every animation frame at a speed that follows the smoothed arrival rate (speeding up if more than ~1.2s behind), so bursty network chunks render as a steady flow; citations appear once the text has finished revealing
+- Until the answer text arrives, `delta.status` events set the bubble's progress label (`searching` → "Searching the documentation…", `writing` → "Checking sources…"; "Thinking…" before either), announced via `role="status"`. The API checks the whole answer against the retrieved docs before sending it, so it typically arrives as one chunk
+- `delta.grounding_status` is stored on the message; `PARTIALLY_SUPPORTED` answers show a "The documentation covers only part of this question." note
 - Detects `data: [DONE]` and `finish_reason: "stop"` to cancel the reader and close the connection cleanly; a `{ "error": … }` event is shown as an error
 - Conversation history is kept server-side, keyed by an `HttpOnly` session cookie the API sets on the first response plus an `X-Tab-Id` header; the browser sends the cookie back automatically because the UI is served from the same origin
 - The tab id is a UUID in `sessionStorage`, so each tab has its own conversation and keeps it across reloads (a duplicated tab copies it and continues the same conversation until cleared)

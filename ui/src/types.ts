@@ -2,10 +2,21 @@
 // OpenAI-compatible streaming chunk types
 // ---------------------------------------------------------------------------
 
+export type ProgressStatus = "searching" | "writing";
+
+export type GroundingStatus =
+  | "SUPPORTED"
+  | "PARTIALLY_SUPPORTED"
+  | "NOT_SUPPORTED";
+
 export interface DeltaContent {
   role?: "assistant" | "user";
   content?: string;
   citations?: Citation[];
+  /** Progress while the answer is prepared and checked (before content). */
+  status?: ProgressStatus;
+  /** How well the documentation supports the answer (after content). */
+  grounding_status?: GroundingStatus;
 }
 
 export interface StreamChoice {
@@ -65,4 +76,7 @@ export interface ChatMessage {
   citations?: Citation[];
   /** True while the assistant is still streaming */
   streaming?: boolean;
+  /** Latest progress update, shown until the answer text arrives */
+  status?: ProgressStatus;
+  groundingStatus?: GroundingStatus;
 }

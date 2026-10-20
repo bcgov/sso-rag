@@ -10,7 +10,8 @@ from app.retrieval.knowledge_base import (
 logger = logging.getLogger(__name__)
 
 # invocation_state key: pass a list here when invoking the agent to collect
-# the sources this tool returned (see ChatService.stream).
+# every result this tool returned, as {"title", "uri", "score", "text"} (see
+# ChatService.stream and app/services/grounding.py).
 CITATIONS_KEY = "citations"
 
 
@@ -62,7 +63,9 @@ def search_knowledge_base(
             citations.append({
                 "title": title,
                 "uri": meta.get("source_url") or r.source,
-                "score": r.score
+                "score": r.score,
+                # Grounding checks compare the answer against this text.
+                "text": r.text
             })
         blocks.append(
             f"[{i}] {title}\n"

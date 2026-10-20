@@ -38,7 +38,8 @@ app/
   retrieval/knowledge_base.py    expand_query, retrieve, rerank, multi_search
   retrieval/models.py            RetrievedChunk
   schemas/                       Pydantic request/response models
-  services/chat_service.py       ChatService.stream(), ThinkingFilter, select_citations
+  services/chat_service.py       ChatService.stream() (buffer → verify), ThinkingFilter
+  services/grounding.py          grounding block parsing + rejection checks (verify)
   services/session_cleanup.py    deletes sessions inactive > SESSION_RETENTION_DAYS; delete_browser_history()
   tools/knowledge_base_tool.py   @tool search_knowledge_base
 ui/src/
@@ -66,10 +67,22 @@ Python packages under `app/` are **namespace packages** (no `__init__.py`); don'
    (in a thread — restoring the snapshot does blocking I/O) and iterates
    `agent.stream_async(question, invocation_state={"citations": [...]}, cancel_signal=...)`.
 4. Text deltas pass through `ThinkingFilter` (removes `<thinking>…</thinking>`,
-   including tags split across chunks) and are emitted as SSE.
-5. After the text, `select_citations()` keeps retrieved sources whose URL appears
-   in the answer (whole-URL match, fragment optional), or all retrieved sources if
-   none are linked, deduped by URL.
+   including tags split across chunks) and are **buffered**, not streamed;
+   `status` events (`searching` on a tool call, `writing` once text arrives) and
+   `: keepalive` comments (every 10s idle) are sent meanwhile.
+5. `grounding.verify(reply, retrieved, prompt)` strips the model's
+   `<grounding>{"response_type", "grounding_status", "citations"}</grounding>`
+   block and returns the text to send. It is replaced with
+   `NO_DOCUMENTATION_RESPONSE` (`app/common/constants.py`) when the status is
+   NOT_SUPPORTED, or on rejection: SUPPORTED with empty citations; a citation
+   not among the retrieved `uri`s; no retrieval results but factual guidance;
+   any URL / endpoint path / inline code / quoted value in a code block not
+   found in the retrieved text or the user's prompt (`<placeholders>`
+   ignored); missing or malformed block. Rejections are logged as
+   `answer_rejected` and `replace_last_answer()` re-saves the snapshot with the
+   delivered text. Citations = cited + linked retrieved sources, by URL.
+   Checks are deterministic string matches only (no LLM judge) — keep it that
+   way unless asked.
 6. The response sets the session cookie on every call (sliding expiry).
 
 ### SSE contract (`text/event-stream`)
@@ -78,7 +91,9 @@ OpenAI-compatible `chat.completion.chunk` events, in this order:
 
 ```text
 data: {..."choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}
-data: {..."choices":[{"index":0,"delta":{"content":"..."},"finish_reason":null}]}      (repeated)
+data: {..."choices":[{"index":0,"delta":{"status":"searching"|"writing"},"finish_reason":null}]}   (0+, plus ": keepalive" comments)
+data: {..."choices":[{"index":0,"delta":{"content":"..."},"finish_reason":null}]}      (once: the checked answer)
+data: {..."choices":[{"index":0,"delta":{"grounding_status":"SUPPORTED"|"PARTIALLY_SUPPORTED"|"NOT_SUPPORTED"},"finish_reason":null}]}   (omitted for greetings/clarifications)
 data: {..."choices":[{"index":0,"delta":{"citations":[{"title","location":{"uri"},"score"}]},"finish_reason":null}]}   (optional)
 data: {..."choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
 data: [DONE]
