@@ -1,5 +1,7 @@
+import { memo } from "react";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { stabilizeStreamingMarkdown } from "../lib/markdown";
 import type { ChatMessage, Citation } from "../types";
 
 interface Props {
@@ -18,7 +20,11 @@ const markdownComponents: Components = {
   ),
 };
 
-export function ChatMessageBubble({ message }: Props) {
+// Memoized: while one answer streams, the other bubbles keep the same message
+// object and skip re-parsing their Markdown on every frame.
+export const ChatMessageBubble = memo(function ChatMessageBubble({
+  message,
+}: Props) {
   const isUser = message.role === "user";
 
   return (
@@ -37,7 +43,9 @@ export function ChatMessageBubble({ message }: Props) {
           // inject markup.
           <div className="prose prose-sm max-w-none break-words prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5 prose-pre:my-2 prose-headings:mt-3 prose-headings:mb-2 prose-a:text-blue-700 first:prose-p:mt-0 last:prose-p:mb-0">
             <Markdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-              {message.content}
+              {message.streaming
+                ? stabilizeStreamingMarkdown(message.content)
+                : message.content}
             </Markdown>
           </div>
         )}
@@ -54,7 +62,7 @@ export function ChatMessageBubble({ message }: Props) {
       </div>
     </div>
   );
-}
+});
 
 function CitationList({ citations }: { citations: Citation[] }) {
   return (

@@ -51,7 +51,7 @@ Defines all types used across the app:
 Core logic hook:
 - Sends `POST /chat` with `{ prompt: string }`
 - Reads the response body as a `ReadableStream`, decodes SSE lines, and parses each `data: …` chunk
-- Uses `flushSync` to force React to re-render on every token so text appears progressively
+- Feeds received text into a typewriter (`src/lib/typewriter.ts`) instead of painting each chunk: text is revealed every animation frame at a speed that follows the smoothed arrival rate (speeding up if more than ~1.2s behind), so bursty network chunks render as a steady flow; citations appear once the text has finished revealing
 - Detects `data: [DONE]` and `finish_reason: "stop"` to cancel the reader and close the connection cleanly; a `{ "error": … }` event is shown as an error
 - Conversation history is kept server-side, keyed by an `HttpOnly` session cookie the API sets on the first response plus an `X-Tab-Id` header; the browser sends the cookie back automatically because the UI is served from the same origin
 - The tab id is a UUID in `sessionStorage`, so each tab has its own conversation and keeps it across reloads (a duplicated tab copies it and continues the same conversation until cleared)
@@ -59,7 +59,7 @@ Core logic hook:
 - **Clear** calls `DELETE /chat` for this tab's history and then switches to a new tab id
 
 **`src/components/ChatMessageBubble.tsx`**  
-Renders a single message. User messages are right-aligned (blue), assistant messages left-aligned (gray). Assistant messages are rendered as Markdown (GitHub-flavoured: lists, tables, code, links) with `react-markdown` + `remark-gfm` and styled with `@tailwindcss/typography`; raw HTML in answers is not rendered, and links open in a new tab. User messages are shown as plain text. Shows a blinking cursor while streaming. Renders citation sources with links once streaming is complete.
+Renders a single message. User messages are right-aligned (blue), assistant messages left-aligned (gray). Assistant messages are rendered as Markdown (GitHub-flavoured: lists, tables, code, links) with `react-markdown` + `remark-gfm` and styled with `@tailwindcss/typography`; raw HTML in answers is not rendered, and links open in a new tab. User messages are shown as plain text. While streaming, the text goes through `stabilizeStreamingMarkdown` (`src/lib/markdown.ts`), which shows an unfinished link as plain label text and drops or temporarily closes open `**`/`*`/`` ` ``/code-fence markers, so raw Markdown syntax never flashes on screen. The component is memoized so only the streaming bubble re-renders each frame. Shows a blinking cursor while streaming. Renders citation sources with links once streaming is complete.
 
 **`src/components/ChatInput.tsx`**  
 Auto-growing textarea capped at 10 lines. Submits on `Enter` (new line on `Shift+Enter`). Disabled while the assistant is streaming.

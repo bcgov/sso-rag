@@ -6,10 +6,22 @@ import { useChat } from "./hooks/useChat";
 export default function App() {
   const { messages, isStreaming, error, sendMessage, clearMessages } =
     useChat();
+  const mainRef = useRef<HTMLElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const messageCount = messages.length;
 
+  // A new message (the user's prompt) scrolls into view smoothly.
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messageCount]);
+
+  // While an answer streams, follow it instantly — a smooth scroll restarted
+  // on every frame stutters — and only if the user hasn't scrolled up to read.
+  useEffect(() => {
+    const el = mainRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    if (nearBottom) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
   return (
@@ -31,7 +43,7 @@ export default function App() {
       </header>
 
       {/* Message list */}
-      <main className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+      <main ref={mainRef} className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
         {messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full gap-2 text-center">
             <p className="text-2xl">💬</p>

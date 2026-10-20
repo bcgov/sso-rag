@@ -1,5 +1,5 @@
-import { useCallback, useState } from "react";
-import { flushSync } from "react-dom";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { createTypewriter, type Typewriter } from "../lib/typewriter";
 import type {
   ChatCompletionChunk,
   ChatMessage,
@@ -49,6 +49,9 @@ export function useChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const typewriterRef = useRef<Typewriter | null>(null);
+
+  useEffect(() => () => typewriterRef.current?.cancel(), []);
 
   const sendMessage = useCallback(async (prompt: string) => {
     setError(null);
@@ -69,6 +72,18 @@ export function useChat() {
 
     setMessages((prev) => [...prev, userMessage, assistantPlaceholder]);
     setIsStreaming(true);
+
+    const updateAssistant = (patch: Partial<ChatMessage>) =>
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, ...patch } : m)),
+      );
+
+    // Received text is revealed smoothly, one animation frame at a time.
+    const typewriter = createTypewriter((visible) =>
+      updateAssistant({ content: visible }),
+    );
+    typewriterRef.current = typewriter;
+    const citations: Citation[] = [];
 
     try {
       const body: ChatRequest = { prompt };
@@ -133,45 +148,35 @@ export function useChat() {
             break;
           }
 
-          const { content, citations } = choice.delta;
-          if (!content && !citations) continue;
-
-          flushSync(() => {
-            setMessages((prev) =>
-              prev.map((m) => {
-                if (m.id !== assistantId) return m;
-                return {
-                  ...m,
-                  content: m.content + (content ?? ""),
-                  citations: citations
-                    ? [...(m.citations ?? []), ...(citations as Citation[])]
-                    : m.citations,
-                };
-              }),
-            );
-          });
+          const { content, citations: newCitations } = choice.delta;
+          if (content) typewriter.push(content);
+          if (newCitations) citations.push(...newCitations);
         }
       }
 
       reader.cancel();
+
+      // Let the remaining text finish revealing before showing the sources.
+      await typewriter.finish();
+      updateAssistant({
+        streaming: false,
+        citations: citations.length ? citations : undefined,
+      });
     } catch (err) {
+      typewriter.cancel();
       const message =
         err instanceof Error ? err.message : "An unexpected error occurred.";
       setError(message);
       // Remove the assistant placeholder (and any partial answer) on error
       setMessages((prev) => prev.filter((m) => m.id !== assistantId));
     } finally {
-      // Mark streaming done
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantId ? { ...m, streaming: false } : m,
-        ),
-      );
+      if (typewriterRef.current === typewriter) typewriterRef.current = null;
       setIsStreaming(false);
     }
   }, []);
 
   const clearMessages = useCallback(async () => {
+    typewriterRef.current?.cancel();
     setMessages([]);
     setError(null);
 
