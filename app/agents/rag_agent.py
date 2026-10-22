@@ -1,5 +1,5 @@
 import uuid
-from strands import Agent
+from strands import Agent, ModelRetryStrategy
 from strands.models.bedrock import BedrockModel
 from strands.storage import S3Storage
 from strands.storage import LocalFileStorage
@@ -92,6 +92,11 @@ def create_agent(session_id: str) -> Agent:
         ],
         system_prompt=SYSTEM_PROMPT,
         context_manager="auto",
+        retry_strategy=ModelRetryStrategy(
+            max_attempts=3,
+            initial_delay=2,
+            max_delay=60
+        ),
         session_manager=SnapshotSessionManager(session_id, storage=storage),
         # Output is streamed to the client; skip the default stdout printer.
         callback_handler=None,
