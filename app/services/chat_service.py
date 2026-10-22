@@ -7,8 +7,9 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from app.agents.rag_agent import create_agent, replace_last_answer
+from app.common.config import settings
 from app.common.constants import NO_DOCUMENTATION_RESPONSE
-from app.services.grounding import NOT_SUPPORTED, grounding_block, verify
+from app.services.grounding import NOT_SUPPORTED, Verdict, grounding_block, split_grounding, verify
 from app.tools.knowledge_base_tool import CITATIONS_KEY
 
 logger = logging.getLogger(__name__)
@@ -127,6 +128,37 @@ class Answer:
 
 
 HEARTBEAT_SECONDS = 10
+REPLY_PREVIEW_CHARS = 300
+LOGGED_SOURCES = 5
+
+
+def replacement_log(
+    verdict: Verdict,
+    reply: str,
+    retrieved: list[dict],
+    stop_reason: str | None,
+) -> dict:
+    """Why the model's reply was swapped for the no-documentation reply:
+    the grounding checks rejected it ("answer_rejected", with reasons), or
+    the model itself labelled it NOT_SUPPORTED ("answer_not_supported").
+    Includes what retrieval returned, to spot NOT_SUPPORTED despite strong
+    results."""
+
+    body, grounding = split_grounding(reply)
+    scores = [r.get("score") or 0 for r in retrieved]
+    return {
+        "event": "answer_rejected" if verdict.rejected else "answer_not_supported",
+        "reasons": verdict.reasons,
+        "model_status": grounding.status if grounding else None,
+        "model_citations": grounding.citations if grounding else [],
+        # e.g. "limit_turns" when AGENT_MAX_TURNS cut the reply off.
+        "stop_reason": stop_reason,
+        "retrieved": len(retrieved),
+        "top_score": round(max(scores), 3) if scores else None,
+        "sources": list(dict.fromkeys(r.get("uri") for r in retrieved if r.get("uri")))[:LOGGED_SOURCES],
+        "reply_chars": len(body),
+        "reply_preview": body[:REPLY_PREVIEW_CHARS],
+    }
 
 
 class ChatService:
@@ -148,15 +180,21 @@ class ChatService:
         retrieved: list[dict] = []
         reply: list[str] = []
         status: str | None = None
+        stop_reason: str | None = None
         last_sent = time.monotonic()
 
         async for event in agent.stream_async(
             question,
             invocation_state={CITATIONS_KEY: retrieved},
-            cancel_signal=cancel_signal
+            cancel_signal=cancel_signal,
+            # Hard stop for a model that keeps calling tools; the unfinished
+            # reply then fails the grounding check and the no-docs reply is sent.
+            limits={"turns": settings.agent_max_turns},
         ):
             if not isinstance(event, dict):
                 continue
+            if "result" in event:
+                stop_reason = getattr(event["result"], "stop_reason", None)
 
             phase = None
             if event.get("current_tool_use"):
@@ -175,15 +213,13 @@ class ChatService:
                 yield Heartbeat()
 
         reply.append(thinking.flush())
+        raw_reply = "".join(reply)
 
-        verdict = verify("".join(reply), retrieved, question)
-        if verdict.rejected:
-            logger.warning(json.dumps({
-                "event": "answer_rejected",
-                "reasons": verdict.reasons,
-                "retrieved": len(retrieved),
-            }))
+        verdict = verify(raw_reply, retrieved, question)
         if verdict.replaced:
+            logger.warning(json.dumps(
+                replacement_log(verdict, raw_reply, retrieved, stop_reason), default=str
+            ))
             # Keep the delivered reply, not the rejected one, as context for
             # the next turn.
             await replace_last_answer(

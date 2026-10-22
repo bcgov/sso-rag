@@ -21,7 +21,7 @@ not implemented yet). Everything else reflects the current code.
 | FastAPI API | API | `POST/DELETE /chat` (SSE), `/health`, `/documents/search`; session cookie + `X-Tab-Id` | ECS Fargate `:8000`, 2 workers / `uvicorn :8000` |
 | Strands Agent | Agent | New `Agent` per request, `SnapshotSessionManager`, `ThinkingFilter` | In the API process |
 | Bedrock model | LLM | Amazon Nova Lite via `ConverseStream` | Bedrock |
-| KB search tool | Tool | `search_knowledge_base` → `multi_search` (acronym expansion, parallel retrieve, dedupe, rerank) | In the API process |
+| KB search tool | Tool | `search_knowledge_base` → `retrieval_pipeline.search`: fast path or LLM query planner (`QueryPlan`), deterministic guards, up to `MAX_RETRIEVAL_ROUNDS` rounds of parallel retrieve → dedupe → rerank with an LLM gap check between rounds | In the API process |
 | Bedrock Knowledge Base | Datastore | S3 Vectors index (`SEMANTIC`), Rerank API | Bedrock |
 | Agent storage | Datastore | Conversation snapshots under `session/<id>/` and `context/<id>/` | S3 `<env>-sso-rag-agent-context-store` / `./.agent-store/` |
 | Session cleanup | Job | FastAPI lifespan loop, or `python -m app.jobs.cleanup_sessions` | Each API worker |
@@ -58,7 +58,7 @@ sends the session cookie automatically.
 6. **Agent → Storage**: the agent tries to restore `snapshot_latest.json`. None exists, so history starts empty.
 7. **Agent → Bedrock model**: the model receives the system prompt and the user message, and responds with a `search_knowledge_base` tool call.
 8. **Agent → KB tool**: the tool runs with `tool_context`. `invocation_state["citations"]` collects sources.
-9. **KB tool → Knowledge Base**: acronyms are expanded, queries are retrieved in parallel, results are deduped, then reranked against the question.
+9. **KB tool → Knowledge Base**: simple questions skip planning; otherwise the planner (same model, structured output) turns the user's message plus recent history into a `QueryPlan` (canonical query, 3–4 variants, sub-questions, validated filters). Queries are acronym-expanded, retrieved in parallel (`CANDIDATES_PER_QUERY` each), deduped and reranked together. For multi-part questions a gap check names missing facets and one targeted follow-up round runs, stopping early on budget or when it adds no new evidence.
 10. **Knowledge Base → KB tool**: ranked chunks come back with `section` and `source_url`.
 11. **KB tool → Agent**: the model gets numbered result blocks, and `{title, uri, score}` is recorded for citations.
 12. **Bedrock model → Agent**: the Markdown answer, ending in a `<grounding>` block (status + cited URLs), streams back. `ThinkingFilter` strips `<thinking>` blocks; the API only sends `status` progress events meanwhile.

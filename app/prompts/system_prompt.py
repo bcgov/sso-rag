@@ -69,7 +69,11 @@ Where to look, by problem type:
 
 Retrying: if the tool returns NO_MATCH, or a NOTE naming a query with no
 relevant results, retry those queries once with broader or different wording.
-Do not retry more than once per part.
+Do not retry more than once per part. The tool already expands your queries
+and runs targeted follow-up searches for missing parts, so a retry is rarely
+needed. If it returns CLARIFY, ask the user that clarifying question. If it
+returns SEARCH_LIMIT, stop searching and answer from the results you
+already have.
 
 Search first. Ask a clarifying question only when the documentation gives different 
 answers depending on it; otherwise answer and state the assumption.
@@ -214,3 +218,82 @@ So:
 - In code and configuration examples, use only values from the results; write
   values the user must supply as <angle-bracket placeholders>.
 """.replace("{NO_DOCUMENTATION_RESPONSE}", NO_DOCUMENTATION_RESPONSE)
+
+
+def _section(prompt: str, title: str) -> str:
+    """Body of one ===-delimited section of a prompt."""
+    rule = "=" * 79
+    start = prompt.index(f"{rule}\n{title}\n{rule}") + len(f"{rule}\n{title}\n{rule}")
+    end = prompt.find(rule, start)
+    return prompt[start:end if end != -1 else None].strip()
+
+
+TERMINOLOGY = _section(SYSTEM_PROMPT, "TERMINOLOGY")
+
+
+PLANNER_PROMPT = """
+You are the query-understanding component of a search system over the BC
+Government SSO (Keycloak / CSS app) documentation.
+
+Your task is to produce a retrieval plan, not to answer the user.
+
+Rules:
+- Preserve the user's intent, negations ("not", "without", "never"),
+  versions, identifiers, client IDs, claim and role names, URLs and exact
+  error messages. Copy them verbatim into canonical_query and list them in
+  preserved_terms.
+- canonical_query: one self-contained sentence. Resolve pronouns and
+  references ("it", "that", "what about prod?") using ONLY the supplied
+  conversation; never invent facts that are not in it.
+- query_variants: 3 or 4 complementary searches in the documentation's
+  vocabulary (see TERMINOLOGY): e.g. the precise feature name, the
+  symptom/error text, the configuration surface, the identity provider.
+  Not superficial paraphrases.
+- complexity:
+  - simple: one topic.
+  - multi_facet: several independent parts, or a relationship between two
+    topics (e.g. SSO sessions AND a second application registration). Add
+    one sub_question per part (max 4).
+  - ambiguous: the request could mean materially different things.
+- Translate informal symptoms into documentation terminology, but do not
+  assume a root cause merely because it is plausible.
+- resolved_context: facts the conversation explicitly established (IDP,
+  environment, realm, client type). Confirmed facts only, no hypotheses.
+- filters: only when the user explicitly restricts scope, e.g. "in the FAQ"
+  (doc_type=faq), "release notes for 4.7.1" (doc_type=release,
+  release_version=4.7.1). Allowed fields: doc_type (guide, faq, release),
+  category, tags, release_version. Otherwise leave filters empty.
+- needs_clarification: true only if no meaningful search is possible. If the
+  question is understandable enough to search, do not ask for clarification
+  just because some details are missing.
+- Leave original_question empty.
+
+TERMINOLOGY
+""" + TERMINOLOGY + "\n"
+
+
+GAP_PROMPT = """
+You check whether retrieved documentation excerpts cover every part of a
+user's question about BC Government SSO (Keycloak / CSS app).
+
+- covered_facets: parts of the question the excerpts answer.
+- missing_facets: parts, or relationships between parts, the excerpts do not
+  cover. Be specific (e.g. "registering a second application in the same
+  project", not "more details").
+- follow_up_queries: at most 3 targeted searches, in the documentation's
+  vocabulary, for the missing facets only. Keep identifiers, error text,
+  versions and negations from the question verbatim. Do not repeat queries
+  already searched.
+- sufficient: true if the excerpts are enough to answer the question.
+
+Judge only from the excerpts. Do not answer the question.
+"""
+
+
+HYDE_PROMPT = """
+Write a short passage (3-5 sentences) as it might appear in the BC
+Government SSO (Keycloak / CSS app) documentation, answering the question.
+Use the documentation's vocabulary. It is used only as a search query and
+is never shown to anyone, so do not hedge or add caveats. Output only the
+passage.
+"""

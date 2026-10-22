@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import Field
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
@@ -92,6 +94,98 @@ class Settings(BaseSettings):
         default=24,
         ge=0,
         alias="SESSION_CLEANUP_INTERVAL_HOURS"
+    )
+
+    # Retrieval strategy used by search_knowledge_base:
+    #   baseline           - the agent's own queries, one round (previous behaviour)
+    #   planner            - planner-rewritten queries, one round
+    #   planner_iterative  - planner + gap check + targeted follow-up rounds
+    query_strategy: Literal["baseline", "planner", "planner_iterative"] = Field(
+        default="planner_iterative",
+        alias="QUERY_STRATEGY"
+    )
+
+    candidates_per_query: int = Field(
+        default=15,
+        ge=1,
+        le=100,
+        alias="CANDIDATES_PER_QUERY"
+    )
+
+    max_retrieval_rounds: int = Field(
+        default=2,
+        ge=1,
+        alias="MAX_RETRIEVAL_ROUNDS"
+    )
+
+    # Tokens spent by the planner and gap-check LLM calls per search.
+    retrieval_token_budget: int = Field(
+        default=6000,
+        ge=0,
+        alias="RETRIEVAL_TOKEN_BUDGET"
+    )
+
+    retrieval_latency_budget_ms: int = Field(
+        default=12000,
+        ge=0,
+        alias="RETRIEVAL_LATENCY_BUDGET_MS"
+    )
+
+    # A follow-up round that adds fewer new chunks than this to the final
+    # reranked set is treated as contributing no meaningful evidence.
+    min_new_evidence: int = Field(
+        default=1,
+        ge=0,
+        alias="MIN_NEW_EVIDENCE"
+    )
+
+    planner_history_turns: int = Field(
+        default=6,
+        ge=0,
+        alias="PLANNER_HISTORY_TURNS"
+    )
+
+    # Adds a hypothetical answer passage as an extra retrieval query. Off
+    # unless evals show it improves Recall@K without hurting faithfulness.
+    hyde_enabled: bool = Field(
+        default=False,
+        alias="HYDE_ENABLED"
+    )
+
+    # Loop guards. AGENT_MAX_TURNS caps model calls per chat message (each
+    # turn is one model call plus the tools it requests);
+    # MAX_SEARCHES_PER_TURN caps search_knowledge_base calls per message.
+    agent_max_turns: int = Field(
+        default=6,
+        ge=1,
+        alias="AGENT_MAX_TURNS"
+    )
+
+    max_searches_per_turn: int = Field(
+        default=3,
+        ge=1,
+        alias="MAX_SEARCHES_PER_TURN"
+    )
+
+    # Hard timeout for each planner / gap-check / HyDE call; also bounded by
+    # what is left of RETRIEVAL_LATENCY_BUDGET_MS.
+    planner_call_timeout_ms: int = Field(
+        default=8000,
+        ge=100,
+        alias="PLANNER_CALL_TIMEOUT_MS"
+    )
+
+    # Attempts for the main agent's model calls on throttling/transient errors.
+    model_max_attempts: int = Field(
+        default=3,
+        ge=1,
+        alias="MODEL_MAX_ATTEMPTS"
+    )
+
+    bedrock_read_timeout_s: int = Field(
+        default=60,
+        ge=1,
+        alias="BEDROCK_READ_TIMEOUT_S"
     )
 
 

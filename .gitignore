@@ -69,3 +69,5 @@ node_modules/
 **.tfvars
 .terraform/
 .agent-store/
+# Evaluation output
+evals/results/

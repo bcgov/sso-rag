@@ -3,9 +3,8 @@ import logging
 
 from strands import ToolContext, tool
 
-from app.retrieval.knowledge_base import (
-    multi_search
-)
+from app.common.config import settings
+from app.services.retrieval_pipeline import search
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +12,24 @@ logger = logging.getLogger(__name__)
 # every result this tool returned, as {"title", "uri", "score", "text"} (see
 # ChatService.stream and app/services/grounding.py).
 CITATIONS_KEY = "citations"
+
+TOOL_NAME = "search_knowledge_base"
+
+
+def searches_this_turn(messages: list[dict] | None) -> int:
+    """Calls to this tool since the user's latest message, including the one
+    being executed (it is already in the assistant message)."""
+    count = 0
+    for m in reversed(messages or []):
+        content = m.get("content") or []
+        if m.get("role") == "user" and any(isinstance(b, dict) and "text" in b for b in content):
+            break
+        if m.get("role") == "assistant":
+            count += sum(
+                1 for b in content
+                if isinstance(b, dict) and (b.get("toolUse") or {}).get("name") == TOOL_NAME
+            )
+    return count
 
 
 @tool(context=True)
@@ -41,13 +58,26 @@ def search_knowledge_base(
     Returns:
         Numbered result blocks separated by "---", each with the page and
         section, source URL, score and text, followed by a note naming any
-        query that found nothing relevant; or a string starting with
-        "NO_MATCH" if nothing relevant was found for any query.
+        query that found nothing relevant; a string starting with "NO_MATCH"
+        if nothing relevant was found for any query; or a string starting
+        with "CLARIFY:" followed by a question to ask the user; or
+        "SEARCH_LIMIT" if this message has used up its searches.
     """
 
-    hits, stats = multi_search(question, queries)
-    logger.info(json.dumps({"question": question, "kept": len(hits), **stats}))
+    messages = getattr(tool_context.agent, "messages", None)
+    calls = searches_this_turn(messages)
+    if calls > settings.max_searches_per_turn:
+        logger.warning(json.dumps({"event": "search_limit", "calls": calls}))
+        return (f"SEARCH_LIMIT: already searched {calls - 1} times for this message. "
+                "Do not search again. Answer from the results you already have, or "
+                "give the no-documentation reply if they don't cover the question.")
 
+    result = search(question, queries, messages=messages)
+    hits, stats = result.hits, result.stats
+    logger.info(json.dumps({"question": question, "kept": len(hits), **stats}, default=str))
+
+    if result.clarification:
+        return f"CLARIFY: {result.clarification}"
     if not hits:
         return ("NO_MATCH: nothing relevant for these queries. Try different "
                 "wording (the docs' own terms, the identity provider name, or "
@@ -74,8 +104,7 @@ def search_knowledge_base(
             f"{r.text}"
         )
 
-    found = {q for r in hits for q in r.metadata.get("_queries", [])}
-    missing = [q for q in stats["queries"] if q not in found]
+    missing = result.missing
     if missing:
         blocks.append(
             "NOTE: no relevant results for: "

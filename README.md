@@ -101,24 +101,83 @@ Document retrieval leverages:
 
 ## Retrieval Pipeline
 
-Each `search_knowledge_base` call:
+Each `search_knowledge_base` call runs the strategy set by `QUERY_STRATEGY`
+(`app/services/retrieval_pipeline.py`). The default, `planner_iterative`:
 
-1. **Acronym expansion** – queries using an acronym from `app/common/constants.py`
-   (`BCSC`, `PKCE`, `M2M`, …) get its spelled-out form appended, so the
-   embedding also matches the docs' wording. Only genuine abbreviations are
-   expanded; general words are left alone.
-2. **Parallel multi-query retrieval** – the agent passes 1–4 queries; duplicates
-   are dropped and each query is searched in parallel.
-3. **Dedupe** – chunks found by more than one query are merged.
-4. **Rerank** – the merged set is reranked against the user's question (not the
-   individual queries) with the Bedrock `Rerank` API, and results below
-   `MIN_RERANK_SCORE` are dropped. Extra facets get a little extra room
-   (up to 12 results) so one facet can't crowd out the others.
-5. **Coverage note** – queries with no surviving results are named in a `NOTE`
-   so the agent can retry just those.
+1. **Conversation-aware input** – the tool reads the user's verbatim message
+   and the last `PLANNER_HISTORY_TURNS` turns from the agent's messages
+   (tool calls, `<thinking>` and grounding blocks removed). The agent's own
+   `question` and `queries` are passed along as a draft.
+2. **Fast path** – self-contained, single-topic questions that are short or
+   anchored by an exact literal (error text, identifier, version) skip the
+   planner LLM call and are searched as written plus the agent's queries
+   (`query_guards.is_simple_query`).
+3. **Query plan** – otherwise the planner (same model as `MODEL_ARN`, temperature
+   0, structured output `QueryPlan`) produces a standalone `canonical_query`, 3–4
+   complementary `query_variants`, `sub_questions` for multi-part questions, a
+   `complexity` label, and optional metadata `filters`. If it fails, the fast
+   path is used.
+4. **Deterministic guards** (`app/services/query_guards.py`) – the original
+   question is kept on the plan; identifiers, quoted error messages, versions,
+   URLs and numbers dropped by the rewrite are put back; variants that lost a
+   negation are discarded. Filters are kept only for allowed fields
+   (`doc_type`, `category`, `tags`, `release_version`) and operators, and only
+   when the question itself justifies them; they become a Bedrock
+   `RetrievalFilter`. A filtered query that finds nothing is retried unfiltered.
+5. **Round 1** – up to 6 queries (canonical, sub-questions, variants, agent
+   drafts), each with acronym expansion, retrieved in parallel with
+   `CANDIDATES_PER_QUERY` candidates each, merged, deduped and reranked
+   together against the canonical query.
+6. **Gap check + follow-ups** – for multi-facet/ambiguous plans, or when a
+   sub-question found nothing, an LLM `GapAssessment` names missing facets
+   (e.g. "registering a second application" when only SSO session docs came
+   back) and up to 3 targeted follow-up queries. They are searched, merged into
+   the pool, and the union is reranked.
+7. **Stop** – after `MAX_RETRIEVAL_ROUNDS` rounds, when
+   `RETRIEVAL_TOKEN_BUDGET` or `RETRIEVAL_LATENCY_BUDGET_MS` is spent, when the
+   gap check says the evidence is sufficient, or when a round adds fewer than
+   `MIN_NEW_EVIDENCE` new chunks to the final reranked set.
+8. **Loop guards** – every planner, gap-check and HyDE call has a hard
+   timeout and at most 2 attempts; the agent may search at most
+   `MAX_SEARCHES_PER_TURN` times and run `AGENT_MAX_TURNS` turns per message.
+9. **Coverage note** – sub-questions with no surviving results are named in a
+   `NOTE`; if nothing was found and the planner flagged an essential ambiguity,
+   the tool returns `CLARIFY: <question>`.
+
+`QUERY_STRATEGY=baseline` restores the previous behaviour (the agent's queries,
+one round); `planner` plans but runs a single round. `HYDE_ENABLED=true` adds a
+hypothetical documentation passage as an extra retrieval query (never as
+evidence); keep it off unless the evals show it helps.
 
 If no reranker is configured, or the reranker request is rejected, results are
 ordered by vector score instead.
+
+## Evaluation
+
+`evals/golden.jsonl` is a seed set of 40 questions (tags: `simple`,
+`troubleshooting`, `multi_facet`, `follow_up`, `negation`, `version`), each
+with conversation `history` and the page URLs that answer it. Review and extend
+it as the docs change.
+
+```bash
+# Recall@1/5/10, MRR, latency, planner tokens and rounds per strategy and tag
+uv run python evals/run_retrieval.py
+uv run python evals/run_retrieval.py --strategies baseline planner_iterative --tags multi_facet
+
+# Full agent: LLM-judged faithfulness, grounding rejection rate, cited recall
+uv run python evals/run_answers.py --strategies baseline planner_iterative --limit 20
+```
+
+Reports and per-question JSONL go to `evals/results/` (git-ignored). Both
+need AWS credentials and the usual `.env`. In `run_retrieval.py` the baseline
+searches the question verbatim, so it is a lower bound for the production
+baseline (where the agent writes the queries).
+
+Unit tests (Bedrock and the LLM are stubbed):
+
+```bash
+uv run pytest
+```
 
 ## Tool-Based Architecture
 
@@ -156,6 +215,8 @@ sso-rag/
 │
 ├── app/
 │   ├── agents/
+│   │   ├── bedrock_model.py     # shared Bedrock models (agent + planner)
+│   │   ├── planner_agent.py     # planner, gap-check and HyDE agents
 │   │   └── rag_agent.py
 │   │
 │   ├── api/
@@ -177,11 +238,16 @@ sso-rag/
 │   │
 │   ├── retrieval/
 │   │   ├── bedrock_client.py
+│   │   ├── iterative.py         # multi-round retrieval, gap checks, budgets
 │   │   ├── knowledge_base.py
 │   │   └── models.py
 │   │
 │   ├── services/
 │   │   ├── chat_service.py
+│   │   ├── grounding.py
+│   │   ├── query_guards.py      # literal/negation preservation, filter whitelist, fast path
+│   │   ├── query_planner.py     # QueryPlan, GapAssessment and HyDE LLM calls
+│   │   ├── retrieval_pipeline.py  # strategy orchestration for search_knowledge_base
 │   │   └── session_cleanup.py   # deletes inactive sessions
 │   │
 │   ├── tools/
@@ -189,8 +255,11 @@ sso-rag/
 │   │
 │   └── schemas/
 │       ├── chat.py
-│       └── health.py
+│       ├── health.py
+│       └── query_plan.py        # QueryPlan, GapAssessment
 │
+├── evals/                    # golden set + retrieval/answer evaluation scripts
+├── tests/                    # unit tests (uv run pytest)
 ├── chunker/                  # docs preprocessor (chunks for the KB)
 ├── legacy/                   # earlier POCs
 ├── terraform/                # AWS infrastructure (ECS, ALB, API Gateway, IAM, ECR)
@@ -330,6 +399,19 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `NUMBER_OF_RERANKED_RESULTS` | `6` | Results kept after reranking for a single query (+2 per extra query, max 12) |
 | `MIN_RERANK_SCORE` | `0.05` | Drop reranked results below this relevance score |
 | `SEARCH_TYPE` | `SEMANTIC` | Bedrock `overrideSearchType`; keep `SEMANTIC` on S3 Vectors |
+| `QUERY_STRATEGY` | `planner_iterative` | `baseline` (agent's queries, one round), `planner` (planned queries, one round) or `planner_iterative` (planner + gap check + follow-up rounds) |
+| `CANDIDATES_PER_QUERY` | `15` | Candidates retrieved per planned query before merging and reranking |
+| `MAX_RETRIEVAL_ROUNDS` | `2` | Hard limit on retrieval rounds per tool call |
+| `RETRIEVAL_TOKEN_BUDGET` | `6000` | Max tokens for planner, gap-check and HyDE calls per tool call |
+| `RETRIEVAL_LATENCY_BUDGET_MS` | `12000` | No new round starts after this much time |
+| `MIN_NEW_EVIDENCE` | `1` | Stop when a round adds fewer new chunks than this to the reranked results |
+| `PLANNER_HISTORY_TURNS` | `6` | Prior conversation messages given to the planner |
+| `HYDE_ENABLED` | `false` | Add a hypothetical-answer passage as an extra retrieval query |
+| `AGENT_MAX_TURNS` | `6` | Max agent loop turns (model call + its tool calls) per chat message; a reply cut off by this fails grounding and the no-documentation reply is sent |
+| `MAX_SEARCHES_PER_TURN` | `3` | Max `search_knowledge_base` calls per chat message; further calls return `SEARCH_LIMIT` |
+| `PLANNER_CALL_TIMEOUT_MS` | `8000` | Hard timeout per planner / gap-check / HyDE call (also bounded by the remaining latency budget); on timeout the search falls back |
+| `MODEL_MAX_ATTEMPTS` | `3` | Attempts for the agent's model calls on throttling (backoff 2–10s) |
+| `BEDROCK_READ_TIMEOUT_S` | `60` | Read timeout for the agent's Bedrock model client |
 | `CORS_ORIGINS` | `["*"]` | Allowed origins for the UI (answers `OPTIONS` preflight). Cookies are only allowed cross-origin when this lists explicit origins, e.g. `["https://ui.example.gov.bc.ca"]` |
 | `AGENT_STORAGE_S3_BUCKET` | `sandbox-sso-rag-agent-context-store` | Bucket for conversation history when `ENVIRONMENT` is not `local` |
 | `SESSION_COOKIE_NAME` | `strands_session` | Name of the session cookie |
@@ -457,8 +539,17 @@ contacts) when:
   (`<placeholders>` are ignored);
 - the grounding block is missing or malformed.
 
-Rejections are logged as `answer_rejected` with the reasons. The stored
-conversation keeps the delivered reply rather than the rejected one.
+Every replaced reply is logged as a warning with its cause:
+
+- `answer_rejected` – the checks above rejected it; `reasons` says why.
+- `answer_not_supported` – the model itself labelled it `NOT_SUPPORTED`.
+
+Both include `model_status`, `model_citations`, the agent's `stop_reason`
+(e.g. `limit_turns`), how many results retrieval returned with their
+`top_score` and `sources`, and a `reply_preview` of the model's text. A
+high `top_score` on `answer_not_supported` usually means the model was too
+cautious rather than the docs lacking the answer. The stored conversation
+keeps the delivered reply rather than the rejected one.
 
 The checks are exact string matches, not a semantic judge: plain-prose
 statements aren't verified. The prompt asks the model to write every role,
@@ -598,7 +689,9 @@ Responsibilities:
 - Bedrock client management (`bedrock_client.py`)
 - Knowledge Base queries (`retrieve`)
 - Reranking (`rerank`)
-- Multi-query search, dedupe and coverage tracking (`multi_search`)
+- Multi-query search, dedupe and coverage tracking (`search_round`, `rank`,
+  `multi_search`)
+- Multi-round retrieval with gap checks and budgets (`iterative.py`)
 - Acronym expansion (`expand_query`)
 - Result normalization (`models.py`)
 

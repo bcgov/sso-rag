@@ -1,11 +1,11 @@
 import uuid
 from strands import Agent
-from strands.models.bedrock import BedrockModel
 from strands.storage import S3Storage
 from strands.storage import LocalFileStorage
 from app.common.config import settings
 from strands.session import SnapshotSessionManager
 
+from app.agents.bedrock_model import agent_retry_strategy, extract_model_id, model  # noqa: F401  (re-exported)
 from app.prompts.system_prompt import (
     SYSTEM_PROMPT
 )
@@ -17,15 +17,6 @@ from app.tools.knowledge_base_tool import (
 LOCAL_STORAGE_DIR = "./.agent-store/"
 
 storage = LocalFileStorage(LOCAL_STORAGE_DIR) if settings.environment == "local" else S3Storage(settings.agent_storage_s3_bucket)
-
-
-def extract_model_id(model_arn: str) -> str:
-    return model_arn.split("/")[-1]
-
-model = BedrockModel(
-    model_id=extract_model_id(settings.model_arn),
-    region_name=settings.aws_region
-)
 
 
 SESSION_ID_PREFIX = "session_"
@@ -92,6 +83,7 @@ def create_agent(session_id: str) -> Agent:
         ],
         system_prompt=SYSTEM_PROMPT,
         context_manager="auto",
+        retry_strategy=agent_retry_strategy,
         session_manager=SnapshotSessionManager(session_id, storage=storage),
         # Output is streamed to the client; skip the default stdout printer.
         callback_handler=None,

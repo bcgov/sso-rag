@@ -15,6 +15,8 @@ def get_bedrock_runtime_client():
             "bedrock-agent-runtime",
             config=Config(
                 region_name=settings.aws_region,
+                connect_timeout=5,
+                read_timeout=15,
                 retries={
                     "max_attempts": 3,
                     "mode": "adaptive"

@@ -35,9 +35,14 @@ def _source_uri(item: dict) -> str | None:
     return None
 
 
+def chunk_key(chunk: RetrievedChunk) -> str:
+    return hashlib.sha1(chunk.text.encode()).hexdigest()
+
+
 def retrieve(
     query: str,
-    max_results: int | None = None
+    max_results: int | None = None,
+    retrieval_filter: dict | None = None
 ) -> list[RetrievedChunk]:
     """Vector search against the knowledge base (no reranking)."""
 
@@ -46,6 +51,8 @@ def retrieve(
     vector_cfg = {"numberOfResults": max_results or settings.number_of_results}
     if settings.search_type:
         vector_cfg["overrideSearchType"] = settings.search_type
+    if retrieval_filter:
+        vector_cfg["filter"] = retrieval_filter
 
     response = client.retrieve(
         knowledgeBaseId=settings.knowledge_base_id,
@@ -108,6 +115,75 @@ def rerank(
     ]
 
 
+def search_round(
+    queries: list[str],
+    per_query: int,
+    retrieval_filter: dict | None = None,
+    pool: dict[str, RetrievedChunk] | None = None,
+    labels: list[str] | None = None,
+) -> tuple[dict[str, RetrievedChunk], set[str]]:
+    """Search each query in parallel and merge the results into `pool`
+    (deduplicated by chunk text, keeping the best vector score).
+
+    Each chunk's metadata gets a "_queries" list naming the queries (or
+    `labels`, if given) that found it, so callers can tell which facets came
+    back empty. A filtered query that finds nothing is retried unfiltered.
+    Returns the pool and the keys first seen in this round.
+    """
+
+    pool = {} if pool is None else pool
+    labels = labels or queries
+    if not queries:
+        return pool, set()
+    expanded = [expand_query(q) for q in queries]
+
+    def run(q: str) -> list[RetrievedChunk]:
+        results = retrieve(q, per_query, retrieval_filter)
+        if retrieval_filter and not results:
+            results = retrieve(q, per_query)
+        return results
+
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool_exec:
+        result_sets = list(pool_exec.map(run, expanded))
+
+    new: set[str] = set()
+    for label, results in zip(labels, result_sets):
+        for r in results:
+            key = chunk_key(r)
+            if key not in pool:
+                pool[key] = r.model_copy(update={"metadata": {**r.metadata, "_queries": []}})
+                new.add(key)
+            elif r.score > pool[key].score:
+                pool[key].score = r.score
+            if label not in pool[key].metadata["_queries"]:
+                pool[key].metadata["_queries"].append(label)
+    return pool, new
+
+
+def rank(
+    question: str,
+    candidates: list[RetrievedChunk],
+    top_n: int
+) -> tuple[list[RetrievedChunk], bool]:
+    """Rerank `candidates` against `question` and keep the relevant top_n.
+    Falls back to vector scores if no reranker is configured or it rejects
+    the request. Returns (hits, reranked)."""
+
+    candidates = sorted(candidates, key=lambda c: c.score, reverse=True)
+    if settings.reranker_model_arn and candidates:
+        try:
+            hits = rerank(question, candidates, top_n)
+            return [h for h in hits if h.score >= settings.min_rerank_score], True
+        except get_bedrock_runtime_client().exceptions.ValidationException as e:
+            logger.warning("rerank rejected (%s); falling back to vector scores", e)
+    return candidates[:top_n], False
+
+
+def top_n_for(facets: int) -> int:
+    # Give each extra facet some room so one facet can't crowd out the rest
+    return min(12, settings.number_of_reranked_results + 2 * (max(1, facets) - 1))
+
+
 def multi_search(
     question: str,
     queries: list[str]
@@ -120,41 +196,14 @@ def multi_search(
 
     queries = list(dict.fromkeys(q.strip() for q in queries if q.strip()))[:MAX_QUERIES] or [question]
     per_query = max(10, settings.number_of_results // len(queries))
-    expanded = [expand_query(q) for q in queries]
 
-    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-        result_sets = list(pool.map(lambda q: retrieve(q, per_query), expanded))
-
-    merged: dict[str, RetrievedChunk] = {}
-    for query, results in zip(queries, result_sets):
-        for r in results:
-            key = hashlib.sha1(r.text.encode()).hexdigest()
-            if key not in merged:
-                merged[key] = r.model_copy(update={"metadata": {**r.metadata, "_queries": []}})
-            elif r.score > merged[key].score:
-                merged[key].score = r.score
-            merged[key].metadata["_queries"].append(query)
-
-    candidates = sorted(merged.values(), key=lambda c: c.score, reverse=True)
-    # Give each extra facet some room so one facet can't crowd out the rest
-    top_n = min(12, settings.number_of_reranked_results + 2 * (len(queries) - 1))
-
-    reranked = False
-    if settings.reranker_model_arn:
-        try:
-            hits = rerank(question, candidates, top_n)
-            hits = [h for h in hits if h.score >= settings.min_rerank_score]
-            reranked = True
-        except get_bedrock_runtime_client().exceptions.ValidationException as e:
-            logger.warning("rerank rejected (%s); falling back to vector scores", e)
-            hits = candidates[:top_n]
-    else:
-        hits = candidates[:top_n]
+    pool, _ = search_round(queries, per_query)
+    hits, reranked = rank(question, list(pool.values()), top_n_for(len(queries)))
 
     stats = {
         "queries": queries,
-        "expanded": [e for q, e in zip(queries, expanded) if e != q],
-        "candidates": len(candidates),
+        "expanded": [e for q in queries if (e := expand_query(q)) != q],
+        "candidates": len(pool),
         "reranked": reranked,
         "scores": [round(h.score, 3) for h in hits],
     }
