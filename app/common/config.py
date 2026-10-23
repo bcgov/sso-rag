@@ -60,6 +60,41 @@ class Settings(BaseSettings):
         alias="SEARCH_TYPE"
     )
 
+    # Query rewriter (app/services/query_rewriter.py): a small model that
+    # turns the user's message into the search queries the agent's
+    # search_knowledge_base tool runs.
+    query_rewriter_model_id: str = Field(
+        default="meta.llama3-8b-instruct-v1:0",
+        alias="QUERY_REWRITER_MODEL_ID"
+    )
+
+    query_rewriter_timeout_seconds: float = Field(
+        default=3,
+        gt=0,
+        alias="QUERY_REWRITER_TIMEOUT_SECONDS"
+    )
+
+    query_rewriter_history_turns: int = Field(
+        default=3,
+        ge=0,
+        alias="QUERY_REWRITER_HISTORY_TURNS"
+    )
+
+    query_rewriter_step_back_enabled: bool = Field(
+        default=True,
+        alias="QUERY_REWRITER_STEP_BACK_ENABLED"
+    )
+
+    query_rewriter_decomposition_enabled: bool = Field(
+        default=True,
+        alias="QUERY_REWRITER_DECOMPOSITION_ENABLED"
+    )
+
+    query_rewriter_retry_enabled: bool = Field(
+        default=True,
+        alias="QUERY_REWRITER_RETRY_ENABLED"
+    )
+
     agent_storage_s3_bucket: str = Field(
         alias="AGENT_STORAGE_S3_BUCKET",
         default="sandbox-sso-rag-agent-context-store"

@@ -10,6 +10,7 @@ How a user question travels from the browser to a grounded, streamed answer: req
 | Agent, model, session storage | [rag_agent.py](../../app/agents/rag_agent.py) |
 | Orchestration, `<thinking>` filter, status events | [chat_service.py](../../app/services/chat_service.py) |
 | System prompt | [system_prompt.py](../../app/prompts/system_prompt.py) |
+| Query rewriter (Llama 3 8B) | [query_rewriter.py](../../app/services/query_rewriter.py), [query_rewriter_prompt.py](../../app/prompts/query_rewriter_prompt.py) |
 | Retrieval tool | [knowledge_base_tool.py](../../app/tools/knowledge_base_tool.py) |
 | Search, merge, rerank | [knowledge_base.py](../../app/retrieval/knowledge_base.py) |
 | Answer verification | [grounding.py](../../app/services/grounding.py) |
@@ -25,10 +26,11 @@ FastAPI route chat()            validate body + cookie + tab id → conversation
 StreamingResponse(_event_stream)   Set-Cookie, SSE headers
     ↓
 ChatService.stream()            restore agent from stored snapshot
+    ├─► Query rewriter (background)   intent + rewrite, step-back, sub-queries (Llama 3 8B)
     ↓
 Strands Agent → Bedrock model   system prompt + history + prompt
-    ↓  (tool call)
-search_knowledge_base           multi_search → Bedrock KB retrieve → rerank
+    ↓  (tool call, only for SSO questions)
+search_knowledge_base()         wait for rewriter → multi_search → KB retrieve → rerank → retry misses
     ↓  (tool result)
 Bedrock model                   writes answer + <grounding> block
     ↓
@@ -71,28 +73,47 @@ In `chat()`:
 
 - `model`: the shared `BedrockModel`;
 - `tools`: `[search_knowledge_base]`;
-- `system_prompt`: `SYSTEM_PROMPT` (terminology mapping, search rules, clarifying-question policy, answering rules, escalation text and the grounding-report contract);
+- `system_prompt`: `SYSTEM_PROMPT` (when to call the no-argument search tool, clarifying-question policy, answering rules, escalation text and the grounding-report contract);
 - `context_manager="auto"`: Strands trims the conversation when it grows too large;
 - `session_manager`: `SnapshotSessionManager` on the storage above, which restores previous messages and saves a snapshot after the turn;
 - `callback_handler=None`: nothing is printed to stdout; output is consumed from the stream.
 
 A fresh agent per request prevents conversation history from leaking between users.
 
-## 5. Model invocation and tool loop
+## 5. Query rewriting
 
-`agent.stream_async(question, invocation_state={CITATIONS_KEY: retrieved}, cancel_signal=cancel)` runs the Strands agent loop against Bedrock. `retrieved` is an empty list shared with the tool so it can collect every result for later verification.
+Right after the agent is restored, `ChatService` reads the last few turns from `agent.messages` (before the new prompt is appended) and calls `query_rewriter.submit(prompt, history)`. It wraps the returned future in a `SearchTurn`.
+
+- **Greetings.** Whole-message greetings, thanks and capability questions match a regex and resolve at once as conversational, with no model call.
+- **Everything else.** Three Llama 3 8B calls (Bedrock `Converse`) run in the background, in parallel:
+  - rewrite + intent;
+  - step-back query;
+  - sub-query decomposition.
+- **Overlap.** These calls overlap the agent's first model call.
+- **Fail-open.** Any failure falls back to searching the raw prompt.
+- **Cleanup.** The future is cancelled when the stream ends, in case it is still queued.
+
+Details: [query-decomposition.md](./query-decomposition.md).
+
+## 6. Model invocation and tool loop
+
+`agent.stream_async(question, invocation_state={CITATIONS_KEY: retrieved, SEARCH_TURN_KEY: turn}, cancel_signal=cancel)` runs the Strands agent loop against Bedrock. `retrieved` is an empty list shared with the tool so it can collect every result for later verification.
 
 The loop:
 
 1. The model receives the system prompt, restored history and the new prompt.
-2. For SSO questions it must call `search_knowledge_base(question, queries)`. Greetings and "what can you do" questions need no search.
-3. The tool runs `multi_search`: acronym expansion, parallel Bedrock KB `retrieve` per query, dedupe, rerank, score filter (see [query-decomposition.md](./query-decomposition.md)). It appends each hit `{title, uri, score, text}` to `retrieved` and returns numbered text blocks, or `NO_MATCH`, plus a `NOTE` for queries with no hits.
-4. The model may call the tool again (retry with different wording, once per part) or proceed to write the answer.
+2. For SSO questions it calls `search_knowledge_base()`, which has **no arguments**: the agent never writes queries. For greetings, thanks and "what can you do" questions it replies directly.
+3. The tool does the following:
+   - Waits for the rewriter, up to the timeout. A conversational intent returns `NO_SEARCH_NEEDED`.
+   - Runs `multi_search` over the rewritten query, any sub-queries and the step-back query: acronym expansion, parallel Bedrock KB `retrieve`, dedupe, rerank against the rewritten query, score filter.
+   - Asks the rewriter to reword queries that found nothing, once, and merges those results.
+   - Appends each hit `{title, uri, score, text}` to `retrieved` and returns numbered text blocks, or `NO_MATCH`, plus a `NOTE` for sub-queries the docs don't cover.
+4. The output is cached for the turn, so a repeated tool call returns the same result.
 5. The final reply ends with a `<grounding>{...}</grounding>` block.
 
 A clarifying question is a valid final reply too (`response_type: "clarification"`); the prompt prefers searching first and asking only when the docs give different answers depending on the missing detail.
 
-## 6. Streaming events consumed by `ChatService`
+## 7. Streaming events consumed by `ChatService`
 
 For every event from `stream_async` that is a dict:
 
@@ -108,7 +129,7 @@ For every event from `stream_async` that is a dict:
 
 The reply is **buffered, not streamed token by token**, because it must be verified first.
 
-## 7. Verification
+## 8. Verification
 
 After the stream ends, `ThinkingFilter.flush()` is appended and `verify(reply, retrieved, question)` runs (full rules in [grounding-status.md](./grounding-status.md)). It strips the `<grounding>` block and rejects the answer if citations, URLs or code/config values aren't backed by this turn's retrieved text.
 
@@ -118,7 +139,7 @@ After the stream ends, `ThinkingFilter.flush()` is appended and `verify(reply, r
 
 Result: a single `Answer(text, grounding_status, citations)`.
 
-## 8. Response chunks
+## 9. Response chunks
 
 Back in `_event_stream`, items are encoded as OpenAI-style `chat.completion.chunk` events (`model` is the model id):
 
@@ -140,7 +161,7 @@ data: [DONE]
 
 The UI parses each `data:` line, updates the status indicator, appends content, stores `grounding_status` and `citations`, and stops on `[DONE]` (an `error` chunk is raised as an error and the placeholder message removed).
 
-## 9. Related endpoints
+## 10. Related endpoints
 
 - `DELETE /chat`: drops the stored history of the current conversation. With a valid `X-Tab-Id` only that tab's history is removed and the cookie is kept; without it the browser-level conversation is removed and the cookie cleared.
 - `DELETE /chat/history`: deletes every stored conversation of this browser (all tabs) and clears the cookie; returns 500 and keeps the cookie if some deletions fail so the user can retry.
@@ -151,6 +172,9 @@ The UI parses each `data:` line, updates the status indicator, appends content, 
 |---|---|
 | Invalid body | 422 from FastAPI |
 | Invalid/forged session cookie | Ignored; new session issued |
+| Greeting / thanks | No rewriter call (regex) or `intent=conversational`; no search; reply without a grounding status |
+| Query rewriter fails or times out | Raw prompt searched as the single query |
+| A query finds nothing | Reworded once by the rewriter and searched again |
 | No relevant docs found | Model replies with the no-documentation text, `NOT_SUPPORTED` |
 | Answer fails verification | Replaced with `NO_DOCUMENTATION_RESPONSE`, `NOT_SUPPORTED`; stored history corrected |
 | Rerank request rejected | Falls back to vector-score order |

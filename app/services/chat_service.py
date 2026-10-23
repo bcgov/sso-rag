@@ -7,9 +7,11 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from app.agents.rag_agent import create_agent, replace_last_answer
+from app.common.config import settings
 from app.common.constants import NO_DOCUMENTATION_RESPONSE
 from app.services.grounding import NOT_SUPPORTED, grounding_block, verify
-from app.tools.knowledge_base_tool import CITATIONS_KEY
+from app.services.query_rewriter import query_rewriter, recent_history
+from app.tools.knowledge_base_tool import CITATIONS_KEY, SEARCH_TURN_KEY, SearchTurn
 
 logger = logging.getLogger(__name__)
 
@@ -144,35 +146,49 @@ class ChatService:
         # Agent construction restores the session snapshot synchronously, so
         # keep that storage I/O off the event loop.
         agent = await asyncio.to_thread(create_agent, session_id)
+        # The query rewriter runs while the agent makes its first model call;
+        # the search tool waits for it only if the agent searches. History is
+        # read before stream_async appends this turn.
+        turn = SearchTurn(
+            prompt=question,
+            rewrite=query_rewriter.submit(
+                question,
+                recent_history(agent.messages, settings.query_rewriter_history_turns)
+            )
+        )
         thinking = ThinkingFilter()
         retrieved: list[dict] = []
         reply: list[str] = []
         status: str | None = None
         last_sent = time.monotonic()
 
-        async for event in agent.stream_async(
-            question,
-            invocation_state={CITATIONS_KEY: retrieved},
-            cancel_signal=cancel_signal
-        ):
-            if not isinstance(event, dict):
-                continue
+        try:
+            async for event in agent.stream_async(
+                question,
+                invocation_state={CITATIONS_KEY: retrieved, SEARCH_TURN_KEY: turn},
+                cancel_signal=cancel_signal
+            ):
+                if not isinstance(event, dict):
+                    continue
 
-            phase = None
-            if event.get("current_tool_use"):
-                phase = "searching"
-            elif text := event.get("data"):
-                if visible := thinking.feed(text):
-                    reply.append(visible)
-                    phase = "writing"
+                phase = None
+                if event.get("current_tool_use"):
+                    phase = "searching"
+                elif text := event.get("data"):
+                    if visible := thinking.feed(text):
+                        reply.append(visible)
+                        phase = "writing"
 
-            if phase and phase != status:
-                status = phase
-                last_sent = time.monotonic()
-                yield Status(phase)
-            elif time.monotonic() - last_sent >= HEARTBEAT_SECONDS:
-                last_sent = time.monotonic()
-                yield Heartbeat()
+                if phase and phase != status:
+                    status = phase
+                    last_sent = time.monotonic()
+                    yield Status(phase)
+                elif time.monotonic() - last_sent >= HEARTBEAT_SECONDS:
+                    last_sent = time.monotonic()
+                    yield Heartbeat()
+        finally:
+            # Drops the rewrite if it is still queued (e.g. client disconnected).
+            turn.rewrite.cancel()
 
         reply.append(thinking.flush())
 

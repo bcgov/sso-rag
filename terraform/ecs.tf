@@ -71,6 +71,12 @@ resource "aws_ecs_task_definition" "api" {
         { name = "NUMBER_OF_RESULTS", value = var.number_of_results },
         { name = "MIN_RERANK_SCORE", value = var.min_rerank_score },
         { name = "SEARCH_TYPE", value = var.search_type },
+        { name = "QUERY_REWRITER_MODEL_ID", value = var.query_rewriter_model_id },
+        { name = "QUERY_REWRITER_TIMEOUT_SECONDS", value = var.query_rewriter_timeout_seconds },
+        { name = "QUERY_REWRITER_HISTORY_TURNS", value = var.query_rewriter_history_turns },
+        { name = "QUERY_REWRITER_STEP_BACK_ENABLED", value = var.query_rewriter_step_back_enabled },
+        { name = "QUERY_REWRITER_DECOMPOSITION_ENABLED", value = var.query_rewriter_decomposition_enabled },
+        { name = "QUERY_REWRITER_RETRY_ENABLED", value = var.query_rewriter_retry_enabled },
       ]
 
       logConfiguration = {
