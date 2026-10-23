@@ -338,7 +338,8 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ENVIRONMENT` | `sandbox` | `local` stores conversations in `./.agent-store/`; anything else uses `AGENT_STORAGE_S3_BUCKET` |
+| `ENVIRONMENT` | `sandbox` | `local` stores conversations in `./.agent-store/` and turns on trace logs; anything else uses `AGENT_STORAGE_S3_BUCKET` |
+| `DEBUG_TRACE` | `true` | Trace logs of rewritten queries, search results and the agent's reply before the grounding check. Only has an effect when `ENVIRONMENT=local`; set `false` to silence them locally |
 | `AWS_REGION` | `ca-central-1` | Region for Bedrock calls |
 | `KNOWLEDGE_BASE_ID` | – (required) | Bedrock Knowledge Base to search |
 | `MODEL_ARN` | – | Foundation model the agent uses |
@@ -715,6 +716,23 @@ uv run uvicorn main:app \
   --host 0.0.0.0 \
   --port 8000
 ```
+
+With `ENVIRONMENT=local`, each chat turn prints `TRACE` blocks to stderr
+(`app/common/trace.py`) so you can check inputs and outputs:
+
+- `query rewriter: output`: the prompt, history, intent, rewritten query,
+  sub-queries, step-back query, per-call status and latency, and the raw
+  model replies (plus `greeting short-circuit` and `retry` events);
+- `search tool: queries and results`: each query with its origin, queries
+  with no hits, retry queries, and every hit (score, title, URL, which
+  queries found it, text preview);
+- `agent reply before grounding check (first|repair attempt)`: the prompt,
+  the raw reply including its `<grounding>` block, and the evidence URLs;
+- `grounding verdict (first|repair attempt)`: rejected or not, reasons,
+  status, citations and the text that will be delivered.
+
+These include user prompts and document text, so they never run outside
+`ENVIRONMENT=local`. Set `DEBUG_TRACE=false` to turn them off locally.
 
 Swagger:
 

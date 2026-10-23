@@ -49,7 +49,9 @@ _OPEN_BLOCK_RE = re.compile(r"<grounding>.*\Z", re.S | re.I)
 # A grounding block wrapped in a code fence leaves an empty fence behind.
 _EMPTY_FENCE_RE = re.compile(r"(```|~~~)[^\n]*\s*\1\s*\Z")
 
-_URL_RE = re.compile(r"(?:https?://|mailto:)[^\s<>()\[\]\"'`]+", re.I)
+# <placeholder> segments are kept so ".../logout?id_token_hint=<id_token>&..."
+# isn't cut short at the "<".
+_URL_RE = re.compile(r"(?:https?://|mailto:)(?:[^\s<>()\[\]\"'`]|<[^<>\s]+>)+", re.I)
 _FENCE_RE = re.compile(r"^(```|~~~)[^\n]*\n(.*?)(?:^\1[ \t]*$|\Z)", re.S | re.M)
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _DOUBLE_QUOTED_RE = re.compile(r'"([^"\n]{2,200})"')
@@ -224,6 +226,34 @@ def _documented(value: str, evidence: _Evidence) -> bool:
     return True
 
 
+def _url_documented(url: str, evidence: _Evidence) -> bool:
+    """A URL is documented if it appears in the evidence as-is or, failing
+    that, if its scheme/host/path appears in the evidence text and every
+    query parameter name is documented with a placeholder, documented value
+    or documented URL as its value. This allows documented endpoints with
+    user-supplied values, e.g. ".../logout?id_token_hint=<id_token>"."""
+
+    if _url_key(url) in evidence.urls or _is_example_url(url):
+        return True
+
+    base, _, query = _clean_url(url).partition("?")
+    base = base.split("#", 1)[0].rstrip("/")
+    if not base or not _documented(base, evidence):
+        return False
+
+    for param in filter(None, query.split("#", 1)[0].split("&") if query else []):
+        name, _, value = param.partition("=")
+        if not name or _norm(name) not in evidence.text:
+            return False
+        if not value or _PLACEHOLDER_RE.fullmatch(value):
+            continue
+        documented = _url_documented(value, evidence) if _URL_RE.fullmatch(value) \
+            else _documented(value, evidence)
+        if not documented:
+            return False
+    return True
+
+
 def _values(body: str) -> tuple[list[str], list[str]]:
     """(URLs, other checkable values) written in the answer."""
 
@@ -250,15 +280,23 @@ def _has_factual_markers(body: str) -> bool:
     )
 
 
-def verify(reply: str, retrieved: list[dict], prompt: str) -> Verdict:
+def verify(reply: str, retrieved: list[dict], prompt: str, conversational: bool = False) -> Verdict:
     """Checks the model's reply against what retrieval returned this turn.
 
     `retrieved` holds one dict per result: {"title", "uri", "score", "text"}.
+    `conversational` is True when the query rewriter classified the prompt as
+    a greeting/thanks/capability question.
     """
 
     body, grounding = split_grounding(reply)
     evidence = _evidence(retrieved, prompt)
     reasons: list[str] = []
+
+    # The model sometimes drops the grounding block on small talk. Deliver it
+    # anyway when nothing was searched and it contains no checkable values.
+    if grounding is None and conversational and not retrieved and body \
+            and not _has_factual_markers(body):
+        return Verdict(text=body, status=None)
 
     if grounding is None:
         reasons.append("missing or malformed grounding block")
@@ -281,10 +319,7 @@ def verify(reply: str, retrieved: list[dict], prompt: str) -> Verdict:
         reasons.append("retrieval returned no results but the answer contains factual guidance")
 
     urls, values = _values(body)
-    unknown_urls = [
-        u for u in dict.fromkeys(urls)
-        if _url_key(u) not in evidence.urls and not _is_example_url(u)
-    ]
+    unknown_urls = [u for u in dict.fromkeys(urls) if not _url_documented(u, evidence)]
     if unknown_urls:
         reasons.append(f"undocumented URLs: {unknown_urls}")
     unknown_values = [v for v in values if not _documented(v, evidence)]

@@ -28,13 +28,13 @@ Documentation vocabulary (user wording -> documentation terms):
 
 Applications and integrations
 - app, application, project, system, my project -> CSS project / CSS SSO integration
-- register / onboard / connect my app, add SSO, add government login -> request a CSS integration (Quickstart)
+- register / onboard / connect my app, add SSO, add government login -> request an integration through CSS
 - integration request status, pending, still processing -> integration status: In Draft, Submitted, Completed
 - add prod / add test, promote to production -> configure the integration for the PROD / TEST environment
 - remove SSO, delete or retire the app -> remove / decommission an integration
 
 Clients and credentials
-- client, SSO client -> Keycloak client (CSS-Integration)
+- client, SSO client -> Keycloak client (CSS Integration)
 - client ID, app ID, "resource" -> client_id (resource in the Installation JSON)
 - client password, app secret, SSO password, integration secret -> client secret (confidential client), only when the context is a client, integration or token request
 - installation file, config JSON, keycloak.json, setup file, credentials file -> Installation JSON

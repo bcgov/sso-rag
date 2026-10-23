@@ -54,7 +54,8 @@ def test_angle_bracket_placeholder_urls_pass():
 def test_partial_placeholder_host_is_still_checked():
     body = f"Sign in to the [CSS app]({CSS}) and call `https://<env>.loginproxy.gov.bc.ca/auth/realms/standard/made-up`."
     verdict = verify(_reply(body), RETRIEVED, "q")
-    assert verdict.rejected and "undocumented values" in verdict.reasons[0]
+    assert verdict.rejected and "undocumented URLs" in verdict.reasons[0]
+    assert "made-up" in verdict.reasons[0]
 
 
 def test_contact_links_alone_are_not_factual_guidance():
@@ -110,3 +111,85 @@ def test_plain_text_clarifying_question_is_delivered(retrieved):
 def test_clarifying_question_cannot_smuggle_undocumented_values():
     verdict = verify(_clarify("Do you see `invalid_grant` from https://sso.gov.bc.ca/?"), RETRIEVED, "q")
     assert verdict.rejected
+
+
+# --- conversational replies without a grounding block -------------------------
+
+GREETING_REPLY = "Hello! I can help with BC Government SSO questions. What do you need?"
+
+
+def test_conversational_reply_without_block_is_delivered():
+    verdict = verify(GREETING_REPLY, [], "Hello", conversational=True)
+    assert not verdict.rejected
+    assert verdict.text == GREETING_REPLY
+    assert verdict.status is None
+
+
+def test_missing_block_still_rejected_when_not_conversational():
+    verdict = verify(GREETING_REPLY, [], "Hello")
+    assert verdict.rejected
+    assert verdict.text == NO_DOCUMENTATION_RESPONSE
+
+
+@pytest.mark.parametrize("reply", [
+    f"Hi! Start at {CSS} to request one.",
+    "Hi! Use the `realm-admin` role.",
+])
+def test_conversational_reply_with_factual_markers_needs_block(reply):
+    verdict = verify(reply, [], "Hello", conversational=True)
+    assert verdict.rejected
+
+
+def test_conversational_flag_ignored_when_retrieval_ran():
+    verdict = verify(GREETING_REPLY, RETRIEVED, "Hello", conversational=True)
+    assert verdict.rejected
+
+
+# --- URLs with user-supplied placeholder values -------------------------------
+
+LOGOUT_DOC = "https://bcgov.github.io/sso-docs/best-practices/dos-donts"
+LOGOUT_RETRIEVED = [{
+    "title": "Logout",
+    "uri": LOGOUT_DOC,
+    "score": 0.9,
+    "text": (
+        "Redirect the user to Keycloak's `end_session_endpoint` with `id_token_hint` "
+        "(the user's ID token) and `post_logout_redirect_uri`.\n"
+        "https://logon7.gov.bc.ca/clp-cgi/logoff.cgi?retnow=1&returl=https://loginproxy.gov.bc.ca"
+        "/auth/realms/standard/protocol/openid-connect/logout?post_logout_redirect_uri=https://myapp/logout"
+    ),
+}]
+
+
+def _logout_reply(body: str) -> str:
+    return body + (
+        '\n<grounding>{"response_type": "answer", "grounding_status": "SUPPORTED", '
+        f'"citations": ["{LOGOUT_DOC}"]}}</grounding>'
+    )
+
+
+def test_documented_urls_with_placeholder_values_pass():
+    body = (
+        "Redirect to `https://loginproxy.gov.bc.ca/auth/realms/standard/protocol/openid-connect/logout"
+        "?id_token_hint=<id_token>&post_logout_redirect_uri=<your-logout-uri>`.\n\n"
+        "For SiteMinder: https://logon7.gov.bc.ca/clp-cgi/logoff.cgi?retnow=1&returl="
+        "https://loginproxy.gov.bc.ca/auth/realms/standard/protocol/openid-connect/logout"
+        "?post_logout_redirect_uri=<your-logout-uri>"
+    )
+    verdict = verify(_logout_reply(body), LOGOUT_RETRIEVED, "how do I log out?")
+    assert not verdict.rejected, verdict.reasons
+
+
+@pytest.mark.parametrize("url", [
+    # undocumented path
+    "https://loginproxy.gov.bc.ca/auth/realms/standard/protocol/openid-connect/revoke?token=<token>",
+    # undocumented parameter name
+    "https://loginproxy.gov.bc.ca/auth/realms/standard/protocol/openid-connect/logout?client_secret=<secret>",
+    # undocumented literal value
+    "https://loginproxy.gov.bc.ca/auth/realms/standard/protocol/openid-connect/logout"
+    "?post_logout_redirect_uri=https://other.gov.bc.ca/bye",
+])
+def test_placeholder_urls_still_checked(url):
+    verdict = verify(_logout_reply(f"Use {url}"), LOGOUT_RETRIEVED, "how do I log out?")
+    assert verdict.rejected
+    assert any("undocumented URLs" in r for r in verdict.reasons)

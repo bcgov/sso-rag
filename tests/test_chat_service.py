@@ -207,3 +207,18 @@ def test_clarifying_question_is_delivered_without_repair(harness):
     assert len(agent.prompts) == 1
     assert answer.text == question and answer.grounding_status is None and answer.citations == []
     assert calls["replaced"] == [] and calls["saved"] == 0
+
+
+def test_greeting_without_grounding_block_is_delivered(harness, monkeypatch):
+    def submit(prompt, history):
+        f = Future()
+        f.set_result(RewrittenQuery.conversational())
+        return f
+
+    monkeypatch.setattr(cs.query_rewriter, "submit", submit)
+    greeting = "Hello! I can help with BC Government SSO questions. What do you need?"
+    agent = FakeAgent([greeting], search=False)
+    answer, calls = harness(agent)
+    assert len(agent.prompts) == 1
+    assert answer.text == greeting and answer.grounding_status is None
+    assert calls["replaced"] == []

@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from app.common.config import settings
+from app.common.trace import trace
 from app.prompts.query_rewriter_prompt import (
     DECOMPOSE_SYSTEM,
     RETRY_SYSTEM,
@@ -224,6 +225,7 @@ class QueryRewriter:
             logger.info(json.dumps({
                 "event": "query_rewrite", "intent": CONVERSATIONAL, "short_circuit": True
             }))
+            trace("query rewriter: greeting short-circuit (no model call)", prompt=prompt)
             return future
         return _jobs.submit(self.transform, prompt, history)
 
@@ -311,6 +313,19 @@ class QueryRewriter:
             "n_sub_queries": len(result.sub_queries),
             "step_back": result.step_back_query is not None,
         }))
+        trace(
+            "query rewriter: output",
+            prompt=prompt,
+            history=[f"{role}: {text}" for role, text in history],
+            intent=result.intent,
+            rewritten_query=result.rewritten_query,
+            sub_queries=result.sub_queries,
+            step_back_query=result.step_back_query,
+            fallback=result.fallback,
+            status=status,
+            latency_ms=latency,
+            raw_replies=replies,
+        )
         return result
 
     def retry(self, question: str, failed: list[str]) -> list[str]:
@@ -329,6 +344,8 @@ class QueryRewriter:
             return []
 
         queries = parse_retry(text, len(failed))
+        trace("query rewriter: retry", question=question, failed_queries=failed,
+              retry_queries=queries, raw_reply=text)
         logger.info(json.dumps({
             "event": "query_rewrite_retry",
             "failed": len(failed),

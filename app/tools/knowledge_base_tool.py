@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from strands import ToolContext, tool
 
 from app.common.config import settings
+from app.common.trace import preview, trace
 from app.retrieval.knowledge_base import merge_hits, multi_search
 from app.retrieval.models import RetrievedChunk, SearchQuery
 from app.services.query_rewriter import CONVERSATIONAL, RewrittenQuery, query_rewriter
@@ -90,6 +91,7 @@ def search_knowledge_base(tool_context: ToolContext) -> str:
     with turn.lock:
         if turn.result is not None:
             logger.info(json.dumps({"event": "search_repeated"}))
+            trace("search tool: repeated call in the same turn", returned="ALREADY_SEARCHED")
             return ALREADY_SEARCHED
         citations = state.get(CITATIONS_KEY)
         turn.result = _search(turn, citations if isinstance(citations, list) else None)
@@ -119,6 +121,7 @@ def _search(turn: SearchTurn, citations: list | None) -> str:
 
     if rewrite.intent == CONVERSATIONAL:
         logger.info(json.dumps({"event": "search_skipped", "reason": CONVERSATIONAL}))
+        trace("search tool: skipped (conversational)", prompt=turn.prompt, returned="NO_SEARCH_NEEDED")
         return NO_SEARCH_NEEDED
 
     question = rewrite.rewritten_query or turn.prompt
@@ -149,6 +152,33 @@ def _search(turn: SearchTurn, citations: list | None) -> str:
         "retry": retry_stats,
         **stats,
     }))
+
+    trace(
+        "search tool: queries and results",
+        prompt=turn.prompt,
+        waited_for_rewriter_ms=waited_ms,
+        fallback_to_raw_prompt=rewrite.fallback,
+        rerank_question=question,
+        queries=[f"[{o}] {q}" for q, o in zip(stats["queries"], stats["origins"])],
+        acronym_expanded=stats.get("expanded", []),
+        candidates=stats.get("candidates"),
+        reranked=stats.get("reranked"),
+        no_hits=stats["missing"],
+        retry_queries=retry_stats["queries"] if retry_stats else [],
+        retry_no_hits=retry_stats["missing"] if retry_stats else [],
+        uncovered_sub_queries=[q for q in stats["queries"] if q in still_missing and origin_of.get(q) == "sub"],
+        hits=[
+            {
+                "score": round(r.score, 3),
+                "title": _title(r),
+                "uri": _uri(r),
+                "found_by": r.metadata.get("_queries", []),
+                "text": preview(r.text),
+            }
+            for r in hits
+        ],
+        returned="NO_MATCH" if not hits else f"{len(hits)} result blocks",
+    )
 
     if not hits:
         return NO_MATCH

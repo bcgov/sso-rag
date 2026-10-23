@@ -16,9 +16,10 @@ from app.agents.rag_agent import (
 )
 from app.common.config import settings
 from app.common.constants import NO_DOCUMENTATION_RESPONSE
+from app.common.trace import preview, trace
 from app.prompts.system_prompt import repair_request
 from app.services.grounding import NOT_SUPPORTED, Verdict, grounding_block, verify
-from app.services.query_rewriter import query_rewriter, recent_history
+from app.services.query_rewriter import CONVERSATIONAL, query_rewriter, recent_history
 from app.tools.knowledge_base_tool import CITATIONS_KEY, SEARCH_TURN_KEY, SearchTurn
 
 logger = logging.getLogger(__name__)
@@ -219,10 +220,40 @@ async def _run_agent(
     run.parts.append(thinking.flush())
 
 
-def _check(run: _Run, retrieved: list[dict], question: str) -> Verdict:
+def _is_conversational(turn: SearchTurn) -> bool:
+    """True when the rewrite already finished and classified the prompt as
+    conversational (always the case for short-circuited greetings)."""
+    rewrite = turn.rewrite
+    if not rewrite.done() or rewrite.cancelled() or rewrite.exception() is not None:
+        return False
+    return rewrite.result().intent == CONVERSATIONAL
+
+
+def _check(run: _Run, retrieved: list[dict], question: str, conversational: bool = False) -> Verdict:
     if run.truncated:
         return Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED, reasons=[TRUNCATED_REASON])
-    return verify(run.text, retrieved, question)
+    return verify(run.text, retrieved, question, conversational=conversational)
+
+
+def _trace_attempt(attempt: str, prompt: str, run: _Run, retrieved: list[dict], verdict: Verdict) -> None:
+    """Local-only: the agent's reply as the grounding check received it
+    (thinking removed, grounding block still attached), and the verdict."""
+    trace(
+        f"agent reply before grounding check ({attempt} attempt)",
+        prompt=prompt,
+        cut_off_at_max_tokens=run.truncated,
+        raw_reply=run.text,
+        evidence=[f"{r.get('score', 0):.3f} {r.get('uri')}" for r in retrieved],
+    )
+    trace(
+        f"grounding verdict ({attempt} attempt)",
+        rejected=verdict.rejected,
+        reasons=verdict.reasons,
+        replaced_with_no_documentation_reply=verdict.replaced,
+        grounding_status=verdict.status,
+        citations=[c.get("uri") for c in verdict.citations],
+        delivered_text=preview(verdict.text, 600),
+    )
 
 
 def _log_rejection(verdict, retrieved: list[dict], attempt: str) -> None:
@@ -276,7 +307,8 @@ class ChatService:
             # Drops the rewrite if it is still queued (e.g. client disconnected).
             turn.rewrite.cancel()
 
-        verdict = _check(run, retrieved, question)
+        verdict = _check(run, retrieved, question, _is_conversational(turn))
+        _trace_attempt("first", question, run, retrieved, verdict)
 
         feedback = None
         if (
@@ -291,6 +323,7 @@ class ChatService:
             async for item in _run_agent(agent, feedback, state, cancel_signal, progress, run):
                 yield item
             verdict = _check(run, retrieved, question)
+            _trace_attempt("repair", feedback, run, retrieved, verdict)
             drop_repair_exchange(agent, feedback)
             logger.info(json.dumps({"event": "answer_repair", "repaired": not verdict.replaced}))
 

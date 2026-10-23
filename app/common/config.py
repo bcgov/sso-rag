@@ -16,6 +16,14 @@ class Settings(BaseSettings):
         default="sandbox"
     )
 
+    # Local-only trace logs (app/common/trace.py): rewritten queries, search
+    # results and the agent's raw reply before the grounding check. Has no
+    # effect unless ENVIRONMENT=local.
+    debug_trace: bool = Field(
+        default=True,
+        alias="DEBUG_TRACE"
+    )
+
     aws_region: str = Field(
         default="ca-central-1",
         alias="AWS_REGION"
