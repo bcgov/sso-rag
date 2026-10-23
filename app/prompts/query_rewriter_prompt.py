@@ -41,7 +41,9 @@ Task:
      information, including follow-ups about something already discussed.
    - "conversational": only greetings, thanks, small talk, or questions about
      what the assistant can help with.
-   If unsure, choose "sso_question".
+   A reply to the assistant's clarifying question ("IDIR, in prod", "the
+   error is invalid_grant") is always "sso_question". If unsure, choose
+   "sso_question".
 2. If "sso_question", rewrite the latest question into ONE specific, detailed,
    standalone search query in the documentation's vocabulary:
    - resolve references ("it", "that", "what about prod?") from the
@@ -57,6 +59,10 @@ Task:
 Follow-up example
 <question>what about prod?</question> after a conversation about BCeID in TEST
 {"intent": "sso_question", "rewritten_query": "How do I request PROD approval for a BCeID integration in the CSS app?"}
+
+Clarification-reply example
+<question>IDIR, in PROD</question> after the user said "my login isn't working" and the assistant asked which identity provider and environment
+{"intent": "sso_question", "rewritten_query": "Why does IDIR login fail for my CSS integration in the PROD environment?"}
 
 Return only JSON, with no other text:
 {"intent": "sso_question" or "conversational", "rewritten_query": "..."}

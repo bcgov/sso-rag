@@ -342,6 +342,7 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `AWS_REGION` | `ca-central-1` | Region for Bedrock calls |
 | `KNOWLEDGE_BASE_ID` | – (required) | Bedrock Knowledge Base to search |
 | `MODEL_ARN` | – | Foundation model the agent uses |
+| `MODEL_MAX_TOKENS` | `4096` | Output-token limit per agent model call; a reply cut off at it gets one repair attempt asking for a shorter answer |
 | `RERANKER_MODEL_ARN` | unset | Bedrock reranker model; unset = order by vector score |
 | `NUMBER_OF_RESULTS` | `25` | Total candidates retrieved per search, split across queries (min 5 per query) |
 | `NUMBER_OF_RERANKED_RESULTS` | `6` | Results kept after reranking for a single-part question (+2 per extra part, max 12) |
@@ -353,6 +354,7 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `QUERY_REWRITER_STEP_BACK_ENABLED` | `true` | Add a broader step-back query |
 | `QUERY_REWRITER_DECOMPOSITION_ENABLED` | `true` | Split multi-part questions into 2–4 sub-queries |
 | `QUERY_REWRITER_RETRY_ENABLED` | `true` | Reword queries that found nothing and search once more |
+| `GROUNDING_REPAIR_ENABLED` | `true` | Give a reply that fails the grounding checks one rewrite (from the same results) before falling back to the no-documentation reply |
 | `CORS_ORIGINS` | `["*"]` | Allowed origins for the UI (answers `OPTIONS` preflight). Cookies are only allowed cross-origin when this lists explicit origins, e.g. `["https://ui.example.gov.bc.ca"]` |
 | `AGENT_STORAGE_S3_BUCKET` | `sandbox-sso-rag-agent-context-store` | Bucket for conversation history when `ENVIRONMENT` is not `local` |
 | `SESSION_COOKIE_NAME` | `strands_session` | Name of the session cookie |
@@ -477,11 +479,27 @@ contacts) when:
 - the reply contains a URL, endpoint path, inline code (roles, claims,
   configuration keys and values) or quoted string/path in a code block that
   appears neither in the retrieved text nor in the user's message
-  (`<placeholders>` are ignored);
+  (`<placeholders>` and URLs on a placeholder host such as
+  `https://<your-app-host>/callback` are ignored; the support contacts and
+  example URLs on reserved or loopback hosts such as `example.com` and
+  `localhost` are always allowed);
 - the grounding block is missing or malformed.
 
-Rejections are logged as `answer_rejected` with the reasons. The stored
-conversation keeps the delivered reply rather than the rejected one.
+**Repair attempt.** If the reply is rejected but the search did return
+results, the agent gets one chance to fix it. It is sent the rejection
+reasons (for example a CSS app URL written from memory, or endpoint names
+that aren't in this turn's results) and rewrites the reply from the same
+results, without searching again. The rewrite is checked again; only
+if it also fails does the user get `NO_DOCUMENTATION_RESPONSE`. Set
+`GROUNDING_REPAIR_ENABLED=false` to turn this off.
+
+A reply cut off at the output-token limit (`MODEL_MAX_TOKENS`, Strands'
+`MaxTokensReachedException`) is handled the same way: the agent is asked for
+a shorter, complete reply, and the partial message is removed from history.
+
+Rejections are logged as `answer_rejected` (with `attempt`: `first` or
+`repair`) and repairs as `answer_repair`. The stored conversation keeps only
+the delivered reply: the rejected reply and the repair request are removed.
 
 The checks are exact string matches, not a semantic judge: plain-prose
 statements aren't verified. The prompt asks the model to write every role,
@@ -594,8 +612,14 @@ The prompt lives in `app/prompts/system_prompt.py`. It covers:
   → IDIR with MFA, M2M → client credentials, …) lives in
   `app/prompts/terminology.py` and is used by the query rewriter prompts in
   `app/prompts/query_rewriter_prompt.py`.
-- **Clarifying questions** – search first; ask about identity provider,
-  environment or client type only when the answer depends on it.
+- **Clarifying questions** – search first, then ask (1–3 short, plain-text
+  questions) instead of answering when the request is too vague to act on
+  ("login isn't working" with no error) or the results differ by a detail
+  the user hasn't given (identity provider, environment, realm, client type,
+  protocol) and covering every variant would be long. Preferred over the
+  no-documentation reply for vague requests. Otherwise answer and state any
+  assumption. The query rewriter treats the user's reply to a clarifying
+  question as an SSO question, so the next turn searches with those details.
 - **Answering** – facts only from search results, markdown citations built
   from result URLs, guides preferred over release notes, Silver flagged as
   legacy, partial answers that state what isn't covered.
@@ -663,7 +687,8 @@ search. `tool_context` is injected by Strands. `ChatService` passes
 `invocation_state={"search_turn": SearchTurn(...), "citations": [...]}`:
 
 - `search_turn` holds the turn's raw prompt, the query rewriter's future, and
-  the cached result (repeated calls in a turn return it without searching).
+  the first call's result (repeated calls in a turn get `ALREADY_SEARCHED`
+  instead of the same results again).
 - each returned result's title, source URL, score and text is appended to
   `citations`; `/chat` builds its citations and grounding checks from it.
 

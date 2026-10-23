@@ -61,6 +61,18 @@ variable "model_arn" {
   default     = "arn:aws:bedrock:ca-central-1:820251787117:inference-profile/global.amazon.nova-2-lite-v1:0"
 }
 
+variable "model_max_tokens" {
+  description = "Output-token limit per agent model call; a reply cut off at it gets one repair attempt asking for a shorter answer"
+  type        = string
+  default     = "4096"
+}
+
+variable "grounding_repair_enabled" {
+  description = "Give a reply that fails the grounding checks one rewrite before falling back to the no-documentation reply"
+  type        = string
+  default     = "true"
+}
+
 variable "reranker_model_arn" {
   description = "ARN of the Bedrock foundation model used for Reranking"
   type        = string

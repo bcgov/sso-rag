@@ -8,19 +8,9 @@ from dataclasses import dataclass, field
 from strands import ToolContext, tool
 
 from app.common.config import settings
-from app.retrieval.knowledge_base import (
-    merge_hits,
-    multi_search
-)
-from app.retrieval.models import (
-    RetrievedChunk,
-    SearchQuery
-)
-from app.services.query_rewriter import (
-    CONVERSATIONAL,
-    RewrittenQuery,
-    query_rewriter
-)
+from app.retrieval.knowledge_base import merge_hits, multi_search
+from app.retrieval.models import RetrievedChunk, SearchQuery
+from app.services.query_rewriter import CONVERSATIONAL, RewrittenQuery, query_rewriter
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +26,14 @@ SEARCH_TURN_KEY = "search_turn"
 NO_SEARCH_NEEDED = (
     "NO_SEARCH_NEEDED: this message needs no documentation search; "
     "reply conversationally."
+)
+
+# Returned when the tool is called again in the same turn: the first call's
+# output is already in the conversation, and repeating it would only grow the
+# context (and the reply's token use).
+ALREADY_SEARCHED = (
+    "ALREADY_SEARCHED: the documentation was already searched for this "
+    "question; use the results above and write your reply now."
 )
 
 NO_MATCH = (
@@ -55,7 +53,7 @@ class SearchTurn:
     prompt: str
     # Resolves to the query rewriter's RewrittenQuery for this turn.
     rewrite: Future
-    # The tool's output, cached so repeated calls in a turn don't search again.
+    # The first call's output; later calls in the turn get ALREADY_SEARCHED.
     result: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -78,8 +76,9 @@ def search_knowledge_base(tool_context: ToolContext) -> str:
         Numbered result blocks separated by "---", each with the page and
         section, source URL, score and text, possibly followed by a NOTE
         naming parts of the question the documentation doesn't cover; or a
-        string starting with "NO_MATCH" if nothing relevant was found, or
-        "NO_SEARCH_NEEDED" if the message needs no search.
+        string starting with "NO_MATCH" if nothing relevant was found,
+        "NO_SEARCH_NEEDED" if the message needs no search, or
+        "ALREADY_SEARCHED" if it was already called this turn.
     """
 
     state = tool_context.invocation_state
@@ -89,9 +88,11 @@ def search_knowledge_base(tool_context: ToolContext) -> str:
         return NO_MATCH
 
     with turn.lock:
-        if turn.result is None:
-            citations = state.get(CITATIONS_KEY)
-            turn.result = _search(turn, citations if isinstance(citations, list) else None)
+        if turn.result is not None:
+            logger.info(json.dumps({"event": "search_repeated"}))
+            return ALREADY_SEARCHED
+        citations = state.get(CITATIONS_KEY)
+        turn.result = _search(turn, citations if isinstance(citations, list) else None)
         return turn.result
 
 

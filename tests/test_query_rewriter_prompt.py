@@ -48,3 +48,17 @@ def test_key_documentation_terms_present(term):
 def test_templates_keep_format_placeholders_resolved():
     for text in SYSTEMS.values():
         assert "{rules}" not in text and "{terminology}" not in text
+
+
+def test_rewriter_treats_clarification_replies_as_questions():
+    assert "reply to the assistant's clarifying question" in prompts.REWRITE_SYSTEM
+    assert "Clarification-reply example" in prompts.REWRITE_SYSTEM
+
+
+def test_agent_prompt_defines_when_to_clarify():
+    from app.prompts.system_prompt import SYSTEM_PROMPT, repair_request
+
+    assert "ask a clarifying question INSTEAD of answering" in SYSTEM_PROMPT
+    assert "too vague to act on" in SYSTEM_PROMPT
+    assert "Prefer a clarifying question to the no-documentation reply" in SYSTEM_PROMPT
+    assert "clarifying question instead" in repair_request(["x"])

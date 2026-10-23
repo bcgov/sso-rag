@@ -67,6 +67,8 @@ resource "aws_ecs_task_definition" "api" {
         { name = "KNOWLEDGE_BASE_ID", value = var.knowledge_base_id },
         { name = "RERANKER_MODEL_ARN", value = var.reranker_model_arn },
         { name = "MODEL_ARN", value = var.model_arn },
+        { name = "MODEL_MAX_TOKENS", value = var.model_max_tokens },
+        { name = "GROUNDING_REPAIR_ENABLED", value = var.grounding_repair_enabled },
         { name = "NUMBER_OF_RERANKED_RESULTS", value = var.number_of_reranked_results },
         { name = "NUMBER_OF_RESULTS", value = var.number_of_results },
         { name = "MIN_RERANK_SCORE", value = var.min_rerank_score },

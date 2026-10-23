@@ -80,12 +80,14 @@ def test_searches_rewriter_queries_in_order(search):
     assert set(citations[0]) == {"title", "uri", "score", "text"}
 
 
-def test_result_is_cached_per_turn(search):
+def test_searches_once_per_turn(search):
     turn = SearchTurn(prompt="raw", rewrite=_done(RewrittenQuery(intent="sso_question", rewritten_query="q")))
     citations = []
     first, _ = _call(turn, citations)
     second, _ = _call(turn, citations)
-    assert first == second and len(search.calls) == 1 and len(citations) == 1
+    assert first.startswith("[1]")
+    assert second == kbt.ALREADY_SEARCHED
+    assert len(search.calls) == 1 and len(citations) == 1
 
 
 def test_rewrite_failure_uses_raw_prompt(search):

@@ -16,6 +16,12 @@ cover it (NOT_SUPPORTED), or when it is rejected because:
   claims written as code) that appear neither in the retrieved text nor in
   the user's message.
 
+Always allowed: the support contacts in NO_DOCUMENTATION_RESPONSE (email and
+Teams link), `<placeholders>`, URLs whose whole host is a placeholder
+(`https://<your-app-host>/callback`), which are values the user supplies, and
+example URLs on reserved or loopback hosts (example.com/.net/.org, *.example,
+*.test, *.invalid, localhost, 127.0.0.1).
+
 The checks are deterministic string matches against the retrieved text. They
 can't judge plain-prose claims; the prompt therefore asks for every role,
 claim, configuration key/value and endpoint to be written as `code`, which
@@ -25,6 +31,7 @@ is checked.
 import json
 import re
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from app.common.constants import NO_DOCUMENTATION_RESPONSE
 
@@ -57,6 +64,41 @@ _PLACEHOLDER_RE = re.compile(
 )
 
 CONTACT_URLS = {"mailto:bcgov.sso@gov.bc.ca"}
+
+
+def _contact_urls() -> set[str]:
+    """The support contacts the prompt tells the model to point to: the
+    email plus every link in NO_DOCUMENTATION_RESPONSE (e.g. Teams)."""
+    return CONTACT_URLS | {u.rstrip(".,;:!?*_") for u in _URL_RE.findall(NO_DOCUMENTATION_RESPONSE)}
+
+
+# A URL whose whole host is a placeholder ("https://<your-app-host>/callback")
+# is a value the user supplies, not a documented one. Hosts that only start
+# with one ("https://<env>.loginproxy.gov.bc.ca/...") are still checked.
+_PLACEHOLDER_HOST_URL_RE = re.compile(r"^https?://(?:<[^<>\s]+>|\{\{?[^{}\s]+\}?\}|\$\{[^}\s]+\})(?=[/:?#]|$)", re.I)
+
+# Hosts reserved for documentation and testing (RFC 2606 / RFC 6761) and
+# loopback addresses can never be real BC Gov services, so example URLs on
+# them ("https://myapp.example.com/callback", "http://localhost:3000") are
+# allowed. Real-looking invented hosts ("https://your-app.gov.bc.ca") are not.
+_EXAMPLE_DOMAINS = ("example.com", "example.net", "example.org")
+_EXAMPLE_TLDS = {"example", "test", "invalid", "localhost"}
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _is_example_url(url: str) -> bool:
+    try:
+        host = urlsplit(_clean_url(url)).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    host = host.rstrip(".").lower()
+    if host in _LOOPBACK_HOSTS:
+        return True
+    if any(host == d or host.endswith("." + d) for d in _EXAMPLE_DOMAINS):
+        return True
+    return "." in host and host.rsplit(".", 1)[1] in _EXAMPLE_TLDS
 
 
 @dataclass(frozen=True)
@@ -159,18 +201,22 @@ def _evidence(retrieved: list[dict], prompt: str) -> _Evidence:
             sources[key] = r
 
     texts = [r.get("text") or "" for r in retrieved]
+    contacts = _contact_urls()
     urls = set(sources) | {_url_key(u) for t in texts + [prompt] for u in _URL_RE.findall(t)}
-    urls |= {_url_key(u) for u in CONTACT_URLS}
+    urls |= {_url_key(u) for u in contacts}
 
     # Backticks are formatting in the docs' markdown, not part of values.
     corpus = "\n".join(texts + [r.get("uri") or "" for r in retrieved]
-                       + [prompt, NO_DOCUMENTATION_RESPONSE] + list(CONTACT_URLS))
+                       + [prompt, NO_DOCUMENTATION_RESPONSE] + list(contacts))
     return _Evidence(sources, urls, _norm(corpus.replace("`", "")))
 
 
 def _documented(value: str, evidence: _Evidence) -> bool:
     """Every literal part of `value` (placeholders excluded) is in the
-    evidence text."""
+    evidence text. A URL on a placeholder host is entirely user-supplied."""
+    value = value.strip()
+    if _PLACEHOLDER_HOST_URL_RE.match(value) or (_URL_RE.fullmatch(value) and _is_example_url(value)):
+        return True
     for fragment in _PLACEHOLDER_RE.split(value):
         fragment = _norm(fragment).strip(" .,;:")
         if len(fragment) >= 2 and fragment not in evidence.text:
@@ -198,7 +244,10 @@ def _values(body: str) -> tuple[list[str], list[str]]:
 
 def _has_factual_markers(body: str) -> bool:
     urls, values = _values(body)
-    return bool(values) or any(_url_key(u) not in {_url_key(c) for c in CONTACT_URLS} for u in urls)
+    contacts = {_url_key(c) for c in _contact_urls()}
+    return bool(values) or any(
+        _url_key(u) not in contacts and not _is_example_url(u) for u in urls
+    )
 
 
 def verify(reply: str, retrieved: list[dict], prompt: str) -> Verdict:
@@ -232,7 +281,10 @@ def verify(reply: str, retrieved: list[dict], prompt: str) -> Verdict:
         reasons.append("retrieval returned no results but the answer contains factual guidance")
 
     urls, values = _values(body)
-    unknown_urls = [u for u in dict.fromkeys(urls) if _url_key(u) not in evidence.urls]
+    unknown_urls = [
+        u for u in dict.fromkeys(urls)
+        if _url_key(u) not in evidence.urls and not _is_example_url(u)
+    ]
     if unknown_urls:
         reasons.append(f"undocumented URLs: {unknown_urls}")
     unknown_values = [v for v in values if not _documented(v, evidence)]

@@ -89,7 +89,7 @@ The rewrite template also carries worked rewrite examples, and each template add
 ## 2. The tool: `search_knowledge_base()`
 
 - **No model-facing arguments.** Strands produces an empty input schema.
-- **Per-turn cache.** The first call stores its output on the `SearchTurn` (under a lock), and repeated or parallel calls in the same turn return it.
+- **Once per turn.** The first call stores its output on the `SearchTurn` (under a lock). Repeated or parallel calls in the same turn get a short `ALREADY_SEARCHED` notice instead of the same results again, which would only grow the context and the reply's token use.
 - **Query set.** `rewrite`, then `sub` queries, then `step_back`.
 - **Retry.** Only `rewrite` and `sub` queries listed in `stats["missing"]` are retried, once per turn. Retry queries that duplicate an existing query are skipped. Retry hits are merged with `merge_hits`, which keeps the best score per chunk and caps the list at 12.
 - **Notes.** A `sub` query that is still missing after the retry is named in `NOTE: the documentation returned nothing for: "...". Say this part is not covered (PARTIALLY_SUPPORTED).`
@@ -134,5 +134,5 @@ The rewriter model must be enabled in Bedrock model access. IAM already allows `
 ## Notes and limits
 
 - If an SSO question is misclassified as conversational, there is no retrieval and the grounding checks force the no-documentation reply. The prompt is therefore biased toward `sso_question`.
-- The agent can't search with its own wording, so a follow-up search within the same turn returns the cached result.
+- The agent can't search with its own wording, so a second search in the same turn returns `ALREADY_SEARCHED`.
 - Step-back adds broader evidence, which makes the grounding value checks slightly more permissive.

@@ -35,6 +35,15 @@ class Settings(BaseSettings):
         alias="MODEL_ARN"
     )
 
+    # Output-token limit per agent model call. Bedrock's default varies by
+    # model (Nova 2 is dynamic), so set it explicitly; a reply cut off at
+    # this limit gets one repair attempt asking for a shorter answer.
+    model_max_tokens: int = Field(
+        default=4096,
+        gt=0,
+        alias="MODEL_MAX_TOKENS"
+    )
+
     reranker_model_arn: str | None = Field(
         default=None,
         alias="RERANKER_MODEL_ARN"
@@ -93,6 +102,13 @@ class Settings(BaseSettings):
     query_rewriter_retry_enabled: bool = Field(
         default=True,
         alias="QUERY_REWRITER_RETRY_ENABLED"
+    )
+
+    # When an answer fails the grounding checks but the search returned
+    # results, send the reasons back to the agent once for a corrected reply.
+    grounding_repair_enabled: bool = Field(
+        default=True,
+        alias="GROUNDING_REPAIR_ENABLED"
     )
 
     agent_storage_s3_bucket: str = Field(

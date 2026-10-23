@@ -24,7 +24,8 @@ def extract_model_id(model_arn: str) -> str:
 
 model = BedrockModel(
     model_id=extract_model_id(settings.model_arn),
-    region_name=settings.aws_region
+    region_name=settings.aws_region,
+    max_tokens=settings.model_max_tokens
 )
 
 
@@ -69,6 +70,32 @@ async def delete_session(session_id: str) -> None:
     await SnapshotSessionManager(session_id, storage=storage).delete_session()
 
 
+async def save_session(agent: Agent, session_id: str) -> None:
+    await SnapshotSessionManager(session_id, storage=storage).save_snapshot(agent, is_latest=True)
+
+
+def _message_text(message: dict) -> str:
+    return "".join(
+        block.get("text", "") for block in message.get("content", [])
+        if isinstance(block, dict)
+    )
+
+
+def drop_repair_exchange(agent: Agent, feedback: str) -> None:
+    """Removes a grounding-repair exchange from the history: the feedback
+    message and the rejected reply just before it, so the stored
+    conversation reads as question -> (search) -> repaired answer. Call
+    save_session or replace_last_answer afterwards to persist it."""
+
+    messages = agent.messages
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user" and _message_text(messages[i]) == feedback:
+            del messages[i]
+            if i > 0 and messages[i - 1].get("role") == "assistant":
+                del messages[i - 1]
+            return
+
+
 async def replace_last_answer(agent: Agent, session_id: str, text: str) -> None:
     """Swaps the text of the agent's last reply and re-saves the session, so
     a rejected answer isn't kept as context for the next turn."""
@@ -77,7 +104,7 @@ async def replace_last_answer(agent: Agent, session_id: str, text: str) -> None:
         if message["role"] == "assistant":
             message["content"] = [{"text": text}]
             break
-    await SnapshotSessionManager(session_id, storage=storage).save_snapshot(agent, is_latest=True)
+    await save_session(agent, session_id)
 
 
 def create_agent(session_id: str) -> Agent:

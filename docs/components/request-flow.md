@@ -108,10 +108,10 @@ The loop:
    - Runs `multi_search` over the rewritten query, any sub-queries and the step-back query: acronym expansion, parallel Bedrock KB `retrieve`, dedupe, rerank against the rewritten query, score filter.
    - Asks the rewriter to reword queries that found nothing, once, and merges those results.
    - Appends each hit `{title, uri, score, text}` to `retrieved` and returns numbered text blocks, or `NO_MATCH`, plus a `NOTE` for sub-queries the docs don't cover.
-4. The output is cached for the turn, so a repeated tool call returns the same result.
+4. The tool searches once per turn; a repeated call returns `ALREADY_SEARCHED`. Model output is limited to `MODEL_MAX_TOKENS` (4096) per call.
 5. The final reply ends with a `<grounding>{...}</grounding>` block.
 
-A clarifying question is a valid final reply too (`response_type: "clarification"`); the prompt prefers searching first and asking only when the docs give different answers depending on the missing detail.
+A clarifying question is a valid final reply too (`response_type: "clarification"`). After searching, the agent asks one to three plain-text questions instead of answering in two cases. The first is a request too vague to act on, such as a problem without its error or a request without its subject. The second is results that differ by a detail the user hasn't given (IdP, environment, realm, client type, protocol). It prefers this to the no-documentation reply for vague requests. On the next turn, the query rewriter folds the user's reply into the rewritten query, and treats it as an SSO question even when it is short ("IDIR, in PROD").
 
 ## 7. Streaming events consumed by `ChatService`
 
@@ -133,9 +133,10 @@ The reply is **buffered, not streamed token by token**, because it must be verif
 
 After the stream ends, `ThinkingFilter.flush()` is appended and `verify(reply, retrieved, question)` runs (full rules in [grounding-status.md](./grounding-status.md)). It strips the `<grounding>` block and rejects the answer if citations, URLs or code/config values aren't backed by this turn's retrieved text.
 
-- Rejections are logged as `answer_rejected` with reasons.
-- If the answer was replaced with `NO_DOCUMENTATION_RESPONSE`, `replace_last_answer()` overwrites the last assistant message and re-saves the snapshot, so the rejected text isn't used as context next turn.
-- Otherwise the snapshot saved by the session manager already holds the delivered reply.
+- **Repair attempt.** If the answer is rejected and the search returned results, the agent is run once more with the rejection reasons (`repair_request`). It rewrites the reply from the same results, without a new search, and the rewrite is verified again. The repair request and rejected reply are then removed from the history. The client only sees the `writing` status and heartbeats meanwhile. Set `GROUNDING_REPAIR_ENABLED=false` to turn this off.
+- Rejections are logged as `answer_rejected` (`attempt`: `first` or `repair`) with reasons; repair outcomes as `answer_repair`.
+- If the final answer was replaced with `NO_DOCUMENTATION_RESPONSE`, `replace_last_answer()` overwrites the last assistant message and re-saves the snapshot, so the rejected text isn't used as context next turn.
+- After a successful repair the cleaned history is saved with `save_session()`. Otherwise the snapshot saved by the session manager already holds the delivered reply.
 
 Result: a single `Answer(text, grounding_status, citations)`.
 
@@ -176,8 +177,9 @@ The UI parses each `data:` line, updates the status indicator, appends content, 
 | Query rewriter fails or times out | Raw prompt searched as the single query |
 | A query finds nothing | Reworded once by the rewriter and searched again |
 | No relevant docs found | Model replies with the no-documentation text, `NOT_SUPPORTED` |
-| Answer fails verification | Replaced with `NO_DOCUMENTATION_RESPONSE`, `NOT_SUPPORTED`; stored history corrected |
+| Answer fails verification | One repair attempt with the reasons, if the search returned results; if that also fails, replaced with `NO_DOCUMENTATION_RESPONSE`, `NOT_SUPPORTED`; stored history corrected |
 | Rerank request rejected | Falls back to vector-score order |
+| Reply cut off at `MODEL_MAX_TOKENS` | Treated as a rejection: one repair attempt asking for a shorter reply, otherwise the no-documentation reply; partial message removed from history |
 | Exception mid-stream | In-band `error` event, then `[DONE]` |
 | Client disconnects | Cancel signal stops the agent |
 | Idle upstream | `: keepalive` comments every 10 s |
