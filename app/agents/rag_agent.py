@@ -25,7 +25,8 @@ def extract_model_id(model_arn: str) -> str:
 model = BedrockModel(
     model_id=extract_model_id(settings.model_arn),
     region_name=settings.aws_region,
-    max_tokens=settings.model_max_tokens
+    max_tokens=settings.model_max_tokens,
+    service_tier="flex"
 )
 
 
