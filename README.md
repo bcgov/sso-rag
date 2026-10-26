@@ -77,14 +77,20 @@ Visit [link](https://htmlpreview.github.io/?https://github.com/bcgov/sso-rag/blo
 
 ## Agentic RAG
 
-Unlike traditional RAG, retrieval is exposed as a tool.
+Unlike traditional RAG, retrieval is exposed as a tool, and query writing
+is kept separate from answering:
 
-The agent decides:
+- A **query rewriter** (Meta Llama 3 8B Instruct via the Bedrock Converse
+  API, `app/services/query_rewriter.py`) owns the search queries. It
+  classifies intent (SSO question vs greeting), resolves follow-ups from
+  recent history, rewrites the question into one specific query in the docs'
+  vocabulary, adds a broader step-back query, splits multi-part questions
+  into 2–4 sub-queries, and rewords queries that found nothing.
+- The **agent** decides when to search (never for greetings or thanks) by
+  calling `search_knowledge_base()`, which takes no arguments and runs the
+  rewriter's queries, and writes the final response.
 
-- When to retrieve
-- Whether a question is single-topic (one query) or has independent parts (one query per part)
-- Which parts came back empty and need a retry with different wording
-- How to formulate the final response
+See [docs/plans/plan_user_query_rewriting.md](docs/plans/plan_user_query_rewriting.md).
 
 ## AWS Bedrock Knowledge Base Integration
 
@@ -103,19 +109,27 @@ Document retrieval leverages:
 
 Each `search_knowledge_base` call:
 
+0. **Query rewriting** – waits for the turn's query rewriter result (started
+   when the request arrived, alongside the agent's first model call). A
+   conversational message returns `NO_SEARCH_NEEDED`. If the rewriter fails or
+   times out, the raw prompt is searched as the single query.
 1. **Acronym expansion** – queries using an acronym from `app/common/constants.py`
    (`BCSC`, `PKCE`, `M2M`, …) get its spelled-out form appended, so the
    embedding also matches the docs' wording. Only genuine abbreviations are
    expanded; general words are left alone.
-2. **Parallel multi-query retrieval** – the agent passes 1–4 queries; duplicates
-   are dropped and each query is searched in parallel.
+2. **Parallel multi-query retrieval** – the rewritten query, any sub-queries
+   and the step-back query (max 6, duplicates dropped) are searched in
+   parallel.
 3. **Dedupe** – chunks found by more than one query are merged.
-4. **Rerank** – the merged set is reranked against the user's question (not the
-   individual queries) with the Bedrock `Rerank` API, and results below
-   `MIN_RERANK_SCORE` are dropped. Extra facets get a little extra room
-   (up to 12 results) so one facet can't crowd out the others.
-5. **Coverage note** – queries with no surviving results are named in a `NOTE`
-   so the agent can retry just those.
+4. **Rerank** – the merged set is reranked against the rewritten question (not
+   the individual queries) with the Bedrock `Rerank` API, and results below
+   `MIN_RERANK_SCORE` are dropped. Each sub-query gets a little extra room
+   (up to 12 results) so one part can't crowd out the others; the step-back
+   query doesn't.
+5. **Retry** – the rewritten query and sub-queries with no surviving results
+   are reworded once by the query rewriter and searched again.
+6. **Coverage note** – sub-queries still without results are named in a
+   `NOTE` so the agent answers `PARTIALLY_SUPPORTED`.
 
 If no reranker is configured, or the reranker request is rejected, results are
 ordered by vector score instead.
@@ -222,17 +236,20 @@ conversation's stored history (session cookie + browser tab id; see
 [Agent Configuration](#agent-configuration)).
 
 ```text
+Query rewriter (Llama 3 8B, in parallel with the agent's first model call)
+  ↓  intent="sso_question"
+  ↓  rewritten_query="How do I request PROD approval for BCeID and assign client roles to a service account?"
+  ↓  sub_queries=["BCeID PROD approval", "service account client roles"]
+  ↓  step_back_query="CSS app integration approval process"
 Agent
-  ↓  search_knowledge_base(
-  ↓    question="How do I get PROD approval for BCeID and assign roles to a service account?",
-  ↓    queries=["BCeID PROD approval", "service account client roles"])
+  ↓  search_knowledge_base()          (no arguments)
 Knowledge Base Tool
-  ↓  parallel retrieve → dedupe → rerank against question
+  ↓  parallel retrieve → dedupe → rerank against rewritten query → reword misses once
 Bedrock Knowledge Base + Reranker
   ↓
-Ranked chunks with source URLs (+ NOTE for any query with no results)
+Ranked chunks with source URLs (+ NOTE for any part with no results)
   ↓
-Agent (retries empty queries once, then answers + grounding block)
+Agent (answers + grounding block)
   ↓
 Grounding checks (citations, URLs, code/config values vs retrieved text)
   ↓
@@ -321,15 +338,24 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ENVIRONMENT` | `sandbox` | `local` stores conversations in `./.agent-store/`; anything else uses `AGENT_STORAGE_S3_BUCKET` |
+| `ENVIRONMENT` | `sandbox` | `local` stores conversations in `./.agent-store/` and turns on trace logs; anything else uses `AGENT_STORAGE_S3_BUCKET` |
+| `DEBUG_TRACE` | `true` | Trace logs of rewritten queries, search results and the agent's reply before the grounding check. Only has an effect when `ENVIRONMENT=local`; set `false` to silence them locally |
 | `AWS_REGION` | `ca-central-1` | Region for Bedrock calls |
 | `KNOWLEDGE_BASE_ID` | – (required) | Bedrock Knowledge Base to search |
 | `MODEL_ARN` | – | Foundation model the agent uses |
+| `MODEL_MAX_TOKENS` | `4096` | Output-token limit per agent model call; a reply cut off at it gets one repair attempt asking for a shorter answer |
 | `RERANKER_MODEL_ARN` | unset | Bedrock reranker model; unset = order by vector score |
-| `NUMBER_OF_RESULTS` | `25` | Total candidates retrieved per tool call, split across queries (min 10 per query) |
-| `NUMBER_OF_RERANKED_RESULTS` | `6` | Results kept after reranking for a single query (+2 per extra query, max 12) |
+| `NUMBER_OF_RESULTS` | `25` | Total candidates retrieved per search, split across queries (min 5 per query) |
+| `NUMBER_OF_RERANKED_RESULTS` | `6` | Results kept after reranking for a single-part question (+2 per extra part, max 12) |
 | `MIN_RERANK_SCORE` | `0.05` | Drop reranked results below this relevance score |
 | `SEARCH_TYPE` | `SEMANTIC` | Bedrock `overrideSearchType`; keep `SEMANTIC` on S3 Vectors |
+| `QUERY_REWRITER_MODEL_ID` | `meta.llama3-8b-instruct-v1:0` | Bedrock model the query rewriter calls (Converse API); enable it in Bedrock model access |
+| `QUERY_REWRITER_TIMEOUT_SECONDS` | `3` | Timeout per rewriter call; on timeout the search falls back to the raw prompt |
+| `QUERY_REWRITER_HISTORY_TURNS` | `3` | Conversation turns given to the rewriter to resolve follow-ups |
+| `QUERY_REWRITER_STEP_BACK_ENABLED` | `true` | Add a broader step-back query |
+| `QUERY_REWRITER_DECOMPOSITION_ENABLED` | `true` | Split multi-part questions into 2–4 sub-queries |
+| `QUERY_REWRITER_RETRY_ENABLED` | `true` | Reword queries that found nothing and search once more |
+| `GROUNDING_REPAIR_ENABLED` | `true` | Give a reply that fails the grounding checks one rewrite (from the same results) before falling back to the no-documentation reply |
 | `CORS_ORIGINS` | `["*"]` | Allowed origins for the UI (answers `OPTIONS` preflight). Cookies are only allowed cross-origin when this lists explicit origins, e.g. `["https://ui.example.gov.bc.ca"]` |
 | `AGENT_STORAGE_S3_BUCKET` | `sandbox-sso-rag-agent-context-store` | Bucket for conversation history when `ENVIRONMENT` is not `local` |
 | `SESSION_COOKIE_NAME` | `strands_session` | Name of the session cookie |
@@ -454,11 +480,27 @@ contacts) when:
 - the reply contains a URL, endpoint path, inline code (roles, claims,
   configuration keys and values) or quoted string/path in a code block that
   appears neither in the retrieved text nor in the user's message
-  (`<placeholders>` are ignored);
+  (`<placeholders>` and URLs on a placeholder host such as
+  `https://<your-app-host>/callback` are ignored; the support contacts and
+  example URLs on reserved or loopback hosts such as `example.com` and
+  `localhost` are always allowed);
 - the grounding block is missing or malformed.
 
-Rejections are logged as `answer_rejected` with the reasons. The stored
-conversation keeps the delivered reply rather than the rejected one.
+**Repair attempt.** If the reply is rejected but the search did return
+results, the agent gets one chance to fix it. It is sent the rejection
+reasons (for example a CSS app URL written from memory, or endpoint names
+that aren't in this turn's results) and rewrites the reply from the same
+results, without searching again. The rewrite is checked again; only
+if it also fails does the user get `NO_DOCUMENTATION_RESPONSE`. Set
+`GROUNDING_REPAIR_ENABLED=false` to turn this off.
+
+A reply cut off at the output-token limit (`MODEL_MAX_TOKENS`, Strands'
+`MaxTokensReachedException`) is handled the same way: the agent is asked for
+a shorter, complete reply, and the partial message is removed from history.
+
+Rejections are logged as `answer_rejected` (with `attempt`: `first` or
+`repair`) and repairs as `answer_repair`. The stored conversation keeps only
+the delivered reply: the rejected reply and the repair request are removed.
 
 The checks are exact string matches, not a semantic judge: plain-prose
 statements aren't verified. The prompt asks the model to write every role,
@@ -564,13 +606,21 @@ invocation is cancelled.
 
 The prompt lives in `app/prompts/system_prompt.py`. It covers:
 
-- **Terminology** – rewriting user wording into the docs' vocabulary
-  (App → Integration, Azure IDIR → IDIR with MFA, M2M → client credentials, …).
-- **Searching** – one query for single-topic questions, one per part for
-  multi-part questions or comparisons (max 4), exact error text for errors,
-  and one retry per part that comes back empty.
-- **Clarifying questions** – search first; ask about identity provider,
-  environment or client type only when the answer depends on it.
+- **Searching** – call the no-argument `search_knowledge_base` once per turn
+  that needs SSO facts, never for greetings or thanks; how to handle
+  `NO_SEARCH_NEEDED`, `NO_MATCH` and the not-covered `NOTE`. Query wording is
+  not the agent's job: the terminology mapping (App → Integration, Azure IDIR
+  → IDIR with MFA, M2M → client credentials, …) lives in
+  `app/prompts/terminology.py` and is used by the query rewriter prompts in
+  `app/prompts/query_rewriter_prompt.py`.
+- **Clarifying questions** – search first, then ask (1–3 short, plain-text
+  questions) instead of answering when the request is too vague to act on
+  ("login isn't working" with no error) or the results differ by a detail
+  the user hasn't given (identity provider, environment, realm, client type,
+  protocol) and covering every variant would be long. Preferred over the
+  no-documentation reply for vague requests. Otherwise answer and state any
+  assumption. The query rewriter treats the user's reply to a clarifying
+  question as an SSO question, so the next turn searches with those details.
 - **Answering** – facts only from search results, markdown citations built
   from result URLs, guides preferred over release notes, Silver flagged as
   legacy, partial answers that state what isn't covered.
@@ -621,32 +671,38 @@ Current tool:
 
 Purpose:
 
-- Retrieve relevant chunks from Bedrock Knowledge Base for one or more queries
-- Rank them against the user's question
+- Run the query rewriter's queries against the Bedrock Knowledge Base
+- Rank the results against the rewritten question
+- Reword queries that found nothing (once) and search again
 - Return numbered result blocks with section, source URL and score
-- Flag queries that found nothing so the agent can retry them
+- Flag parts of the question the documentation doesn't cover
 
 ```python
 @tool(context=True)
-def search_knowledge_base(question: str, queries: list[str], tool_context: ToolContext) -> str:
+def search_knowledge_base(tool_context: ToolContext) -> str:
     ...
 ```
 
-`tool_context` is injected by Strands and isn't part of the model-facing
-schema. If the caller passes `invocation_state={"citations": [...]}`, each
-returned result's title, source URL, score and text is appended to that list;
-`/chat` builds its citations and grounding checks from it.
+The tool takes no model-facing arguments: the agent only decides *whether* to
+search. `tool_context` is injected by Strands. `ChatService` passes
+`invocation_state={"search_turn": SearchTurn(...), "citations": [...]}`:
 
-- `question` – the user's need as one standalone sentence, pronouns resolved;
-  results are reranked against it.
-- `queries` – 1–4 search strings in the docs' vocabulary; one per independent
-  part of the question.
+- `search_turn` holds the turn's raw prompt, the query rewriter's future, and
+  the first call's result (repeated calls in a turn get `ALREADY_SEARCHED`
+  instead of the same results again).
+- each returned result's title, source URL, score and text is appended to
+  `citations`; `/chat` builds its citations and grounding checks from it.
 
-Returns `NO_MATCH: ...` when nothing relevant was found for any query.
+Returns `NO_SEARCH_NEEDED: ...` for conversational messages and
+`NO_MATCH: ...` when nothing relevant was found.
 
-Each call logs one JSON line with the question, queries, which queries were
-acronym-expanded, candidate count, whether reranking ran, and the kept scores.
-Use these logs to tune `MIN_RERANK_SCORE` and the result counts.
+Each call logs one JSON line with the rewritten question, queries and their
+origins (`rewrite`, `sub`, `step_back`, `retry`), which queries were
+acronym-expanded, candidate count, whether reranking ran, the kept scores, how
+long it waited for the rewriter, and retry stats. The rewriter logs
+`query_rewrite` (intent, per-technique status and latency) and
+`query_rewrite_retry` events. Use these logs to tune `MIN_RERANK_SCORE`, the
+result counts and the rewriter timeout.
 
 ---
 
@@ -660,6 +716,23 @@ uv run uvicorn main:app \
   --host 0.0.0.0 \
   --port 8000
 ```
+
+With `ENVIRONMENT=local`, each chat turn prints `TRACE` blocks to stderr
+(`app/common/trace.py`) so you can check inputs and outputs:
+
+- `query rewriter: output`: the prompt, history, intent, rewritten query,
+  sub-queries, step-back query, per-call status and latency, and the raw
+  model replies (plus `greeting short-circuit` and `retry` events);
+- `search tool: queries and results`: each query with its origin, queries
+  with no hits, retry queries, and every hit (score, title, URL, which
+  queries found it, text preview);
+- `agent reply before grounding check (first|repair attempt)`: the prompt,
+  the raw reply including its `<grounding>` block, and the evidence URLs;
+- `grounding verdict (first|repair attempt)`: rejected or not, reasons,
+  status, citations and the text that will be delivered.
+
+These include user prompts and document text, so they never run outside
+`ENVIRONMENT=local`. Set `DEBUG_TRACE=false` to turn them off locally.
 
 Swagger:
 
@@ -677,15 +750,18 @@ http://localhost:8000/redoc
 
 # Testing
 
-There is no automated test suite yet. Before changing the prompt or retrieval
-settings, run a fixed set of 15–20 real user questions (including multi-part
-ones) and compare answers and the tool's log lines.
-
-Once tests are added, run them with:
+Unit tests (query rewriter parsing and fail-open, multi-query search, the
+search tool) mock all Bedrock calls and run with:
 
 ```bash
+uv sync
 uv run pytest
 ```
+
+Before changing the prompts, the query rewriter or retrieval settings, also
+run a fixed set of 15–20 real user questions (including follow-ups,
+multi-part questions, error messages and greetings) and compare answers,
+grounding statuses and the `query_rewrite` / tool log lines.
 
 ---
 

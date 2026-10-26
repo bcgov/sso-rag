@@ -1,11 +1,17 @@
 import json
 import logging
+import threading
+import time
+from concurrent.futures import Future
+from dataclasses import dataclass, field
 
 from strands import ToolContext, tool
 
-from app.retrieval.knowledge_base import (
-    multi_search
-)
+from app.common.config import settings
+from app.common.trace import preview, trace
+from app.retrieval.knowledge_base import merge_hits, multi_search
+from app.retrieval.models import RetrievedChunk, SearchQuery
+from app.services.query_rewriter import CONVERSATIONAL, RewrittenQuery, query_rewriter
 
 logger = logging.getLogger(__name__)
 
@@ -14,73 +20,207 @@ logger = logging.getLogger(__name__)
 # ChatService.stream and app/services/grounding.py).
 CITATIONS_KEY = "citations"
 
+# invocation_state key: the turn's SearchTurn (query rewriter output and the
+# cached search result).
+SEARCH_TURN_KEY = "search_turn"
+
+NO_SEARCH_NEEDED = (
+    "NO_SEARCH_NEEDED: this message needs no documentation search; "
+    "reply conversationally."
+)
+
+# Returned when the tool is called again in the same turn: the first call's
+# output is already in the conversation, and repeating it would only grow the
+# context (and the reply's token use).
+ALREADY_SEARCHED = (
+    "ALREADY_SEARCHED: the documentation was already searched for this "
+    "question; use the results above and write your reply now."
+)
+
+NO_MATCH = (
+    "NO_MATCH: the documentation search found nothing relevant for this "
+    "question. Reply with the no-documentation text."
+)
+
+# Origins whose misses trigger a reworded retry; step-back queries only add
+# background, so missing background isn't worth a retry.
+RETRYABLE_ORIGINS = {"rewrite", "sub"}
+
+
+@dataclass
+class SearchTurn:
+    """Per-turn state shared between ChatService and the tool."""
+
+    prompt: str
+    # Resolves to the query rewriter's RewrittenQuery for this turn.
+    rewrite: Future
+    # The first call's output; later calls in the turn get ALREADY_SEARCHED.
+    result: str | None = None
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
 
 @tool(context=True)
-def search_knowledge_base(
-    question: str,
-    queries: list[str],
-    tool_context: ToolContext
-) -> str:
-    """Search the BC Gov SSO (Keycloak / CSS app) documentation.
+def search_knowledge_base(tool_context: ToolContext) -> str:
+    """Search the BC Gov SSO (Keycloak / CSS app) documentation for the
+    user's current question.
 
-    Use for every question about SSO integrations, the CSS app, identity
-    providers (IDIR, BCeID, BC Services Card, GitHub), roles, client types,
-    redirects, OIDC/SAML, custom realms, service accounts, errors and uptime.
+    Call it once whenever the user needs SSO facts: integrations, the CSS
+    app, identity providers (IDIR, BCeID, BC Services Card, GitHub), roles,
+    client types, redirects, OIDC/SAML, custom realms, service accounts,
+    errors and uptime. Never call it for greetings, thanks or questions about
+    what you can help with.
 
-    Args:
-        question: The user's need as one standalone sentence, with pronouns
-            resolved from the conversation ("what about prod?" -> "How do I
-            get PROD approval for my BCeID integration?"). Results are ranked
-            against this.
-        queries: 1 to 4 search queries in the documentation's own vocabulary.
-            Use a single query for a single-topic question. Use one query per
-            facet only when the question has genuinely independent parts
-            (e.g. "BCeID PROD approval" and "service account client roles"),
-            or for troubleshooting (exact error text, then the feature).
+    Takes no arguments: the search queries are prepared automatically from
+    the conversation.
 
     Returns:
         Numbered result blocks separated by "---", each with the page and
-        section, source URL, score and text, followed by a note naming any
-        query that found nothing relevant; or a string starting with
-        "NO_MATCH" if nothing relevant was found for any query.
+        section, source URL, score and text, possibly followed by a NOTE
+        naming parts of the question the documentation doesn't cover; or a
+        string starting with "NO_MATCH" if nothing relevant was found,
+        "NO_SEARCH_NEEDED" if the message needs no search, or
+        "ALREADY_SEARCHED" if it was already called this turn.
     """
 
+    state = tool_context.invocation_state
+    turn = state.get(SEARCH_TURN_KEY)
+    if not isinstance(turn, SearchTurn):
+        logger.error("search_knowledge_base called without a SearchTurn")
+        return NO_MATCH
+
+    with turn.lock:
+        if turn.result is not None:
+            logger.info(json.dumps({"event": "search_repeated"}))
+            trace("search tool: repeated call in the same turn", returned="ALREADY_SEARCHED")
+            return ALREADY_SEARCHED
+        citations = state.get(CITATIONS_KEY)
+        turn.result = _search(turn, citations if isinstance(citations, list) else None)
+        return turn.result
+
+
+def _resolve_rewrite(turn: SearchTurn) -> tuple[RewrittenQuery, int]:
+    started = time.monotonic()
+    try:
+        rewrite = turn.rewrite.result(timeout=settings.query_rewriter_timeout_seconds)
+    except Exception as e:
+        logger.warning("query rewrite unavailable (%s); searching the raw prompt", e or type(e).__name__)
+        rewrite = RewrittenQuery.raw(turn.prompt)
+    return rewrite, int((time.monotonic() - started) * 1000)
+
+
+def build_queries(rewrite: RewrittenQuery) -> list[SearchQuery]:
+    queries = [SearchQuery(text=rewrite.rewritten_query, origin="rewrite")]
+    queries += [SearchQuery(text=q, origin="sub") for q in rewrite.sub_queries]
+    if rewrite.step_back_query:
+        queries.append(SearchQuery(text=rewrite.step_back_query, origin="step_back"))
+    return queries
+
+
+def _search(turn: SearchTurn, citations: list | None) -> str:
+    rewrite, waited_ms = _resolve_rewrite(turn)
+
+    if rewrite.intent == CONVERSATIONAL:
+        logger.info(json.dumps({"event": "search_skipped", "reason": CONVERSATIONAL}))
+        trace("search tool: skipped (conversational)", prompt=turn.prompt, returned="NO_SEARCH_NEEDED")
+        return NO_SEARCH_NEEDED
+
+    question = rewrite.rewritten_query or turn.prompt
+    queries = build_queries(rewrite)
     hits, stats = multi_search(question, queries)
-    logger.info(json.dumps({"question": question, "kept": len(hits), **stats}))
+
+    origin_of = dict(zip(stats["queries"], stats["origins"]))
+    failed = [q for q in stats["missing"] if origin_of.get(q) in RETRYABLE_ORIGINS]
+    still_missing = set(failed)
+    retry_stats = None
+
+    if failed:
+        retry_texts = query_rewriter.retry(question, failed)
+        known = {q.lower() for q in stats["queries"]}
+        pairs = [(f, r) for f, r in zip(failed, retry_texts) if r.lower() not in known]
+        if pairs:
+            retry_hits, retry_stats = multi_search(
+                question, [SearchQuery(text=r, origin="retry") for _, r in pairs]
+            )
+            hits = merge_hits(hits, retry_hits)
+            still_missing -= {f for f, r in pairs if r not in retry_stats["missing"]}
+
+    logger.info(json.dumps({
+        "question": question,
+        "kept": len(hits),
+        "waited_ms": waited_ms,
+        "fallback": rewrite.fallback,
+        "retry": retry_stats,
+        **stats,
+    }))
+
+    trace(
+        "search tool: queries and results",
+        prompt=turn.prompt,
+        waited_for_rewriter_ms=waited_ms,
+        fallback_to_raw_prompt=rewrite.fallback,
+        rerank_question=question,
+        queries=[f"[{o}] {q}" for q, o in zip(stats["queries"], stats["origins"])],
+        acronym_expanded=stats.get("expanded", []),
+        candidates=stats.get("candidates"),
+        reranked=stats.get("reranked"),
+        no_hits=stats["missing"],
+        retry_queries=retry_stats["queries"] if retry_stats else [],
+        retry_no_hits=retry_stats["missing"] if retry_stats else [],
+        uncovered_sub_queries=[q for q in stats["queries"] if q in still_missing and origin_of.get(q) == "sub"],
+        hits=[
+            {
+                "score": round(r.score, 3),
+                "title": _title(r),
+                "uri": _uri(r),
+                "found_by": r.metadata.get("_queries", []),
+                "text": preview(r.text),
+            }
+            for r in hits
+        ],
+        returned="NO_MATCH" if not hits else f"{len(hits)} result blocks",
+    )
 
     if not hits:
-        return ("NO_MATCH: nothing relevant for these queries. Try different "
-                "wording (the docs' own terms, the identity provider name, or "
-                "the error message text) before telling the user.")
+        return NO_MATCH
 
-    citations = tool_context.invocation_state.get(CITATIONS_KEY)
+    if citations is not None:
+        citations.extend(_citation(r) for r in hits)
 
-    blocks = []
-    for i, r in enumerate(hits, 1):
-        meta = r.metadata
-        title = meta.get("section") or meta.get("page_title", "")
-        if isinstance(citations, list):
-            citations.append({
-                "title": title,
-                "uri": meta.get("source_url") or r.source,
-                "score": r.score,
-                # Grounding checks compare the answer against this text.
-                "text": r.text
-            })
+    blocks = [_block(i, r) for i, r in enumerate(hits, 1)]
+
+    uncovered = [q for q in stats["queries"] if q in still_missing and origin_of.get(q) == "sub"]
+    if uncovered:
         blocks.append(
-            f"[{i}] {title}\n"
-            f"source: {meta.get('source_url') or r.source}\n"
-            f"score: {r.score:.3f}\n"
-            f"{r.text}"
-        )
-
-    found = {q for r in hits for q in r.metadata.get("_queries", [])}
-    missing = [q for q in stats["queries"] if q not in found]
-    if missing:
-        blocks.append(
-            "NOTE: no relevant results for: "
-            + "; ".join(f'"{q}"' for q in missing)
-            + ". Retry those with different wording if they matter to the answer."
+            "NOTE: the documentation returned nothing for: "
+            + "; ".join(f'"{q}"' for q in uncovered)
+            + ". Say this part is not covered (PARTIALLY_SUPPORTED)."
         )
 
     return "\n\n---\n\n".join(blocks)
+
+
+def _title(r: RetrievedChunk) -> str:
+    return r.metadata.get("section") or r.metadata.get("page_title", "")
+
+
+def _uri(r: RetrievedChunk) -> str | None:
+    return r.metadata.get("source_url") or r.source
+
+
+def _citation(r: RetrievedChunk) -> dict:
+    return {
+        "title": _title(r),
+        "uri": _uri(r),
+        "score": r.score,
+        # Grounding checks compare the answer against this text.
+        "text": r.text
+    }
+
+
+def _block(i: int, r: RetrievedChunk) -> str:
+    return (
+        f"[{i}] {_title(r)}\n"
+        f"source: {_uri(r)}\n"
+        f"score: {r.score:.3f}\n"
+        f"{r.text}"
+    )

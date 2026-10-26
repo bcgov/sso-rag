@@ -69,3 +69,5 @@ node_modules/
 **.tfvars
 .terraform/
 .agent-store/
+chunker/docs/
+chunker/chunks/

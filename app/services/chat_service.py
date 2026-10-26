@@ -4,12 +4,23 @@ import logging
 import threading
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-from app.agents.rag_agent import create_agent, replace_last_answer
+from strands.types.exceptions import MaxTokensReachedException
+
+from app.agents.rag_agent import (
+    create_agent,
+    drop_repair_exchange,
+    replace_last_answer,
+    save_session,
+)
+from app.common.config import settings
 from app.common.constants import NO_DOCUMENTATION_RESPONSE
-from app.services.grounding import NOT_SUPPORTED, grounding_block, verify
-from app.tools.knowledge_base_tool import CITATIONS_KEY
+from app.common.trace import preview, trace
+from app.prompts.system_prompt import repair_request
+from app.services.grounding import NOT_SUPPORTED, Verdict, grounding_block, verify
+from app.services.query_rewriter import CONVERSATIONAL, query_rewriter, recent_history
+from app.tools.knowledge_base_tool import CITATIONS_KEY, SEARCH_TURN_KEY, SearchTurn
 
 logger = logging.getLogger(__name__)
 
@@ -129,30 +140,58 @@ class Answer:
 HEARTBEAT_SECONDS = 10
 
 
-class ChatService:
+class _Progress:
+    """Status/heartbeat bookkeeping shared by the agent runs of one turn."""
 
-    async def stream(
-        self,
-        question: str,
-        session_id: str,
-        cancel_signal: threading.Event | None = None
-    ) -> AsyncIterator[Status | Heartbeat | Answer]:
-        """Runs the agent, buffering its reply (minus <thinking> blocks) so it
-        can be checked against the retrieved documentation before anything
-        is shown. Yields progress, then exactly one Answer."""
+    def __init__(self) -> None:
+        self.status: str | None = None
+        self.last_sent = time.monotonic()
 
-        # Agent construction restores the session snapshot synchronously, so
-        # keep that storage I/O off the event loop.
-        agent = await asyncio.to_thread(create_agent, session_id)
-        thinking = ThinkingFilter()
-        retrieved: list[dict] = []
-        reply: list[str] = []
-        status: str | None = None
-        last_sent = time.monotonic()
+    def update(self, phase: str | None) -> Status | Heartbeat | None:
+        if phase and phase != self.status:
+            self.status = phase
+            self.last_sent = time.monotonic()
+            return Status(phase)
+        if time.monotonic() - self.last_sent >= HEARTBEAT_SECONDS:
+            self.last_sent = time.monotonic()
+            return Heartbeat()
+        return None
 
+
+TRUNCATED_REASON = (
+    "the reply was cut off at the maximum output length before it was "
+    "finished; write a shorter, complete reply"
+)
+
+
+@dataclass
+class _Run:
+    """The visible text of one agent invocation, and whether the model
+    stopped at the output-token limit."""
+    parts: list[str] = field(default_factory=list)
+    truncated: bool = False
+
+    @property
+    def text(self) -> str:
+        return "".join(self.parts)
+
+
+async def _run_agent(
+    agent,
+    prompt: str,
+    invocation_state: dict,
+    cancel_signal: threading.Event | None,
+    progress: _Progress,
+    run: _Run,
+) -> AsyncIterator[Status | Heartbeat]:
+    """One agent invocation: collects the visible reply text (minus
+    <thinking> blocks) in `run` and yields progress."""
+
+    thinking = ThinkingFilter()
+    try:
         async for event in agent.stream_async(
-            question,
-            invocation_state={CITATIONS_KEY: retrieved},
+            prompt,
+            invocation_state=invocation_state,
             cancel_signal=cancel_signal
         ):
             if not isinstance(event, dict):
@@ -163,26 +202,134 @@ class ChatService:
                 phase = "searching"
             elif text := event.get("data"):
                 if visible := thinking.feed(text):
-                    reply.append(visible)
+                    run.parts.append(visible)
                     phase = "writing"
 
-            if phase and phase != status:
-                status = phase
-                last_sent = time.monotonic()
-                yield Status(phase)
-            elif time.monotonic() - last_sent >= HEARTBEAT_SECONDS:
-                last_sent = time.monotonic()
-                yield Heartbeat()
+            if item := progress.update(phase):
+                yield item
+    except MaxTokensReachedException:
+        # Strands keeps the partial reply in agent.messages; the caller
+        # replaces or removes it.
+        logger.warning(json.dumps({
+            "event": "max_tokens_reached",
+            "max_tokens": settings.model_max_tokens,
+            "chars": len(run.text),
+        }))
+        run.truncated = True
 
-        reply.append(thinking.flush())
+    run.parts.append(thinking.flush())
 
-        verdict = verify("".join(reply), retrieved, question)
+
+def _is_conversational(turn: SearchTurn) -> bool:
+    """True when the rewrite already finished and classified the prompt as
+    conversational (always the case for short-circuited greetings)."""
+    rewrite = turn.rewrite
+    if not rewrite.done() or rewrite.cancelled() or rewrite.exception() is not None:
+        return False
+    return rewrite.result().intent == CONVERSATIONAL
+
+
+def _check(run: _Run, retrieved: list[dict], question: str, conversational: bool = False) -> Verdict:
+    if run.truncated:
+        return Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED, reasons=[TRUNCATED_REASON])
+    return verify(run.text, retrieved, question, conversational=conversational)
+
+
+def _trace_attempt(attempt: str, prompt: str, run: _Run, retrieved: list[dict], verdict: Verdict) -> None:
+    """Local-only: the agent's reply as the grounding check received it
+    (thinking removed, grounding block still attached), and the verdict."""
+    trace(
+        f"agent reply before grounding check ({attempt} attempt)",
+        prompt=prompt,
+        cut_off_at_max_tokens=run.truncated,
+        raw_reply=run.text,
+        evidence=[f"{r.get('score', 0):.3f} {r.get('uri')}" for r in retrieved],
+    )
+    trace(
+        f"grounding verdict ({attempt} attempt)",
+        rejected=verdict.rejected,
+        reasons=verdict.reasons,
+        replaced_with_no_documentation_reply=verdict.replaced,
+        grounding_status=verdict.status,
+        citations=[c.get("uri") for c in verdict.citations],
+        delivered_text=preview(verdict.text, 600),
+    )
+
+
+def _log_rejection(verdict, retrieved: list[dict], attempt: str) -> None:
+    logger.warning(json.dumps({
+        "event": "answer_rejected",
+        "attempt": attempt,
+        "reasons": verdict.reasons,
+        "retrieved": len(retrieved),
+    }))
+
+
+class ChatService:
+
+    async def stream(
+        self,
+        question: str,
+        session_id: str,
+        cancel_signal: threading.Event | None = None
+    ) -> AsyncIterator[Status | Heartbeat | Answer]:
+        """Runs the agent, buffering its reply (minus <thinking> blocks) so it
+        can be checked against the retrieved documentation before anything
+        is shown. A reply that fails the checks or is cut off at the
+        output-token limit, when the search did return results, gets one
+        repair attempt: the agent is told why and rewrites it. Yields
+        progress, then exactly one Answer."""
+
+        # Agent construction restores the session snapshot synchronously, so
+        # keep that storage I/O off the event loop.
+        agent = await asyncio.to_thread(create_agent, session_id)
+        # The query rewriter runs while the agent makes its first model call;
+        # the search tool waits for it only if the agent searches. History is
+        # read before stream_async appends this turn.
+        turn = SearchTurn(
+            prompt=question,
+            rewrite=query_rewriter.submit(
+                question,
+                recent_history(agent.messages, settings.query_rewriter_history_turns)
+            )
+        )
+        retrieved: list[dict] = []
+        # The same state for a repair run: the tool answers ALREADY_SEARCHED,
+        # so the evidence for the second check is unchanged.
+        state = {CITATIONS_KEY: retrieved, SEARCH_TURN_KEY: turn}
+        progress = _Progress()
+        run = _Run()
+
+        try:
+            async for item in _run_agent(agent, question, state, cancel_signal, progress, run):
+                yield item
+        finally:
+            # Drops the rewrite if it is still queued (e.g. client disconnected).
+            turn.rewrite.cancel()
+
+        verdict = _check(run, retrieved, question, _is_conversational(turn))
+        _trace_attempt("first", question, run, retrieved, verdict)
+
+        feedback = None
+        if (
+            verdict.rejected
+            and retrieved
+            and settings.grounding_repair_enabled
+            and not (cancel_signal and cancel_signal.is_set())
+        ):
+            _log_rejection(verdict, retrieved, "first")
+            feedback = repair_request(verdict.reasons)
+            run = _Run()
+            async for item in _run_agent(agent, feedback, state, cancel_signal, progress, run):
+                yield item
+            verdict = _check(run, retrieved, question)
+            _trace_attempt("repair", feedback, run, retrieved, verdict)
+            drop_repair_exchange(agent, feedback)
+            logger.info(json.dumps({"event": "answer_repair", "repaired": not verdict.replaced}))
+
         if verdict.rejected:
-            logger.warning(json.dumps({
-                "event": "answer_rejected",
-                "reasons": verdict.reasons,
-                "retrieved": len(retrieved),
-            }))
+            _log_rejection(verdict, retrieved, "repair" if feedback else "first")
+
         if verdict.replaced:
             # Keep the delivered reply, not the rejected one, as context for
             # the next turn.
@@ -191,6 +338,8 @@ class ChatService:
                 session_id,
                 f"{NO_DOCUMENTATION_RESPONSE}\n\n{grounding_block(NOT_SUPPORTED)}"
             )
+        elif feedback:
+            await save_session(agent, session_id)
 
         yield Answer(verdict.text, verdict.status, verdict.citations)
 

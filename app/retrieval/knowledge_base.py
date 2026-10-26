@@ -9,12 +9,35 @@ from app.retrieval.bedrock_client import (
     get_bedrock_runtime_client,
 )
 from app.retrieval.models import (
-    RetrievedChunk
+    RetrievedChunk,
+    SearchQuery
 )
 
 logger = logging.getLogger(__name__)
 
-MAX_QUERIES = 4
+# 1 rewritten query + up to 4 sub-queries + 1 step-back query.
+MAX_QUERIES = 6
+
+MAX_RERANKED = 12
+
+# Origins that stand for a part of the question. Each widens the reranked
+# result count; step-back queries only add background, so they don't.
+FACET_ORIGINS = {"rewrite", "sub", "retry"}
+
+
+def _chunk_key(chunk: RetrievedChunk) -> str:
+    return hashlib.sha1(chunk.text.encode()).hexdigest()
+
+
+def _dedupe(queries: list[SearchQuery]) -> list[SearchQuery]:
+    seen: set[str] = set()
+    unique: list[SearchQuery] = []
+    for q in queries:
+        text = " ".join(q.text.split())
+        if text and text.lower() not in seen:
+            seen.add(text.lower())
+            unique.append(SearchQuery(text=text, origin=q.origin))
+    return unique
 
 
 def expand_query(q: str) -> str:
@@ -110,17 +133,20 @@ def rerank(
 
 def multi_search(
     question: str,
-    queries: list[str]
+    queries: list[SearchQuery]
 ) -> tuple[list[RetrievedChunk], dict]:
     """Search each query in parallel, dedupe, and rerank against the question.
 
-    Each returned chunk's metadata gets a "_queries" list naming the queries
-    that found it, so callers can tell which facets came back empty.
+    `queries` come from the query rewriter, tagged with their origin
+    ("rewrite", "sub", "step_back" or "retry"). Each returned chunk's
+    metadata gets a "_queries" list naming the queries that found it, and
+    stats["missing"] lists the queries with no surviving hit, so callers can
+    tell which parts of the question came back empty.
     """
 
-    queries = list(dict.fromkeys(q.strip() for q in queries if q.strip()))[:MAX_QUERIES] or [question]
-    per_query = max(10, settings.number_of_results // len(queries))
-    expanded = [expand_query(q) for q in queries]
+    queries = _dedupe(queries)[:MAX_QUERIES] or [SearchQuery(text=question, origin="rewrite")]
+    per_query = max(5, settings.number_of_results // len(queries))
+    expanded = [expand_query(q.text) for q in queries]
 
     with ThreadPoolExecutor(max_workers=len(queries)) as pool:
         result_sets = list(pool.map(lambda q: retrieve(q, per_query), expanded))
@@ -128,16 +154,18 @@ def multi_search(
     merged: dict[str, RetrievedChunk] = {}
     for query, results in zip(queries, result_sets):
         for r in results:
-            key = hashlib.sha1(r.text.encode()).hexdigest()
+            key = _chunk_key(r)
             if key not in merged:
                 merged[key] = r.model_copy(update={"metadata": {**r.metadata, "_queries": []}})
             elif r.score > merged[key].score:
                 merged[key].score = r.score
-            merged[key].metadata["_queries"].append(query)
+            if query.text not in merged[key].metadata["_queries"]:
+                merged[key].metadata["_queries"].append(query.text)
 
     candidates = sorted(merged.values(), key=lambda c: c.score, reverse=True)
     # Give each extra facet some room so one facet can't crowd out the rest
-    top_n = min(12, settings.number_of_reranked_results + 2 * (len(queries) - 1))
+    facets = max(1, sum(q.origin in FACET_ORIGINS for q in queries))
+    top_n = min(MAX_RERANKED, settings.number_of_reranked_results + 2 * (facets - 1))
 
     reranked = False
     if settings.reranker_model_arn:
@@ -151,11 +179,39 @@ def multi_search(
     else:
         hits = candidates[:top_n]
 
+    found = {q for h in hits for q in h.metadata.get("_queries", [])}
     stats = {
-        "queries": queries,
-        "expanded": [e for q, e in zip(queries, expanded) if e != q],
+        "queries": [q.text for q in queries],
+        "origins": [q.origin for q in queries],
+        "expanded": [e for q, e in zip(queries, expanded) if e != q.text],
         "candidates": len(candidates),
         "reranked": reranked,
         "scores": [round(h.score, 3) for h in hits],
+        "missing": [q.text for q in queries if q.text not in found],
     }
     return hits, stats
+
+
+def merge_hits(
+    first: list[RetrievedChunk],
+    second: list[RetrievedChunk],
+    limit: int = MAX_RERANKED
+) -> list[RetrievedChunk]:
+    """Union of two hit lists (same chunk text = same hit, best score and all
+    finding queries kept), highest score first."""
+
+    merged: dict[str, RetrievedChunk] = {}
+    for hit in [*first, *second]:
+        key = _chunk_key(hit)
+        if key not in merged:
+            merged[key] = hit.model_copy(update={"metadata": {
+                **hit.metadata, "_queries": list(hit.metadata.get("_queries", []))
+            }})
+            continue
+        kept = merged[key]
+        kept.score = max(kept.score, hit.score)
+        for q in hit.metadata.get("_queries", []):
+            if q not in kept.metadata["_queries"]:
+                kept.metadata["_queries"].append(q)
+
+    return sorted(merged.values(), key=lambda c: c.score, reverse=True)[:limit]

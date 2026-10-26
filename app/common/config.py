@@ -16,6 +16,14 @@ class Settings(BaseSettings):
         default="sandbox"
     )
 
+    # Local-only trace logs (app/common/trace.py): rewritten queries, search
+    # results and the agent's raw reply before the grounding check. Has no
+    # effect unless ENVIRONMENT=local.
+    debug_trace: bool = Field(
+        default=True,
+        alias="DEBUG_TRACE"
+    )
+
     aws_region: str = Field(
         default="ca-central-1",
         alias="AWS_REGION"
@@ -33,6 +41,15 @@ class Settings(BaseSettings):
     model_arn: str | None = Field(
         default=None,
         alias="MODEL_ARN"
+    )
+
+    # Output-token limit per agent model call. Bedrock's default varies by
+    # model (Nova 2 is dynamic), so set it explicitly; a reply cut off at
+    # this limit gets one repair attempt asking for a shorter answer.
+    model_max_tokens: int = Field(
+        default=4096,
+        gt=0,
+        alias="MODEL_MAX_TOKENS"
     )
 
     reranker_model_arn: str | None = Field(
@@ -58,6 +75,48 @@ class Settings(BaseSettings):
     search_type: str = Field(
         default="SEMANTIC",
         alias="SEARCH_TYPE"
+    )
+
+    # Query rewriter (app/services/query_rewriter.py): a small model that
+    # turns the user's message into the search queries the agent's
+    # search_knowledge_base tool runs.
+    query_rewriter_model_id: str = Field(
+        default="meta.llama3-8b-instruct-v1:0",
+        alias="QUERY_REWRITER_MODEL_ID"
+    )
+
+    query_rewriter_timeout_seconds: float = Field(
+        default=3,
+        gt=0,
+        alias="QUERY_REWRITER_TIMEOUT_SECONDS"
+    )
+
+    query_rewriter_history_turns: int = Field(
+        default=3,
+        ge=0,
+        alias="QUERY_REWRITER_HISTORY_TURNS"
+    )
+
+    query_rewriter_step_back_enabled: bool = Field(
+        default=True,
+        alias="QUERY_REWRITER_STEP_BACK_ENABLED"
+    )
+
+    query_rewriter_decomposition_enabled: bool = Field(
+        default=True,
+        alias="QUERY_REWRITER_DECOMPOSITION_ENABLED"
+    )
+
+    query_rewriter_retry_enabled: bool = Field(
+        default=True,
+        alias="QUERY_REWRITER_RETRY_ENABLED"
+    )
+
+    # When an answer fails the grounding checks but the search returned
+    # results, send the reasons back to the agent once for a corrected reply.
+    grounding_repair_enabled: bool = Field(
+        default=True,
+        alias="GROUNDING_REPAIR_ENABLED"
     )
 
     agent_storage_s3_bucket: str = Field(

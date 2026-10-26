@@ -58,7 +58,19 @@ variable "knowledge_base_id" {
 variable "model_arn" {
   description = "ARN of the Bedrock model or inference profile the agent uses"
   type        = string
-  default     = "arn:aws:bedrock:ca-central-1:820251787117:inference-profile/global.amazon.nova-2-lite-v1:0"
+  default     = "arn:aws:bedrock:ca-central-1:820251787117:inference-profile/global.moonshotai.kimi-k3"
+}
+
+variable "model_max_tokens" {
+  description = "Output-token limit per agent model call; a reply cut off at it gets one repair attempt asking for a shorter answer"
+  type        = string
+  default     = "4096"
+}
+
+variable "grounding_repair_enabled" {
+  description = "Give a reply that fails the grounding checks one rewrite before falling back to the no-documentation reply"
+  type        = string
+  default     = "true"
 }
 
 variable "reranker_model_arn" {
@@ -68,9 +80,45 @@ variable "reranker_model_arn" {
 }
 
 variable "number_of_reranked_results" {
-  description = "Results kept after reranking for a single query (+2 per extra query, max 12)"
+  description = "Results kept after reranking (+2 per extra question part, max 12)"
   type        = string
   default     = "6"
+}
+
+variable "query_rewriter_model_id" {
+  description = "Bedrock model id of the query rewriter (Converse API); must be enabled in Bedrock model access"
+  type        = string
+  default     = "meta.llama3-8b-instruct-v1:0"
+}
+
+variable "query_rewriter_timeout_seconds" {
+  description = "Timeout for each query rewriter call; on timeout the search falls back to the raw prompt"
+  type        = string
+  default     = "3"
+}
+
+variable "query_rewriter_history_turns" {
+  description = "Conversation turns given to the query rewriter to resolve follow-up questions"
+  type        = string
+  default     = "3"
+}
+
+variable "query_rewriter_step_back_enabled" {
+  description = "Add a broader step-back query to each search"
+  type        = string
+  default     = "true"
+}
+
+variable "query_rewriter_decomposition_enabled" {
+  description = "Split multi-part questions into 2-4 sub-queries"
+  type        = string
+  default     = "true"
+}
+
+variable "query_rewriter_retry_enabled" {
+  description = "Reword queries that found nothing and search once more"
+  type        = string
+  default     = "true"
 }
 
 variable "number_of_results" {

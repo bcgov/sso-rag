@@ -56,15 +56,16 @@ sends the session cookie automatically.
 4. **API → API**: `strands_session` is missing or invalid, so a new `session_<uuid4>` is created. With a valid tab id, the conversation id becomes `session_<uuid>__<tab uuid>`.
 5. **API → Agent**: `create_agent(conversation_id)` builds a fresh agent with `SnapshotSessionManager`.
 6. **Agent → Storage**: the agent tries to restore `snapshot_latest.json`. None exists, so history starts empty.
-7. **Agent → Bedrock model**: the model receives the system prompt and the user message, and responds with a `search_knowledge_base` tool call.
-8. **Agent → KB tool**: the tool runs with `tool_context`. `invocation_state["citations"]` collects sources.
-9. **KB tool → Knowledge Base**: acronyms are expanded, queries are retrieved in parallel, results are deduped, then reranked against the question.
-10. **Knowledge Base → KB tool**: ranked chunks come back with `section` and `source_url`.
-11. **KB tool → Agent**: the model gets numbered result blocks, and `{title, uri, score}` is recorded for citations.
-12. **Bedrock model → Agent**: the Markdown answer, ending in a `<grounding>` block (status + cited URLs), streams back. `ThinkingFilter` strips `<thinking>` blocks; the API only sends `status` progress events meanwhile.
-13. **Agent → Storage**: the snapshot is saved on `AfterInvocationEvent`.
-14. **Agent → API**: the buffered reply goes through `grounding.verify` — citations must be retrieved URLs, and URLs, endpoints and code values must appear in the retrieved text. A rejected or NOT_SUPPORTED reply is replaced with the no-documentation message (and re-saved in the snapshot).
-15. **API → ALB → API Gateway → Browser** (Local: **API → Vite → Browser**): `200 text/event-stream` with `Set-Cookie: strands_session=…; HttpOnly; SameSite=lax; Secure`. The UI renders the Markdown and a Sources list.
+7. **API → Query rewriter (Bedrock, Llama 3 8B)**: in the background, three parallel `Converse` calls produce the intent and rewritten query, a step-back query and any sub-queries. Greetings skip this, and failures fall back to the raw prompt.
+8. **Agent → Bedrock model**: the model receives the system prompt and the user message. For an SSO question it responds with a `search_knowledge_base()` tool call, which has no arguments; for a greeting it replies directly.
+9. **Agent → KB tool**: the tool runs with `tool_context` and waits for the rewriter's result from `invocation_state["search_turn"]`. `invocation_state["citations"]` collects sources.
+10. **KB tool → Knowledge Base**: acronyms are expanded, the rewriter's queries are retrieved in parallel, results are deduped and reranked against the rewritten question. Queries with no results are reworded once by the rewriter and searched again.
+11. **Knowledge Base → KB tool**: ranked chunks come back with `section` and `source_url`.
+12. **KB tool → Agent**: the model gets numbered result blocks, and `{title, uri, score}` is recorded for citations.
+13. **Bedrock model → Agent**: the Markdown answer, ending in a `<grounding>` block (status + cited URLs), streams back. `ThinkingFilter` strips `<thinking>` blocks; the API only sends `status` progress events meanwhile.
+14. **Agent → Storage**: the snapshot is saved on `AfterInvocationEvent`.
+15. **Agent → API**: the buffered reply goes through `grounding.verify` — citations must be retrieved URLs, and URLs, endpoints and code values must appear in the retrieved text. A rejected or NOT_SUPPORTED reply is replaced with the no-documentation message (and re-saved in the snapshot).
+16. **API → ALB → API Gateway → Browser** (Local: **API → Vite → Browser**): `200 text/event-stream` with `Set-Cookie: strands_session=…; HttpOnly; SameSite=lax; Secure`. The UI renders the Markdown and a Sources list.
 
 ### 2. Follow-up in the same tab (cookie + `X-Tab-Id`)
 
@@ -72,7 +73,7 @@ sends the session cookie automatically.
 2. **API → API**: both ids pass UUID validation and map to the same conversation id. Another tab sends a different id and gets its own history; with no tab id, the cookie-level id is used.
 3. **API → Agent**: a fresh agent object again.
 4. **Storage → Agent**: the previous turns are restored.
-5. **Agent → Bedrock model**: history plus the follow-up. The model turns "what about…" into a standalone search.
+5. **Agent → Bedrock model**: history plus the follow-up. The query rewriter, which also gets the last few turns, turns "what about…" into a standalone search query.
 6. **Agent → Storage**: the updated snapshot is saved, which also refreshes the conversation's last-modified time used by cleanup.
 7. **API → … → Browser**: the answer streams back and the cookie is re-set (sliding 24h expiry).
 
