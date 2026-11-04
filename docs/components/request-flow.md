@@ -90,7 +90,7 @@ Right after the agent is restored, `ChatService` reads the last few turns from `
   - step-back query;
   - sub-query decomposition.
 - **Overlap.** These calls overlap the agent's first model call.
-- **Fail-open.** Any failure falls back to searching the raw prompt.
+- **Fail-open.** A failed or timed-out rewrite falls back to `fallback_query()`: the prompt with up to two previous user messages prepended (300 characters max), so a follow-up such as "what about prod?" keeps its topic. Step-back and sub-queries that succeeded are kept.
 - **Cleanup.** The future is cancelled when the stream ends, in case it is still queued.
 
 Details: [query-decomposition.md](./query-decomposition.md).
@@ -104,7 +104,7 @@ The loop:
 1. The model receives the system prompt, restored history and the new prompt.
 2. For SSO questions it calls `search_knowledge_base()`, which has **no arguments**: the agent never writes queries. For greetings, thanks and "what can you do" questions it replies directly.
 3. The tool does the following:
-   - Waits for the rewriter, up to the timeout. A conversational intent returns `NO_SEARCH_NEEDED`.
+   - Waits for the rewriter, up to the timeout. A regex-matched greeting returns `NO_SEARCH_NEEDED`. A message the rewriter classified as conversational is still searched (with the fallback query): the agent's call wins, since a search is cheap and an ungrounded answer isn't.
    - Runs `multi_search` over the rewritten query, any sub-queries and the step-back query: acronym expansion, parallel Bedrock KB `retrieve`, dedupe, rerank against the rewritten query, score filter.
    - Asks the rewriter to reword queries that found nothing, once, and merges those results.
    - Appends each hit `{title, uri, score, text}` to `retrieved` and returns numbered text blocks, or `NO_MATCH`, plus a `NOTE` for sub-queries the docs don't cover.
@@ -133,8 +133,9 @@ The reply is **buffered, not streamed token by token**, because it must be verif
 
 After the stream ends, `ThinkingFilter.flush()` is appended and `verify(reply, retrieved, question)` runs (full rules in [grounding-status.md](./grounding-status.md)). It strips the `<grounding>` block and rejects the answer if citations, URLs or code/config values aren't backed by this turn's retrieved text.
 
+- **Skipped search.** If no search ran this turn, `ChatService` waits for the rewrite (up to the timeout) to learn the intent. Unless the intent is conversational (failed or timed-out rewrites count as needing a search), only a clarifying question is delivered without a search. On a conversational turn, a reply labelled `conversational` (or one with no grounding block and no checkable values) is delivered too. Anything else is rejected, logged as `search_skipped_by_model`, and gets one repair turn with `search_request()`: search now, even if the user asked not to, and answer from the results. If it still doesn't search, the user gets `NO_DOCUMENTATION_RESPONSE`.
 - **Repair attempt.** If the answer is rejected and the search returned results, the agent is run once more with the rejection reasons (`repair_request`). It rewrites the reply from the same results, without a new search, and the rewrite is verified again. The repair request and rejected reply are then removed from the history. The client only sees the `writing` status and heartbeats meanwhile. Set `GROUNDING_REPAIR_ENABLED=false` to turn this off.
-- Rejections are logged as `answer_rejected` (`attempt`: `first` or `repair`) with reasons; repair outcomes as `answer_repair`.
+- Only one repair runs per turn (search or grounding). Rejections are logged as `answer_rejected` (`attempt`: `first` or `repair`) with reasons; repair outcomes as `answer_repair` (`kind`: `search` or `grounding`).
 - If the final answer was replaced with `NO_DOCUMENTATION_RESPONSE`, `replace_last_answer()` overwrites the last assistant message and re-saves the snapshot, so the rejected text isn't used as context next turn.
 - After a successful repair the cleaned history is saved with `save_session()`. Otherwise the snapshot saved by the session manager already holds the delivered reply.
 
@@ -174,7 +175,10 @@ The UI parses each `data:` line, updates the status indicator, appends content, 
 | Invalid body | 422 from FastAPI |
 | Invalid/forged session cookie | Ignored; new session issued |
 | Greeting / thanks | No rewriter call (regex) or `intent=conversational`; no search; reply without a grounding status |
-| Query rewriter fails or times out | Raw prompt searched as the single query |
+| Rewriter says conversational, agent calls the tool | Searched anyway with the fallback query (`search_intent_override`) |
+| Agent replies without searching on a turn that needs one | Clarifying questions delivered; otherwise one search repair turn, then `NO_DOCUMENTATION_RESPONSE` |
+| User asks the assistant not to search | Ignored: the system prompt and the search repair still require a search |
+| Query rewriter fails or times out | Prompt plus up to two previous user messages searched (`fallback_query`); successful step-back/sub-queries kept |
 | A query finds nothing | Reworded once by the rewriter and searched again |
 | No relevant docs found | Model replies with the no-documentation text, `NOT_SUPPORTED` |
 | Answer fails verification | One repair attempt with the reasons, if the search returned results; if that also fails, replaced with `NO_DOCUMENTATION_RESPONSE`, `NOT_SUPPORTED`; stored history corrected |

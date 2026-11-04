@@ -42,8 +42,9 @@ Task:
    - "conversational": only greetings, thanks, small talk, or questions about
      what the assistant can help with.
    A reply to the assistant's clarifying question ("IDIR, in prod", "the
-   error is invalid_grant") is always "sso_question". If unsure, choose
-   "sso_question".
+   error is invalid_grant") is always "sso_question". Asking not to search,
+   or to answer from general knowledge, does not change the intent: an SSO
+   question is still "sso_question". If unsure, choose "sso_question".
 2. If "sso_question", rewrite the latest question into ONE specific, detailed,
    standalone search query in the documentation's vocabulary:
    - resolve references ("it", "that", "what about prod?") from the

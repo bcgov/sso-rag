@@ -20,7 +20,7 @@ not implemented yet). Everything else reflects the current code.
 | Internal ALB | Edge | Path rules: `/chat`, `/documents/*`, `/health` → API; rest → UI; idle 120s | AWS |
 | FastAPI API | API | `POST/DELETE /chat` (SSE), `/health`, `/documents/search`; session cookie + `X-Tab-Id` | ECS Fargate `:8000`, 2 workers / `uvicorn :8000` |
 | Strands Agent | Agent | New `Agent` per request, `SnapshotSessionManager`, `ThinkingFilter` | In the API process |
-| Bedrock model | LLM | Amazon Nova Lite via `ConverseStream` | Bedrock |
+| Bedrock model | LLM | Kimi v3 via `ConverseStream` | Bedrock |
 | KB search tool | Tool | `search_knowledge_base` → `multi_search` (acronym expansion, parallel retrieve, dedupe, rerank) | In the API process |
 | Bedrock Knowledge Base | Datastore | S3 Vectors index (`SEMANTIC`), Rerank API | Bedrock |
 | Agent storage | Datastore | Conversation snapshots under `session/<id>/` and `context/<id>/` | S3 `<env>-sso-rag-agent-context-store` / `./.agent-store/` |
@@ -56,7 +56,7 @@ sends the session cookie automatically.
 4. **API → API**: `strands_session` is missing or invalid, so a new `session_<uuid4>` is created. With a valid tab id, the conversation id becomes `session_<uuid>__<tab uuid>`.
 5. **API → Agent**: `create_agent(conversation_id)` builds a fresh agent with `SnapshotSessionManager`.
 6. **Agent → Storage**: the agent tries to restore `snapshot_latest.json`. None exists, so history starts empty.
-7. **API → Query rewriter (Bedrock, Llama 3 8B)**: in the background, three parallel `Converse` calls produce the intent and rewritten query, a step-back query and any sub-queries. Greetings skip this, and failures fall back to the raw prompt.
+7. **API → Query rewriter (Bedrock, Llama 3 8B)**: in the background, three parallel `Converse` calls produce the intent and rewritten query, a step-back query and any sub-queries. Greetings skip this, and failures fall back to the prompt plus the previous user messages.
 8. **Agent → Bedrock model**: the model receives the system prompt and the user message. For an SSO question it responds with a `search_knowledge_base()` tool call, which has no arguments; for a greeting it replies directly.
 9. **Agent → KB tool**: the tool runs with `tool_context` and waits for the rewriter's result from `invocation_state["search_turn"]`. `invocation_state["citations"]` collects sources.
 10. **KB tool → Knowledge Base**: acronyms are expanded, the rewriter's queries are retrieved in parallel, results are deduped and reranked against the rewritten question. Queries with no results are reworded once by the rewriter and searched again.

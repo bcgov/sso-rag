@@ -17,9 +17,14 @@ from app.agents.rag_agent import (
 from app.common.config import settings
 from app.common.constants import NO_DOCUMENTATION_RESPONSE
 from app.common.trace import preview, trace
-from app.prompts.system_prompt import repair_request
+from app.prompts.system_prompt import repair_request, search_request
 from app.services.grounding import NOT_SUPPORTED, Verdict, grounding_block, verify
-from app.services.query_rewriter import CONVERSATIONAL, query_rewriter, recent_history
+from app.services.query_rewriter import (
+    CONVERSATIONAL,
+    RewrittenQuery,
+    query_rewriter,
+    recent_history,
+)
 from app.tools.knowledge_base_tool import CITATIONS_KEY, SEARCH_TURN_KEY, SearchTurn
 
 logger = logging.getLogger(__name__)
@@ -163,6 +168,8 @@ TRUNCATED_REASON = (
     "finished; write a shorter, complete reply"
 )
 
+SKIPPED_SEARCH_REASON = "the reply was written without searching the documentation"
+
 
 @dataclass
 class _Run:
@@ -220,19 +227,60 @@ async def _run_agent(
     run.parts.append(thinking.flush())
 
 
-def _is_conversational(turn: SearchTurn) -> bool:
-    """True when the rewrite already finished and classified the prompt as
-    conversational (always the case for short-circuited greetings)."""
-    rewrite = turn.rewrite
-    if not rewrite.done() or rewrite.cancelled() or rewrite.exception() is not None:
+async def _wait_for_rewrite(turn: SearchTurn) -> RewrittenQuery | None:
+    """The rewriter's result for the turn, waiting for it (up to the rewriter
+    timeout) if it is still running. None if it failed, was cancelled or
+    timed out: the intent is then unknown and treated as needing a search."""
+
+    future = turn.rewrite
+    if not future.done():
+        await asyncio.wait(
+            [asyncio.wrap_future(future)],
+            timeout=settings.query_rewriter_timeout_seconds,
+        )
+    if not future.done() or future.cancelled() or future.exception() is not None:
+        return None
+    return future.result()
+
+
+def _ok_without_search(verdict: Verdict, conversational: bool) -> bool:
+    """Whether a reply written without a search may be delivered: a
+    clarifying question, or a conversational reply to a message classified
+    as conversational. Anything else (an answer, a no-documentation reply, a
+    reply labelled conversational for an SSO question) skipped the search."""
+
+    if verdict.rejected or verdict.replaced:
         return False
-    return rewrite.result().intent == CONVERSATIONAL
+    if verdict.response_type == "clarification":
+        return True
+    return conversational and verdict.response_type == "conversational"
 
 
-def _check(run: _Run, retrieved: list[dict], question: str, conversational: bool = False) -> Verdict:
+def _check(
+    run: _Run,
+    retrieved: list[dict],
+    question: str,
+    turn: SearchTurn,
+    conversational: bool,
+) -> tuple[Verdict, bool]:
+    """The verdict for one agent run, and whether it skipped a search the
+    turn needed (the verdict is then the no-documentation reply)."""
+
+    if turn.searched:
+        conversational = False
     if run.truncated:
-        return Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED, reasons=[TRUNCATED_REASON])
-    return verify(run.text, retrieved, question, conversational=conversational)
+        verdict = Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED, reasons=[TRUNCATED_REASON])
+    else:
+        verdict = verify(run.text, retrieved, question, conversational=conversational)
+
+    if turn.searched or _ok_without_search(verdict, conversational):
+        return verdict, False
+    return Verdict(
+        NO_DOCUMENTATION_RESPONSE,
+        NOT_SUPPORTED,
+        reasons=[SKIPPED_SEARCH_REASON, *verdict.reasons],
+        response_type=verdict.response_type,
+    ), True
 
 
 def _trace_attempt(attempt: str, prompt: str, run: _Run, retrieved: list[dict], verdict: Verdict) -> None:
@@ -275,10 +323,17 @@ class ChatService:
     ) -> AsyncIterator[Status | Heartbeat | Answer]:
         """Runs the agent, buffering its reply (minus <thinking> blocks) so it
         can be checked against the retrieved documentation before anything
-        is shown. A reply that fails the checks or is cut off at the
-        output-token limit, when the search did return results, gets one
-        repair attempt: the agent is told why and rewrites it. Yields
-        progress, then exactly one Answer."""
+        is shown. Gets one repair attempt:
+
+        - a reply that fails the checks or is cut off at the output-token
+          limit, when the search did return results: the agent is told why
+          and rewrites it;
+        - a reply written without searching, when the turn needs a search
+          (the rewriter didn't classify it as conversational, or the reply
+          isn't conversational): the agent is told to search and answer.
+          Only clarifying questions may skip the search.
+
+        Yields progress, then exactly one Answer."""
 
         # Agent construction restores the session snapshot synchronously, so
         # keep that storage I/O off the event loop.
@@ -286,16 +341,15 @@ class ChatService:
         # The query rewriter runs while the agent makes its first model call;
         # the search tool waits for it only if the agent searches. History is
         # read before stream_async appends this turn.
+        history = recent_history(agent.messages, settings.query_rewriter_history_turns)
         turn = SearchTurn(
             prompt=question,
-            rewrite=query_rewriter.submit(
-                question,
-                recent_history(agent.messages, settings.query_rewriter_history_turns)
-            )
+            rewrite=query_rewriter.submit(question, history),
+            history=history,
         )
         retrieved: list[dict] = []
-        # The same state for a repair run: the tool answers ALREADY_SEARCHED,
-        # so the evidence for the second check is unchanged.
+        # The same state for a repair run: after a search the tool answers
+        # ALREADY_SEARCHED, so the evidence for the second check is unchanged.
         state = {CITATIONS_KEY: retrieved, SEARCH_TURN_KEY: turn}
         progress = _Progress()
         run = _Run()
@@ -303,29 +357,44 @@ class ChatService:
         try:
             async for item in _run_agent(agent, question, state, cancel_signal, progress, run):
                 yield item
+
+            conversational = False
+            if not turn.searched:
+                rewrite = await _wait_for_rewrite(turn)
+                conversational = rewrite is not None and rewrite.intent == CONVERSATIONAL
+            verdict, skipped = _check(run, retrieved, question, turn, conversational)
+            _trace_attempt("first", question, run, retrieved, verdict)
+            if skipped:
+                logger.warning(json.dumps({
+                    "event": "search_skipped_by_model",
+                    "rewriter_intent": CONVERSATIONAL if conversational else "sso_question_or_unknown",
+                    "response_type": verdict.response_type,
+                }))
+
+            feedback = None
+            if (
+                verdict.rejected
+                and (retrieved or skipped)
+                and settings.grounding_repair_enabled
+                and not (cancel_signal and cancel_signal.is_set())
+            ):
+                _log_rejection(verdict, retrieved, "first")
+                feedback = search_request() if skipped else repair_request(verdict.reasons)
+                run = _Run()
+                async for item in _run_agent(agent, feedback, state, cancel_signal, progress, run):
+                    yield item
+                verdict, _ = _check(run, retrieved, question, turn, conversational)
+                _trace_attempt("repair", feedback, run, retrieved, verdict)
+                drop_repair_exchange(agent, feedback)
+                logger.info(json.dumps({
+                    "event": "answer_repair",
+                    "kind": "search" if skipped else "grounding",
+                    "searched": turn.searched,
+                    "repaired": not verdict.replaced,
+                }))
         finally:
             # Drops the rewrite if it is still queued (e.g. client disconnected).
             turn.rewrite.cancel()
-
-        verdict = _check(run, retrieved, question, _is_conversational(turn))
-        _trace_attempt("first", question, run, retrieved, verdict)
-
-        feedback = None
-        if (
-            verdict.rejected
-            and retrieved
-            and settings.grounding_repair_enabled
-            and not (cancel_signal and cancel_signal.is_set())
-        ):
-            _log_rejection(verdict, retrieved, "first")
-            feedback = repair_request(verdict.reasons)
-            run = _Run()
-            async for item in _run_agent(agent, feedback, state, cancel_signal, progress, run):
-                yield item
-            verdict = _check(run, retrieved, question)
-            _trace_attempt("repair", feedback, run, retrieved, verdict)
-            drop_repair_exchange(agent, feedback)
-            logger.info(json.dumps({"event": "answer_repair", "repaired": not verdict.replaced}))
 
         if verdict.rejected:
             _log_rejection(verdict, retrieved, "repair" if feedback else "first")

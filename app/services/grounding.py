@@ -120,6 +120,9 @@ class Verdict:
     citations: list[dict] = field(default_factory=list)
     # Why the model's answer was rejected; empty when it was delivered.
     reasons: list[str] = field(default_factory=list)
+    # The reply's response_type ("answer", "clarification", "conversational"),
+    # or None when the grounding block was missing or malformed.
+    response_type: str | None = None
 
     @property
     def rejected(self) -> bool:
@@ -296,18 +299,19 @@ def verify(reply: str, retrieved: list[dict], prompt: str, conversational: bool 
     # anyway when nothing was searched and it contains no checkable values.
     if grounding is None and conversational and not retrieved and body \
             and not _has_factual_markers(body):
-        return Verdict(text=body, status=None)
+        return Verdict(text=body, status=None, response_type="conversational")
 
     if grounding is None:
         reasons.append("missing or malformed grounding block")
         return Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED, reasons=reasons)
 
     is_answer = grounding.response_type == ANSWER
+    response_type = grounding.response_type
 
     if is_answer and grounding.status is None:
         reasons.append("missing or invalid grounding_status")
     if is_answer and grounding.status == NOT_SUPPORTED:
-        return Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED)
+        return Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED, response_type=response_type)
     if is_answer and grounding.status == SUPPORTED and not grounding.citations:
         reasons.append("grounding_status is SUPPORTED but citations is empty")
 
@@ -328,7 +332,7 @@ def verify(reply: str, retrieved: list[dict], prompt: str, conversational: bool 
 
     if reasons or not body:
         return Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED,
-                       reasons=reasons or ["empty answer"])
+                       reasons=reasons or ["empty answer"], response_type=response_type)
 
     # Sources: the cited results plus any retrieved page the answer links.
     cited = list(dict.fromkeys(
@@ -339,4 +343,5 @@ def verify(reply: str, retrieved: list[dict], prompt: str, conversational: bool 
         text=body,
         status=grounding.status if is_answer else None,
         citations=[evidence.sources[k] for k in cited],
+        response_type=response_type,
     )

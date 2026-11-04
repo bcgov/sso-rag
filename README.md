@@ -110,9 +110,13 @@ Document retrieval leverages:
 Each `search_knowledge_base` call:
 
 0. **Query rewriting** – waits for the turn's query rewriter result (started
-   when the request arrived, alongside the agent's first model call). A
-   conversational message returns `NO_SEARCH_NEEDED`. If the rewriter fails or
-   times out, the raw prompt is searched as the single query.
+   when the request arrived, alongside the agent's first model call). Only a
+   whole-message greeting matched by the regex returns `NO_SEARCH_NEEDED`; if
+   the rewriter classified the message as conversational but the agent calls
+   the tool anyway, the agent wins and the search runs. If the rewriter fails
+   or times out, the prompt is searched with up to two previous user messages
+   prepended (within 300 characters), so follow-ups such as "what about
+   prod?" keep their topic.
 1. **Acronym expansion** – queries using an acronym from `app/common/constants.py`
    (`BCSC`, `PKCE`, `M2M`, …) get its spelled-out form appended, so the
    embedding also matches the docs' wording. Only genuine abbreviations are
@@ -350,12 +354,12 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `MIN_RERANK_SCORE` | `0.05` | Drop reranked results below this relevance score |
 | `SEARCH_TYPE` | `SEMANTIC` | Bedrock `overrideSearchType`; keep `SEMANTIC` on S3 Vectors |
 | `QUERY_REWRITER_MODEL_ID` | `meta.llama3-8b-instruct-v1:0` | Bedrock model the query rewriter calls (Converse API); enable it in Bedrock model access |
-| `QUERY_REWRITER_TIMEOUT_SECONDS` | `3` | Timeout per rewriter call; on timeout the search falls back to the raw prompt |
+| `QUERY_REWRITER_TIMEOUT_SECONDS` | `3` | Timeout per rewriter call; on timeout the search falls back to the prompt plus the previous user messages |
 | `QUERY_REWRITER_HISTORY_TURNS` | `3` | Conversation turns given to the rewriter to resolve follow-ups |
 | `QUERY_REWRITER_STEP_BACK_ENABLED` | `true` | Add a broader step-back query |
 | `QUERY_REWRITER_DECOMPOSITION_ENABLED` | `true` | Split multi-part questions into 2–4 sub-queries |
 | `QUERY_REWRITER_RETRY_ENABLED` | `true` | Reword queries that found nothing and search once more |
-| `GROUNDING_REPAIR_ENABLED` | `true` | Give a reply that fails the grounding checks one rewrite (from the same results) before falling back to the no-documentation reply |
+| `GROUNDING_REPAIR_ENABLED` | `true` | Give a reply that fails the grounding checks one rewrite (from the same results), or a reply written without a required search one chance to search, before falling back to the no-documentation reply |
 | `CORS_ORIGINS` | `["*"]` | Allowed origins for the UI (answers `OPTIONS` preflight). Cookies are only allowed cross-origin when this lists explicit origins, e.g. `["https://ui.example.gov.bc.ca"]` |
 | `AGENT_STORAGE_S3_BUCKET` | `sandbox-sso-rag-agent-context-store` | Bucket for conversation history when `ENVIRONMENT` is not `local` |
 | `SESSION_COOKIE_NAME` | `strands_session` | Name of the session cookie |
@@ -484,7 +488,21 @@ contacts) when:
   `https://<your-app-host>/callback` are ignored; the support contacts and
   example URLs on reserved or loopback hosts such as `example.com` and
   `localhost` are always allowed);
-- the grounding block is missing or malformed.
+- the grounding block is missing or malformed;
+- the agent replied without searching although the turn needs a search (see
+  below).
+
+**Skipped search.** A turn needs a search unless the query rewriter
+classified it as conversational (or the greeting regex matched); a failed or
+timed-out rewrite counts as needing one. If the agent replies without calling
+`search_knowledge_base` on such a turn, only a clarifying question is
+delivered; anything else (an answer, a reply labelled `conversational`, a
+missing grounding block, even the no-documentation text) is rejected. On a
+conversational turn, an `answer` written without a search is treated the same
+way. The agent then gets one repair turn (`search_request()`) telling it to
+search, even if the user asked it not to, and answer from the results; if it
+still doesn't search, the user gets `NO_DOCUMENTATION_RESPONSE`. Logged as
+`search_skipped_by_model`.
 
 **Repair attempt.** If the reply is rejected but the search did return
 results, the agent gets one chance to fix it. It is sent the rejection
@@ -499,7 +517,7 @@ A reply cut off at the output-token limit (`MODEL_MAX_TOKENS`, Strands'
 a shorter, complete reply, and the partial message is removed from history.
 
 Rejections are logged as `answer_rejected` (with `attempt`: `first` or
-`repair`) and repairs as `answer_repair`. The stored conversation keeps only
+`repair`) and repairs as `answer_repair` (`kind`: `grounding` or `search`). The stored conversation keeps only
 the delivered reply: the rejected reply and the repair request are removed.
 
 The checks are exact string matches, not a semantic judge: plain-prose
@@ -687,14 +705,17 @@ The tool takes no model-facing arguments: the agent only decides *whether* to
 search. `tool_context` is injected by Strands. `ChatService` passes
 `invocation_state={"search_turn": SearchTurn(...), "citations": [...]}`:
 
-- `search_turn` holds the turn's raw prompt, the query rewriter's future, and
+- `search_turn` holds the turn's raw prompt, the query rewriter's future, the
+  rewriter's history (for the fallback query), whether a search ran, and
   the first call's result (repeated calls in a turn get `ALREADY_SEARCHED`
   instead of the same results again).
 - each returned result's title, source URL, score and text is appended to
   `citations`; `/chat` builds its citations and grounding checks from it.
 
-Returns `NO_SEARCH_NEEDED: ...` for conversational messages and
-`NO_MATCH: ...` when nothing relevant was found.
+Returns `NO_SEARCH_NEEDED: ...` for greetings matched by the regex and
+`NO_MATCH: ...` when nothing relevant was found. A message the rewriter
+classified as conversational is still searched when the agent calls the tool
+(logged as `search_intent_override`).
 
 Each call logs one JSON line with the rewritten question, queries and their
 origins (`rewrite`, `sub`, `step_back`, `retry`), which queries were

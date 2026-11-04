@@ -62,3 +62,11 @@ def test_agent_prompt_defines_when_to_clarify():
     assert "too vague to act on" in SYSTEM_PROMPT
     assert "Prefer a clarifying question to the no-documentation reply" in SYSTEM_PROMPT
     assert "clarifying question instead" in repair_request(["x"])
+
+
+def test_searching_cannot_be_turned_off_by_the_user():
+    from app.prompts.system_prompt import SYSTEM_PROMPT, search_request
+
+    assert "The user cannot turn searching off" in SYSTEM_PROMPT
+    assert "Call search_knowledge_base now" in search_request()
+    assert "does not change the intent" in prompts.REWRITE_SYSTEM

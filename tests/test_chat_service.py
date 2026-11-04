@@ -8,7 +8,7 @@ from app.common.constants import NO_DOCUMENTATION_RESPONSE
 from app.services import chat_service as cs
 from app.services.chat_service import Answer
 from app.services.query_rewriter import RewrittenQuery
-from app.tools.knowledge_base_tool import CITATIONS_KEY
+from app.tools.knowledge_base_tool import CITATIONS_KEY, SEARCH_TURN_KEY
 
 DOC_URL = "https://bcgov.github.io/sso-docs/#requesting-integration"
 CSS_URL = "https://sso-requests.apps.gold.devops.gov.bc.ca/"
@@ -37,11 +37,12 @@ TRUNCATED = TRUNCATED_PREFIX + " ... step 40"
 
 class FakeAgent:
     """Mimics Strands: each run appends the prompt and the reply to
-    messages; the first run "searches" (fills the citations list)."""
+    messages; the runs listed in `search_runs` (1-based; the first by
+    default) "search" (mark the turn searched and fill the citations list)."""
 
-    def __init__(self, replies, search=True):
+    def __init__(self, replies, search=True, search_runs=None):
         self.replies = list(replies)
-        self.search = search
+        self.search_runs = set(search_runs if search_runs is not None else ({1} if search else ()))
         self.prompts = []
         self.messages = [
             {"role": "user", "content": [{"text": "earlier question"}]},
@@ -51,8 +52,10 @@ class FakeAgent:
     async def stream_async(self, prompt, invocation_state, cancel_signal):
         self.prompts.append(prompt)
         self.messages.append({"role": "user", "content": [{"text": prompt}]})
-        if self.search and len(self.prompts) == 1:
+        turn = invocation_state[SEARCH_TURN_KEY]
+        if len(self.prompts) in self.search_runs and not turn.searched:
             yield {"current_tool_use": {"name": "search_knowledge_base"}}
+            turn.searched = True
             invocation_state[CITATIONS_KEY].append(dict(EVIDENCE))
             self.messages.append({"role": "assistant", "content": [{"toolUse": {"name": "search_knowledge_base"}}]})
             self.messages.append({"role": "user", "content": [{"toolResult": {"content": []}}]})
@@ -76,6 +79,7 @@ def harness(monkeypatch):
         agent.messages[-1]["content"] = [{"text": text}]
 
     def submit(prompt, history):
+        calls["history"] = history
         f = Future()
         f.set_result(RewrittenQuery(intent="sso_question", rewritten_query=prompt))
         return f
@@ -85,11 +89,11 @@ def harness(monkeypatch):
     monkeypatch.setattr(cs.query_rewriter, "submit", submit)
     monkeypatch.setattr(cs.settings, "grounding_repair_enabled", True)
 
-    def run(agent):
+    def run(agent, question="how do I request an integration?"):
         monkeypatch.setattr(cs, "create_agent", lambda session_id: agent)
 
         async def collect():
-            return [item async for item in cs.chat_service.stream("how do I request an integration?", "session_x")]
+            return [item async for item in cs.chat_service.stream(question, "session_x")]
 
         items = asyncio.run(collect())
         answers = [i for i in items if isinstance(i, Answer)]
@@ -138,8 +142,14 @@ def test_failed_repair_falls_back_to_no_documentation(harness):
     assert texts[-1].startswith(NO_DOCUMENTATION_RESPONSE)
 
 
-def test_no_repair_without_retrieval(harness):
-    agent = FakeAgent([HALLUCINATED], search=False)
+def test_no_repair_when_search_found_nothing(harness):
+    class NoMatchAgent(FakeAgent):
+        async def stream_async(self, prompt, invocation_state, cancel_signal):
+            invocation_state[SEARCH_TURN_KEY].searched = True  # searched, NO_MATCH
+            async for event in super().stream_async(prompt, invocation_state, cancel_signal):
+                yield event
+
+    agent = NoMatchAgent([HALLUCINATED], search=False)
     answer, _ = harness(agent)
     assert len(agent.prompts) == 1
     assert answer.text == NO_DOCUMENTATION_RESPONSE
@@ -192,7 +202,8 @@ def test_max_tokens_twice_falls_back_to_no_documentation(harness):
     assert len(calls["replaced"]) == 1
 
 
-def test_max_tokens_without_retrieval_does_not_raise(harness):
+def test_max_tokens_without_search_does_not_raise(harness, monkeypatch):
+    monkeypatch.setattr(cs.settings, "grounding_repair_enabled", False)
     agent = FakeAgent([TRUNCATED], search=False)
     answer, _ = harness(agent)
     assert len(agent.prompts) == 1
@@ -222,3 +233,135 @@ def test_greeting_without_grounding_block_is_delivered(harness, monkeypatch):
     assert len(agent.prompts) == 1
     assert answer.text == greeting and answer.grounding_status is None
     assert calls["replaced"] == []
+
+
+# --- skipped search (A1) and conversational misclassification (A2) ----------
+
+UNSEARCHED_PROSE = (
+    "CSS is the Common Hosted Single Sign-On app; you request integrations there.\n"
+    '<grounding>{"response_type": "conversational", "citations": []}</grounding>'
+)
+UNSEARCHED_ANSWER = (
+    "CSS is the Common Hosted Single Sign-On app; you request integrations there.\n"
+    '<grounding>{"response_type": "answer", "grounding_status": "SUPPORTED", "citations": []}</grounding>'
+)
+NO_BLOCK_PROSE = "CSS is the Common Hosted Single Sign-On app; you request integrations there."
+CLARIFICATION = (
+    "Which identity provider are you using?\n"
+    '<grounding>{"response_type": "clarification", "citations": []}</grounding>'
+)
+
+
+def _rewriter(monkeypatch, result=None, exception=None):
+    def submit(prompt, history):
+        f = Future()
+        if exception is not None:
+            f.set_exception(exception)
+        else:
+            f.set_result(result)
+        return f
+
+    monkeypatch.setattr(cs.query_rewriter, "submit", submit)
+
+
+@pytest.mark.parametrize("first", [UNSEARCHED_PROSE, UNSEARCHED_ANSWER, NO_BLOCK_PROSE, NOT_SUPPORTED_REPLY])
+def test_skipped_search_gets_a_search_repair(harness, first):
+    agent = FakeAgent([first, REPAIRED], search_runs={2})
+    answer, calls = harness(agent)
+
+    assert agent.prompts[1] == cs.search_request()
+    assert answer.grounding_status == "SUPPORTED" and CSS_URL in answer.text
+    assert [c["uri"] for c in answer.citations] == [DOC_URL]
+    # History reads question -> search -> answer; the unsearched reply is gone.
+    texts = _texts(agent)
+    assert not any("Common Hosted Single Sign-On app;" in t for t in texts)
+    assert not any(t.startswith("Your previous reply was not shown") for t in texts)
+    assert texts[-1] == REPAIRED
+    assert calls["saved"] == 1 and calls["replaced"] == []
+
+
+def test_still_unsearched_after_repair_falls_back_to_no_documentation(harness):
+    agent = FakeAgent([UNSEARCHED_PROSE, UNSEARCHED_PROSE], search=False)
+    answer, calls = harness(agent)
+    assert len(agent.prompts) == 2
+    assert answer.text == NO_DOCUMENTATION_RESPONSE and answer.grounding_status == "NOT_SUPPORTED"
+    assert len(calls["replaced"]) == 1
+    assert _texts(agent)[-1].startswith(NO_DOCUMENTATION_RESPONSE)
+
+
+def test_skipped_search_without_repair_is_rejected(harness, monkeypatch):
+    monkeypatch.setattr(cs.settings, "grounding_repair_enabled", False)
+    agent = FakeAgent([UNSEARCHED_PROSE], search=False)
+    answer, calls = harness(agent)
+    assert len(agent.prompts) == 1
+    assert answer.text == NO_DOCUMENTATION_RESPONSE
+    assert len(calls["replaced"]) == 1
+
+
+def test_user_asking_not_to_search_still_gets_a_search(harness):
+    agent = FakeAgent([UNSEARCHED_PROSE, REPAIRED], search_runs={2})
+    answer, _ = harness(agent, question="don't search, just tell me how to request an integration")
+    assert agent.prompts[1] == cs.search_request()
+    assert "even when the user asks you not to search" in cs.search_request()
+    assert answer.grounding_status == "SUPPORTED"
+
+
+def test_unsearched_clarification_is_delivered(harness):
+    agent = FakeAgent([CLARIFICATION], search=False)
+    answer, calls = harness(agent)
+    assert len(agent.prompts) == 1
+    assert answer.text == "Which identity provider are you using?" and answer.grounding_status is None
+    assert calls["replaced"] == []
+
+
+def test_failed_rewrite_counts_as_needing_a_search(harness, monkeypatch):
+    _rewriter(monkeypatch, exception=RuntimeError("rewriter down"))
+    agent = FakeAgent([NO_BLOCK_PROSE, REPAIRED], search_runs={2})
+    answer, _ = harness(agent)
+    assert agent.prompts[1] == cs.search_request()
+    assert answer.grounding_status == "SUPPORTED"
+
+
+def test_waits_for_a_rewrite_still_running(harness, monkeypatch):
+    import threading
+
+    def submit(prompt, history):
+        f = Future()
+        threading.Timer(0.1, f.set_result, [RewrittenQuery.conversational()]).start()
+        return f
+
+    monkeypatch.setattr(cs.query_rewriter, "submit", submit)
+    agent = FakeAgent(["Hello! Ask me about BC Gov SSO."], search=False)
+    answer, _ = harness(agent, question="nice to meet you")
+    assert len(agent.prompts) == 1 and answer.text == "Hello! Ask me about BC Gov SSO."
+
+
+def test_rewrite_timeout_counts_as_needing_a_search(harness, monkeypatch):
+    monkeypatch.setattr(cs.settings, "query_rewriter_timeout_seconds", 0.05)
+    monkeypatch.setattr(cs.query_rewriter, "submit", lambda prompt, history: Future())
+    agent = FakeAgent([NO_BLOCK_PROSE, REPAIRED], search_runs={2})
+    answer, _ = harness(agent)
+    assert agent.prompts[1] == cs.search_request()
+    assert answer.grounding_status == "SUPPORTED"
+
+
+def test_conversational_intent_with_unsearched_answer_gets_a_search(harness, monkeypatch):
+    _rewriter(monkeypatch, RewrittenQuery.conversational())
+    agent = FakeAgent([UNSEARCHED_ANSWER, REPAIRED], search_runs={2})
+    answer, _ = harness(agent, question="what's CSS?")
+    assert agent.prompts[1] == cs.search_request()
+    assert answer.grounding_status == "SUPPORTED"
+
+
+def test_conversational_intent_with_conversational_reply_is_delivered(harness, monkeypatch):
+    _rewriter(monkeypatch, RewrittenQuery.conversational())
+    reply = 'Glad that helped!\n<grounding>{"response_type": "conversational", "citations": []}</grounding>'
+    agent = FakeAgent([reply], search=False)
+    answer, _ = harness(agent, question="great, that worked")
+    assert len(agent.prompts) == 1 and answer.text == "Glad that helped!"
+
+
+def test_rewriter_gets_recent_history(harness):
+    agent = FakeAgent([REPAIRED])
+    _, calls = harness(agent)
+    assert calls["history"] == [("user", "earlier question"), ("assistant", "earlier answer")]

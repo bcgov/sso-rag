@@ -193,3 +193,14 @@ def test_placeholder_urls_still_checked(url):
     verdict = verify(_logout_reply(f"Use {url}"), LOGOUT_RETRIEVED, "how do I log out?")
     assert verdict.rejected
     assert any("undocumented URLs" in r for r in verdict.reasons)
+
+
+@pytest.mark.parametrize("reply, conversational, expected", [
+    ('Which IdP?\n<grounding>{"response_type": "clarification", "citations": []}</grounding>', False, "clarification"),
+    ('Hi!\n<grounding>{"response_type": "conversational", "citations": []}</grounding>', False, "conversational"),
+    ("Hi! How can I help?", True, "conversational"),
+    ("CSS is the SSO app.", False, None),
+    (NO_DOCUMENTATION_RESPONSE + '\n<grounding>{"response_type": "answer", "grounding_status": "NOT_SUPPORTED", "citations": []}</grounding>', False, "answer"),
+])
+def test_verdict_reports_response_type(reply, conversational, expected):
+    assert verify(reply, [], "q", conversational=conversational).response_type == expected

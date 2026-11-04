@@ -76,6 +76,9 @@ Python packages under `app/` are **namespace packages** (no `__init__.py`); don'
    `NO_DOCUMENTATION_RESPONSE` (`app/common/constants.py`) when the status is
    NOT_SUPPORTED, or on rejection: SUPPORTED with empty citations; a citation
    not among the retrieved `uri`s; no retrieval results but factual guidance;
+   a reply written without a search on a turn that needs one (only
+   clarifications may skip it; `ChatService` first gives the agent one
+   `search_request()` repair turn);
    any URL / endpoint path / inline code / quoted value in a code block not
    found in the retrieved text or the user's prompt (`<placeholders>`
    ignored); missing or malformed block. Rejections are logged as

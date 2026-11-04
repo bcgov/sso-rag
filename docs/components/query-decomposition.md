@@ -22,7 +22,7 @@ ChatService.stream(prompt)
   ├─ agent = create_agent(session)                    restores history
   ├─ history = recent_history(agent.messages, 3)
   ├─ turn = SearchTurn(prompt, query_rewriter.submit(prompt, history))
-  │     greeting regex? → resolved at once as conversational (no model call)
+  │     greeting regex? → resolved at once as a greeting (no model call)
   │     else, in the background, in parallel (Llama 3 8B, Converse):
   │       rewrite + intent → {"intent", "rewritten_query"}
   │       step-back        → {"step_back_query"}
@@ -30,8 +30,9 @@ ChatService.stream(prompt)
   └─ agent.stream_async(prompt, invocation_state={search_turn, citations})
         greeting / thanks → agent replies, no tool call
         SSO question      → search_knowledge_base()
-                              ├─ wait for rewrite (timeout → raw prompt)
-                              ├─ conversational → NO_SEARCH_NEEDED
+                              ├─ wait for rewrite (timeout → fallback_query: prompt + previous user messages)
+                              ├─ greeting (regex) → NO_SEARCH_NEEDED
+                              ├─ conversational (rewriter) → search anyway with fallback_query
                               ├─ multi_search(rewritten_query, [rewrite, sub…, step_back])
                               ├─ rewrite/sub queries with no hits → rewriter.retry() once → multi_search → merge
                               └─ numbered results (+ NOTE for uncovered sub-queries) | NO_MATCH
@@ -75,16 +76,21 @@ The rewrite template also carries worked rewrite examples, and each template add
 
 1. A conservative whole-message regex catches messages like "hi", "thanks", "ok thanks", "what can you do?" and "who are you". These resolve to conversational without any model call.
 2. Otherwise the rewrite call decides. Anything other than an explicit `"conversational"` is treated as an SSO question.
-3. The agent's prompt says not to call the tool for greetings. If it does anyway, the tool returns `NO_SEARCH_NEEDED`.
+3. The agent's prompt says not to call the tool for greetings. If it does anyway for a regex-matched greeting, the tool returns `NO_SEARCH_NEEDED`. If the rewriter (not the regex) said conversational, the agent's call wins and the tool searches with `fallback_query()`, logged as `search_intent_override`.
+4. A request not to search ("don't search, just tell me") doesn't change the intent; the rewriter prompt says so.
+
+The regex only matches when the whole message is a greeting: "hi, how do I add a redirect URI?" or "Thanks!\n\nHow do I get BCeID?" go to the rewriter.
 
 ### Fail-open
 
 | Failure | Result |
 |---|---|
-| Rewrite call errors, times out or returns unusable JSON | `intent=sso_question`, `rewritten_query = raw prompt`, `fallback=True` (step-back and sub-queries still used if they succeeded) |
+| Rewrite call errors, times out or returns unusable JSON | `intent=sso_question`, `rewritten_query = fallback_query(prompt, history)`, `fallback=True` (step-back and sub-queries, which were written with the history, still used if they succeeded) |
 | Step-back or decomposition fails | That technique is dropped |
 | Retry fails | Results found so far are returned |
-| The tool's wait for the rewrite times out or the future failed | Raw prompt searched as the single query |
+| The tool's wait for the rewrite times out or the future failed | `fallback_query(prompt, history)` searched as the single query |
+
+`fallback_query()` prepends up to two previous user messages (most recent first, within the 300-character query limit) to the prompt, so "what about prod?" after "How do I get BCeID in TEST?" is searched as "How do I get BCeID in TEST? what about prod?". The reranker scores against the same text. A prompt with no room left is searched alone.
 
 ## 2. The tool: `search_knowledge_base()`
 
@@ -129,10 +135,11 @@ The rewriter model must be enabled in Bedrock model access. IAM already allows `
 - `query_rewrite`: intent, short-circuit, fallback, per-technique `status` (`ok`, `timeout`, `error`, `parse_error`) and `latency_ms`, sub-query count, and whether there is a step-back query.
 - `query_rewrite_retry`: failed count, retry count and latency.
 - Tool line: rewritten question, kept hits, `waited_ms` (time blocked on the rewriter), fallback, retry stats and the `multi_search` stats.
-- `search_skipped`: conversational turns where the tool was still called.
+- `search_skipped`: regex-matched greetings where the tool was still called.
+- `search_intent_override`: the rewriter said conversational, the agent called the tool, and the search ran.
 
 ## Notes and limits
 
-- If an SSO question is misclassified as conversational, there is no retrieval and the grounding checks force the no-documentation reply. The prompt is therefore biased toward `sso_question`.
+- If an SSO question is misclassified as conversational, the agent's tool call still searches it. If the agent doesn't search either and writes an answer, `ChatService` runs one search repair turn. Only a reply labelled conversational (or without a grounding block and checkable values) on such a turn gets through without a search. The prompt is therefore biased toward `sso_question`.
 - The agent can't search with its own wording, so a second search in the same turn returns `ALREADY_SEARCHED`.
 - Step-back adds broader evidence, which makes the grounding value checks slightly more permissive.
