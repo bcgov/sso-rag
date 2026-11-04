@@ -365,3 +365,61 @@ def test_rewriter_gets_recent_history(harness):
     agent = FakeAgent([REPAIRED])
     _, calls = harness(agent)
     assert calls["history"] == [("user", "earlier question"), ("assistant", "earlier answer")]
+
+
+# --- truncation is logged distinctly (C1) ----------------------------------
+
+def _events(caplog, name):
+    import json as _json
+
+    out = []
+    for record in caplog.records:
+        try:
+            data = _json.loads(record.getMessage())
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("event") == name:
+            out.append(data)
+    return out
+
+
+def test_truncation_is_logged_apart_from_grounding_failures(harness, caplog):
+    caplog.set_level("INFO", logger="app.services.chat_service")
+    harness(FakeAgent([TRUNCATED, REPAIRED]))
+
+    assert [e["attempt"] for e in _events(caplog, "max_tokens_reached")] == ["first"]
+    rejected = _events(caplog, "answer_rejected")
+    assert [e["cause"] for e in rejected] == ["truncated"]
+    assert [e["kind"] for e in _events(caplog, "answer_repair")] == ["truncated"]
+
+
+def test_grounding_failure_is_logged_as_grounding(harness, caplog):
+    caplog.set_level("INFO", logger="app.services.chat_service")
+    harness(FakeAgent([HALLUCINATED, REPAIRED]))
+
+    assert [e["cause"] for e in _events(caplog, "answer_rejected")] == ["grounding"]
+    assert [e["kind"] for e in _events(caplog, "answer_repair")] == ["grounding"]
+    assert _events(caplog, "max_tokens_reached") == []
+
+
+def test_truncation_repair_asks_for_a_shorter_reply_not_a_grounding_fix(harness):
+    agent = FakeAgent([TRUNCATED, REPAIRED])
+    harness(agent)
+    assert "cut off" in agent.prompts[1]
+    assert "grounding check" not in agent.prompts[1]
+
+
+def test_each_model_call_logs_its_token_usage(harness, caplog):
+    class UsageAgent(FakeAgent):
+        async def stream_async(self, prompt, invocation_state, cancel_signal):
+            async for event in super().stream_async(prompt, invocation_state, cancel_signal):
+                yield event
+            yield {"event": {"messageStop": {"stopReason": "end_turn"}}}
+            yield {"event": {"metadata": {"usage": {"inputTokens": 5000, "outputTokens": 640}}}}
+
+    caplog.set_level("INFO", logger="app.services.chat_service")
+    harness(UsageAgent([REPAIRED]))
+    assert _events(caplog, "model_call") == [{
+        "event": "model_call", "attempt": "first", "stop_reason": "end_turn",
+        "input_tokens": 5000, "output_tokens": 640, "max_tokens": cs.settings.model_max_tokens,
+    }]

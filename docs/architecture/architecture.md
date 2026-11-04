@@ -23,7 +23,7 @@ not implemented yet). Everything else reflects the current code.
 | Bedrock model | LLM | Kimi v3 via `ConverseStream` | Bedrock |
 | KB search tool | Tool | `search_knowledge_base` → `multi_search` (acronym expansion, parallel retrieve, dedupe, rerank) | In the API process |
 | Bedrock Knowledge Base | Datastore | S3 Vectors index (`SEMANTIC`), Rerank API | Bedrock |
-| Agent storage | Datastore | Conversation snapshots under `session/<id>/` and `context/<id>/` | S3 `<env>-sso-rag-agent-context-store` / `./.agent-store/` |
+| Agent storage | Datastore | Conversation snapshots under `session/<id>/` (`context/<id>/` only for conversations stored before the context manager was removed) | S3 `<env>-sso-rag-agent-context-store` / `./.agent-store/` |
 | Session cleanup | Job | FastAPI lifespan loop, or `python -m app.jobs.cleanup_sessions` | Each API worker |
 | Docs chunker | Pipeline | `chunker/preprocess.py` → chunks + `.metadata.json` → S3 → KB sync | Manual |
 | GitHub Actions | Pipeline | Build/push images to ECR, `terraform apply`, ECS force-new-deployment | On push to `main` |

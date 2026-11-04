@@ -17,7 +17,7 @@ from app.agents.rag_agent import (
 from app.common.config import settings
 from app.common.constants import NO_DOCUMENTATION_RESPONSE
 from app.common.trace import preview, trace
-from app.prompts.system_prompt import repair_request, search_request
+from app.prompts.system_prompt import repair_request, search_request, shorten_request
 from app.services.grounding import NOT_SUPPORTED, Verdict, grounding_block, verify
 from app.services.query_rewriter import (
     CONVERSATIONAL,
@@ -57,6 +57,15 @@ class ThinkingFilter:
         self._newlines = 0
 
     def feed(self, delta: str) -> str:
+        """
+        Feed a new chunk of text to the filter.
+
+        Args:
+            delta: The new text chunk.
+
+        Returns:
+            The text with <thinking>...</thinking> sections removed.
+        """
         self._buffer += delta
         out = []
 
@@ -96,6 +105,12 @@ class ThinkingFilter:
         return self._tidy("".join(out))
 
     def flush(self) -> str:
+        """
+        Flush the remaining text in the buffer.
+
+        Returns:
+            The text with <thinking>...</thinking> sections removed.
+        """
         rest = "" if self._in_thinking else self._buffer
         self._buffer = ""
         return self._tidy(rest)
@@ -170,6 +185,11 @@ TRUNCATED_REASON = (
 
 SKIPPED_SEARCH_REASON = "the reply was written without searching the documentation"
 
+# Why a reply was rejected, for the logs and the repair request.
+CAUSE_SKIPPED_SEARCH = "skipped_search"
+CAUSE_TRUNCATED = "truncated"
+CAUSE_GROUNDING = "grounding"
+
 
 @dataclass
 class _Run:
@@ -183,6 +203,20 @@ class _Run:
         return "".join(self.parts)
 
 
+def _log_model_call(attempt: str, stop_reason: str | None, usage: dict) -> None:
+    """One line per model call, so the output-token distribution (reasoning
+    included) can be compared with MODEL_MAX_TOKENS, and the input-token
+    growth with the conversation window."""
+    logger.info(json.dumps({
+        "event": "model_call",
+        "attempt": attempt,
+        "stop_reason": stop_reason,
+        "input_tokens": usage.get("inputTokens"),
+        "output_tokens": usage.get("outputTokens"),
+        "max_tokens": settings.model_max_tokens,
+    }))
+
+
 async def _run_agent(
     agent,
     prompt: str,
@@ -190,11 +224,13 @@ async def _run_agent(
     cancel_signal: threading.Event | None,
     progress: _Progress,
     run: _Run,
+    attempt: str,
 ) -> AsyncIterator[Status | Heartbeat]:
     """One agent invocation: collects the visible reply text (minus
     <thinking> blocks) in `run` and yields progress."""
 
     thinking = ThinkingFilter()
+    stop_reason = None
     try:
         async for event in agent.stream_async(
             prompt,
@@ -203,6 +239,14 @@ async def _run_agent(
         ):
             if not isinstance(event, dict):
                 continue
+
+            # Raw model chunks: Bedrock sends messageStop, then the usage.
+            chunk = event.get("event")
+            if isinstance(chunk, dict):
+                if "messageStop" in chunk:
+                    stop_reason = chunk["messageStop"].get("stopReason")
+                elif "metadata" in chunk:
+                    _log_model_call(attempt, stop_reason, chunk["metadata"].get("usage") or {})
 
             phase = None
             if event.get("current_tool_use"):
@@ -219,6 +263,7 @@ async def _run_agent(
         # replaces or removes it.
         logger.warning(json.dumps({
             "event": "max_tokens_reached",
+            "attempt": attempt,
             "max_tokens": settings.model_max_tokens,
             "chars": len(run.text),
         }))
@@ -304,13 +349,32 @@ def _trace_attempt(attempt: str, prompt: str, run: _Run, retrieved: list[dict], 
     )
 
 
+def _cause(verdict: Verdict) -> str:
+    """The main reason a reply was rejected: a skipped search, the
+    output-token limit, or the grounding checks."""
+    if SKIPPED_SEARCH_REASON in verdict.reasons:
+        return CAUSE_SKIPPED_SEARCH
+    if TRUNCATED_REASON in verdict.reasons:
+        return CAUSE_TRUNCATED
+    return CAUSE_GROUNDING
+
+
 def _log_rejection(verdict, retrieved: list[dict], attempt: str) -> None:
     logger.warning(json.dumps({
         "event": "answer_rejected",
         "attempt": attempt,
+        "cause": _cause(verdict),
         "reasons": verdict.reasons,
         "retrieved": len(retrieved),
     }))
+
+
+def _repair_prompt(cause: str, reasons: list[str]) -> str:
+    if cause == CAUSE_SKIPPED_SEARCH:
+        return search_request()
+    if cause == CAUSE_TRUNCATED:
+        return shorten_request()
+    return repair_request(reasons)
 
 
 class ChatService:
@@ -355,7 +419,7 @@ class ChatService:
         run = _Run()
 
         try:
-            async for item in _run_agent(agent, question, state, cancel_signal, progress, run):
+            async for item in _run_agent(agent, question, state, cancel_signal, progress, run, "first"):
                 yield item
 
             conversational = False
@@ -379,16 +443,17 @@ class ChatService:
                 and not (cancel_signal and cancel_signal.is_set())
             ):
                 _log_rejection(verdict, retrieved, "first")
-                feedback = search_request() if skipped else repair_request(verdict.reasons)
+                cause = _cause(verdict)
+                feedback = _repair_prompt(cause, verdict.reasons)
                 run = _Run()
-                async for item in _run_agent(agent, feedback, state, cancel_signal, progress, run):
+                async for item in _run_agent(agent, feedback, state, cancel_signal, progress, run, "repair"):
                     yield item
                 verdict, _ = _check(run, retrieved, question, turn, conversational)
                 _trace_attempt("repair", feedback, run, retrieved, verdict)
                 drop_repair_exchange(agent, feedback)
                 logger.info(json.dumps({
                     "event": "answer_repair",
-                    "kind": "search" if skipped else "grounding",
+                    "kind": cause,
                     "searched": turn.searched,
                     "repaired": not verdict.replaced,
                 }))

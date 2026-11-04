@@ -46,10 +46,22 @@ class Settings(BaseSettings):
     # Output-token limit per agent model call. Bedrock's default varies by
     # model (Nova 2 is dynamic), so set it explicitly; a reply cut off at
     # this limit gets one repair attempt asking for a shorter answer.
+    # Reasoning models' (e.g. Kimi K3) reasoning tokens count towards it:
+    # check the `model_call` log lines' output_tokens before lowering it.
     model_max_tokens: int = Field(
         default=4096,
         gt=0,
         alias="MODEL_MAX_TOKENS"
+    )
+
+    # Messages of conversation history kept (sliding window, applied after
+    # each request). Earlier turns' search calls and results are dropped when
+    # a conversation is restored, so 20 is about the last 10 questions and
+    # answers.
+    conversation_window_messages: int = Field(
+        default=20,
+        ge=2,
+        alias="CONVERSATION_WINDOW_MESSAGES"
     )
 
     reranker_model_arn: str | None = Field(

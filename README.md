@@ -347,7 +347,8 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `AWS_REGION` | `ca-central-1` | Region for Bedrock calls |
 | `KNOWLEDGE_BASE_ID` | – (required) | Bedrock Knowledge Base to search |
 | `MODEL_ARN` | – | Foundation model the agent uses |
-| `MODEL_MAX_TOKENS` | `4096` | Output-token limit per agent model call; a reply cut off at it gets one repair attempt asking for a shorter answer |
+| `MODEL_MAX_TOKENS` | `4096` | Output-token limit per agent model call (reasoning models' reasoning tokens count towards it; see the `model_call` log lines before lowering it); a reply cut off at it gets one repair attempt asking for a shorter answer |
+| `CONVERSATION_WINDOW_MESSAGES` | `20` | Messages of history kept per conversation (sliding window). Earlier turns' search calls and results are dropped on restore, so this is about the last 10 questions and answers |
 | `RERANKER_MODEL_ARN` | unset | Bedrock reranker model; unset = order by vector score |
 | `NUMBER_OF_RESULTS` | `25` | Total candidates retrieved per search, split across queries (min 5 per query) |
 | `NUMBER_OF_RERANKED_RESULTS` | `6` | Results kept after reranking for a single-part question (+2 per extra part, max 12) |
@@ -514,10 +515,15 @@ if it also fails does the user get `NO_DOCUMENTATION_RESPONSE`. Set
 
 A reply cut off at the output-token limit (`MODEL_MAX_TOKENS`, Strands'
 `MaxTokensReachedException`) is handled the same way: the agent is asked for
-a shorter, complete reply, and the partial message is removed from history.
+a shorter, complete reply (`shorten_request()`), and the partial message is
+removed from history. It is logged as `max_tokens_reached` (with `attempt`).
 
 Rejections are logged as `answer_rejected` (with `attempt`: `first` or
-`repair`) and repairs as `answer_repair` (`kind`: `grounding` or `search`). The stored conversation keeps only
+`repair`, and `cause`: `grounding`, `truncated` or `skipped_search`) and
+repairs as `answer_repair` (`kind`: the same causes). Every model call logs a
+`model_call` line with `stop_reason`, `input_tokens`, `output_tokens` and
+`max_tokens`, to compare real output lengths (reasoning included) with the
+limit and to watch input growth. The stored conversation keeps only
 the delivered reply: the rejected reply and the repair request are removed.
 
 The checks are exact string matches, not a semantic judge: plain-prose
@@ -558,8 +564,9 @@ cookie so the request can be retried. The UI's **Delete history** button calls
 it after a confirmation dialog.
 
 Conversations are kept in the agent storage (`.agent-store/` locally, the
-`AGENT_STORAGE_S3_BUCKET` bucket otherwise) under `session/<id>/` and
-`context/<id>/`. A background job in the API deletes every conversation whose
+`AGENT_STORAGE_S3_BUCKET` bucket otherwise) under `session/<id>/` (and
+`context/<id>/` for conversations stored before the context manager was
+removed). A background job in the API deletes every conversation whose
 newest object is older than `SESSION_RETENTION_DAYS` (default 3), running
 shortly after startup and then every `SESSION_CLEANUP_INTERVAL_HOURS`
 (default 24). Each API worker runs it; deletes are idempotent. Only ids in
@@ -608,11 +615,26 @@ def create_agent(session_id: str) -> Agent:
             search_knowledge_base
         ],
         system_prompt=SYSTEM_PROMPT,
-        context_manager="auto",
+        context_manager=False,
+        conversation_manager=SlidingWindowConversationManager(
+            window_size=settings.conversation_window_messages,
+            should_truncate_results=True,
+        ),
         session_manager=SnapshotSessionManager(session_id, storage=storage),
         callback_handler=None,
     )
+    drop_tool_exchanges(agent.messages)
+    return agent
 ```
+
+**Conversation history.** A sliding window keeps the last
+`CONVERSATION_WINDOW_MESSAGES` messages (trimmed after each request). When a
+conversation is restored, `drop_tool_exchanges()` removes earlier turns'
+search calls and results: only the current turn's results count as evidence,
+so older ones would only add tokens and tempt the model to reuse them. Strands'
+`context_manager="auto"` is deliberately not used: it cut every search result
+over ~1,500 tokens down to a ~750-token preview before the model read it, and
+added a `retrieve_context` tool the model then called to grep the rest.
 
 The `/chat` route is async and runs `agent.stream_async()`, buffering the
 reply for the grounding checks. If the client disconnects, the agent

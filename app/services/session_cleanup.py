@@ -4,7 +4,8 @@ conversations on request (DELETE /chat/history).
 
 Strands keeps each conversation under two prefixes of the agent storage:
 ``session/<id>/`` (agent snapshots, rewritten after every invocation) and
-``context/<id>/`` (context-manager stash). A conversation's last activity is
+``context/<id>/`` (context-manager stash of conversations stored before it
+was turned off). A conversation's last activity is
 the newest modification time of any object under either prefix. The Strands
 ``Storage`` interface doesn't expose timestamps, so they are read directly
 from the bucket (S3 ``LastModified``) or the local directory (file mtime).

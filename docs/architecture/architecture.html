@@ -1172,7 +1172,7 @@ const flows = {
         "title": "Fresh agent for this conversation",
         "route": "create_agent(conversation_id)",
         "desc": "One Strands Agent per request — never shared between users. <code>SnapshotSessionManager<\/code> ties it to the conversation's storage key.",
-        "payload": "Agent(\n    model=BedrockModel(\"…nova-lite…\"),     # shared, module-level\n    tools=[search_knowledge_base],\n    system_prompt=SYSTEM_PROMPT,\n    context_manager=\"auto\",\n    session_manager=SnapshotSessionManager(conversation_id, storage=storage),\n    callback_handler=None,\n)",
+        "payload": "Agent(\n    model=BedrockModel(\"…nova-lite…\"),     # shared, module-level\n    tools=[search_knowledge_base],\n    system_prompt=SYSTEM_PROMPT,\n    context_manager=False,\n    conversation_manager=SlidingWindowConversationManager(window_size=20),\n    session_manager=SnapshotSessionManager(conversation_id, storage=storage),\n    callback_handler=None,\n)",
         "chips": [
           "asyncio.to_thread"
         ],
@@ -1432,7 +1432,7 @@ const flows = {
         "title": "Fresh agent, same conversation id",
         "route": "create_agent(conversation_id)",
         "desc": "Still a new Agent object per request — its memory comes only from storage.",
-        "payload": "Agent(\n    model=BedrockModel(\"…nova-lite…\"),     # shared, module-level\n    tools=[search_knowledge_base],\n    system_prompt=SYSTEM_PROMPT,\n    context_manager=\"auto\",\n    session_manager=SnapshotSessionManager(conversation_id, storage=storage),\n    callback_handler=None,\n)",
+        "payload": "Agent(\n    model=BedrockModel(\"…nova-lite…\"),     # shared, module-level\n    tools=[search_knowledge_base],\n    system_prompt=SYSTEM_PROMPT,\n    context_manager=False,\n    conversation_manager=SlidingWindowConversationManager(window_size=20),\n    session_manager=SnapshotSessionManager(conversation_id, storage=storage),\n    callback_handler=None,\n)",
         "from": "api"
       },
       {

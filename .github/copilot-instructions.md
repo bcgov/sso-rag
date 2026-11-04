@@ -128,7 +128,13 @@ from "Delete history" after a confirmation dialog.
 - History persists via `SnapshotSessionManager(conversation_id, storage=storage)`.
   `storage` is `LocalFileStorage("./.agent-store/")` when `ENVIRONMENT=local`,
   otherwise `S3Storage(AGENT_STORAGE_S3_BUCKET)`. Keys live under
-  `session/<id>/…` (snapshots) and `context/<id>/…` (context-manager stash).
+  `session/<id>/…` (snapshots); `context/<id>/…` only holds the stash of
+  conversations stored before Strands' context manager was turned off.
+- History is capped by `SlidingWindowConversationManager(window_size=
+  CONVERSATION_WINDOW_MESSAGES)`, and `create_agent()` drops earlier turns'
+  tool calls/results on restore (`drop_tool_exchanges`). Don't use
+  `context_manager="auto"`: it truncates the current search result to a
+  short preview before the model reads it and injects a `retrieve_context` tool.
 - Cookie: `strands_session`, `HttpOnly`, `SameSite=Lax`, `Secure` per
   `SESSION_COOKIE_SECURE` (set `false` for plain-HTTP localhost or the browser drops it).
 - Cookie and tab ids are client-controlled and become storage keys: always
@@ -176,6 +182,8 @@ it elsewhere.
 | `AWS_REGION` | `ca-central-1` | |
 | `KNOWLEDGE_BASE_ID` | required | |
 | `MODEL_ARN` | – | model id = last path segment |
+| `MODEL_MAX_TOKENS` | `4096` | per model call, reasoning tokens included; check `model_call` logs before lowering |
+| `CONVERSATION_WINDOW_MESSAGES` | `20` | sliding-window history cap (messages) |
 | `RERANKER_MODEL_ARN` | unset | unset → no rerank |
 | `NUMBER_OF_RESULTS` | `25` | candidates per tool call |
 | `NUMBER_OF_RERANKED_RESULTS` | `6` | kept after rerank (+2 per extra query, max 12) |
