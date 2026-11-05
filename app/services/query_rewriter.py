@@ -13,7 +13,9 @@ and, on demand, rewords queries that found nothing (`retry`).
 The answering agent never writes queries: its search_knowledge_base tool runs
 what this produces (app/tools/knowledge_base_tool.py). Everything fails open:
 if a call errors, times out or returns invalid JSON, that technique is
-dropped, and without a rewrite the raw prompt is searched as is.
+dropped, and without a rewrite the prompt is searched with the previous user
+messages prepended (`fallback_query`), so follow-ups like "what about prod?"
+keep their topic.
 """
 
 import json
@@ -46,6 +48,10 @@ Intent = Literal["sso_question", "conversational"]
 MAX_QUERY_CHARS = 300
 MAX_SUB_QUERIES = 4
 HISTORY_MESSAGE_CHARS = 500
+# Previous user messages prepended to the prompt when the rewrite fails.
+FALLBACK_CONTEXT_MESSAGES = 2
+# Below this many free characters, context would only be a fragment.
+MIN_FALLBACK_CONTEXT_CHARS = 20
 
 # Whole-message greetings, thanks and capability questions skip the model
 # calls entirely. Kept conservative: anything else goes to the rewriter,
@@ -80,20 +86,48 @@ class RewrittenQuery:
     rewritten_query: str
     step_back_query: str | None = None
     sub_queries: list[str] = field(default_factory=list)
-    # True when the rewrite failed and the raw prompt is used instead.
+    # True when the rewrite failed and `fallback_query` is used instead.
     fallback: bool = False
+    # True for whole-message greetings matched by the regex, the only
+    # conversational result the search tool trusts over the agent's own call.
+    short_circuit: bool = False
 
     @classmethod
-    def raw(cls, prompt: str) -> RewrittenQuery:
-        return cls(intent=SSO_QUESTION, rewritten_query=prompt.strip(), fallback=True)
+    def raw(cls, prompt: str, history: list[tuple[str, str]] | None = None) -> RewrittenQuery:
+        return cls(intent=SSO_QUESTION, rewritten_query=fallback_query(prompt, history), fallback=True)
 
     @classmethod
     def conversational(cls) -> RewrittenQuery:
         return cls(intent=CONVERSATIONAL, rewritten_query="")
 
+    @classmethod
+    def greeting(cls) -> RewrittenQuery:
+        return cls(intent=CONVERSATIONAL, rewritten_query="", short_circuit=True)
+
 
 def is_greeting(text: str) -> bool:
     return bool(_GREETING_RE.match(text or ""))
+
+
+def fallback_query(prompt: str, history: list[tuple[str, str]] | None = None) -> str:
+    """The query searched when there is no rewrite: the prompt, preceded by
+    up to FALLBACK_CONTEXT_MESSAGES previous user messages (most recent kept
+    first) within MAX_QUERY_CHARS, so a follow-up keeps its topic.
+    Standalone questions get some extra context; the reranker scores the
+    results against the same text."""
+
+    prompt = " ".join((prompt or "").split())
+    previous = [text for role, text in history or [] if role == "user"]
+    context: list[str] = []
+    room = MAX_QUERY_CHARS - len(prompt) - 1
+    for text in reversed(previous[-FALLBACK_CONTEXT_MESSAGES:]):
+        if room < MIN_FALLBACK_CONTEXT_CHARS:
+            break
+        if len(text) > room:
+            text = text[:room].rsplit(" ", 1)[0].rstrip(" …")
+        context.insert(0, text)
+        room -= len(text) + 1
+    return " ".join(context + [prompt]).strip()
 
 
 def recent_history(messages: list[dict], turns: int) -> list[tuple[str, str]]:
@@ -221,7 +255,7 @@ class QueryRewriter:
 
         if is_greeting(prompt):
             future: Future = Future()
-            future.set_result(RewrittenQuery.conversational())
+            future.set_result(RewrittenQuery.greeting())
             logger.info(json.dumps({
                 "event": "query_rewrite", "intent": CONVERSATIONAL, "short_circuit": True
             }))
@@ -235,8 +269,8 @@ class QueryRewriter:
         try:
             return self._transform(prompt, history)
         except Exception:
-            logger.exception("query rewrite failed; searching the raw prompt")
-            return RewrittenQuery.raw(prompt)
+            logger.exception("query rewrite failed; searching the prompt with recent history")
+            return RewrittenQuery.raw(prompt, history)
 
     def _transform(self, prompt: str, history: list[tuple[str, str]]) -> RewrittenQuery:
         user = user_message(prompt, history)
@@ -286,9 +320,11 @@ class QueryRewriter:
                 sub_queries = parsed
 
         if rewrite is None:
+            # Step-back and sub-queries that did succeed were written with the
+            # history, so they are kept alongside the fallback query.
             result = RewrittenQuery(
                 intent=SSO_QUESTION,
-                rewritten_query=prompt.strip(),
+                rewritten_query=fallback_query(prompt, history),
                 step_back_query=step_back,
                 sub_queries=sub_queries,
                 fallback=True,

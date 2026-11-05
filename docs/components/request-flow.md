@@ -74,8 +74,8 @@ In `chat()`:
 - `model`: the shared `BedrockModel`;
 - `tools`: `[search_knowledge_base]`;
 - `system_prompt`: `SYSTEM_PROMPT` (when to call the no-argument search tool, clarifying-question policy, answering rules, escalation text and the grounding-report contract);
-- `context_manager="auto"`: Strands trims the conversation when it grows too large;
-- `session_manager`: `SnapshotSessionManager` on the storage above, which restores previous messages and saves a snapshot after the turn;
+- `context_manager=False` and a `SlidingWindowConversationManager(window_size=CONVERSATION_WINDOW_MESSAGES)` (default 20 messages, trimmed after each request). After the restore, `drop_tool_exchanges()` removes earlier turns' search calls and results, so history is questions and delivered answers. Strands' `"auto"` context manager is not used: it truncated each search result to a ~750-token preview before the model read it and added a `retrieve_context` tool;
+- `session_manager`: `SnapshotSessionManager(save_latest_on="trigger")` on the storage above, which restores previous messages but never saves on its own; `ChatService` saves once, when the turn completes;
 - `callback_handler=None`: nothing is printed to stdout; output is consumed from the stream.
 
 A fresh agent per request prevents conversation history from leaking between users.
@@ -90,7 +90,7 @@ Right after the agent is restored, `ChatService` reads the last few turns from `
   - step-back query;
   - sub-query decomposition.
 - **Overlap.** These calls overlap the agent's first model call.
-- **Fail-open.** Any failure falls back to searching the raw prompt.
+- **Fail-open.** A failed or timed-out rewrite falls back to `fallback_query()`: the prompt with up to two previous user messages prepended (300 characters max), so a follow-up such as "what about prod?" keeps its topic. Step-back and sub-queries that succeeded are kept.
 - **Cleanup.** The future is cancelled when the stream ends, in case it is still queued.
 
 Details: [query-decomposition.md](./query-decomposition.md).
@@ -104,11 +104,11 @@ The loop:
 1. The model receives the system prompt, restored history and the new prompt.
 2. For SSO questions it calls `search_knowledge_base()`, which has **no arguments**: the agent never writes queries. For greetings, thanks and "what can you do" questions it replies directly.
 3. The tool does the following:
-   - Waits for the rewriter, up to the timeout. A conversational intent returns `NO_SEARCH_NEEDED`.
+   - Waits for the rewriter, up to the timeout. A regex-matched greeting returns `NO_SEARCH_NEEDED`. A message the rewriter classified as conversational is still searched (with the fallback query): the agent's call wins, since a search is cheap and an ungrounded answer isn't.
    - Runs `multi_search` over the rewritten query, any sub-queries and the step-back query: acronym expansion, parallel Bedrock KB `retrieve`, dedupe, rerank against the rewritten query, score filter.
    - Asks the rewriter to reword queries that found nothing, once, and merges those results.
    - Appends each hit `{title, uri, score, text}` to `retrieved` and returns numbered text blocks, or `NO_MATCH`, plus a `NOTE` for sub-queries the docs don't cover.
-4. The tool searches once per turn; a repeated call returns `ALREADY_SEARCHED`. Model output is limited to `MODEL_MAX_TOKENS` (4096) per call.
+4. The tool searches once per turn; a repeated call returns `ALREADY_SEARCHED`. Model output is limited to `MODEL_MAX_TOKENS` (4096, reasoning tokens included) per call; each call logs `model_call` with its token usage and stop reason.
 5. The final reply ends with a `<grounding>{...}</grounding>` block.
 
 A clarifying question is a valid final reply too (`response_type: "clarification"`). After searching, the agent asks one to three plain-text questions instead of answering in two cases. The first is a request too vague to act on, such as a problem without its error or a request without its subject. The second is results that differ by a detail the user hasn't given (IdP, environment, realm, client type, protocol). It prefers this to the no-documentation reply for vague requests. On the next turn, the query rewriter folds the user's reply into the rewritten query, and treats it as an SSO question even when it is short ("IDIR, in PROD").
@@ -124,7 +124,8 @@ For every event from `stream_async` that is a dict:
 | anything else | ignored |
 
 - A `Status` is yielded **only when the phase changes**, so the UI sees `searching` and `writing`.
-- If 10 s (`HEARTBEAT_SECONDS`) pass without sending anything, a `Heartbeat` is yielded; the route turns it into the SSE comment `: keepalive`.
+- `ChatService.stream()` runs the turn in a background task and yields a `Heartbeat` whenever nothing was sent for 10 s (`HEARTBEAT_SECONDS`), on a timer, so keepalives also flow during a search, storage I/O or a reasoning model's silence; the route turns it into the SSE comment `: keepalive`.
+- Past `TURN_TIMEOUT_SECONDS` (240 s, under API Gateway's 300 s stream limit) the turn is cancelled and `TurnTimeout` is raised; the route sends an in-band "took too long" error. Each agent run is capped at 4 loop iterations (`limits={"turns": 4}`, logged as `agent_limit_reached`).
 - `ThinkingFilter` removes `<thinking>…</thinking>` blocks that some models (e.g. Amazon Nova) emit. It handles tags split across deltas, an unclosed tag (everything after is dropped), stray closing tags, leading whitespace and runs of 3+ newlines.
 
 The reply is **buffered, not streamed token by token**, because it must be verified first.
@@ -133,10 +134,10 @@ The reply is **buffered, not streamed token by token**, because it must be verif
 
 After the stream ends, `ThinkingFilter.flush()` is appended and `verify(reply, retrieved, question)` runs (full rules in [grounding-status.md](./grounding-status.md)). It strips the `<grounding>` block and rejects the answer if citations, URLs or code/config values aren't backed by this turn's retrieved text.
 
+- **Skipped search.** If no search ran this turn, `ChatService` waits for the rewrite (up to the timeout) to learn the intent. Unless the intent is conversational (failed or timed-out rewrites count as needing a search), only a clarifying question is delivered without a search. On a conversational turn, a reply labelled `conversational` (or one with no grounding block and no checkable values) is delivered too. Anything else is rejected, logged as `search_skipped_by_model`, and gets one repair turn with `search_request()`: search now, even if the user asked not to, and answer from the results. If it still doesn't search, the user gets `NO_DOCUMENTATION_RESPONSE`.
 - **Repair attempt.** If the answer is rejected and the search returned results, the agent is run once more with the rejection reasons (`repair_request`). It rewrites the reply from the same results, without a new search, and the rewrite is verified again. The repair request and rejected reply are then removed from the history. The client only sees the `writing` status and heartbeats meanwhile. Set `GROUNDING_REPAIR_ENABLED=false` to turn this off.
-- Rejections are logged as `answer_rejected` (`attempt`: `first` or `repair`) with reasons; repair outcomes as `answer_repair`.
-- If the final answer was replaced with `NO_DOCUMENTATION_RESPONSE`, `replace_last_answer()` overwrites the last assistant message and re-saves the snapshot, so the rejected text isn't used as context next turn.
-- After a successful repair the cleaned history is saved with `save_session()`. Otherwise the snapshot saved by the session manager already holds the delivered reply.
+- Only one repair runs per turn (search or grounding). Rejections are logged as `answer_rejected` (`attempt`: `first` or `repair`) with reasons; repair outcomes as `answer_repair` (`kind`: `skipped_search`, `truncated` or `grounding`). `answer_rejected` carries the same `cause`, so truncation is counted apart from grounding failures.
+- If the final answer was replaced with `NO_DOCUMENTATION_RESPONSE`, `replace_last_answer()` overwrites the last assistant message and saves the snapshot, so the rejected text isn't used as context next turn. Otherwise `save_session()` saves it. This is the turn's only save, shielded from cancellation; a turn that fails, times out or is abandoned saves nothing, so stored history only holds delivered replies.
 
 Result: a single `Answer(text, grounding_status, citations)`.
 
@@ -172,14 +173,23 @@ The UI parses each `data:` line, updates the status indicator, appends content, 
 | Situation | Behaviour |
 |---|---|
 | Invalid body | 422 from FastAPI |
+| Blank prompt, or over `MAX_PROMPT_TOKENS` (estimated at ~4 chars/token) | 422 with a user-facing `detail`; the UI reads the limit from `GET /chat/config` and blocks sending over it |
+| Message that is only links | `LINK_ONLY_RESPONSE` clarifying question, no model call; saved to history |
+| Non-English message | Reply in English; rewriter queries in English |
 | Invalid/forged session cookie | Ignored; new session issued |
 | Greeting / thanks | No rewriter call (regex) or `intent=conversational`; no search; reply without a grounding status |
-| Query rewriter fails or times out | Raw prompt searched as the single query |
+| Rewriter says conversational, agent calls the tool | Searched anyway with the fallback query (`search_intent_override`) |
+| Agent replies without searching on a turn that needs one | Clarifying questions delivered; otherwise one search repair turn, then `NO_DOCUMENTATION_RESPONSE` |
+| User asks the assistant not to search | Ignored: the system prompt and the search repair still require a search |
+| Query rewriter fails or times out | Prompt plus up to two previous user messages searched (`fallback_query`); successful step-back/sub-queries kept |
 | A query finds nothing | Reworded once by the rewriter and searched again |
 | No relevant docs found | Model replies with the no-documentation text, `NOT_SUPPORTED` |
 | Answer fails verification | One repair attempt with the reasons, if the search returned results; if that also fails, replaced with `NO_DOCUMENTATION_RESPONSE`, `NOT_SUPPORTED`; stored history corrected |
 | Rerank request rejected | Falls back to vector-score order |
-| Reply cut off at `MODEL_MAX_TOKENS` | Treated as a rejection: one repair attempt asking for a shorter reply, otherwise the no-documentation reply; partial message removed from history |
+| Reply cut off at `MODEL_MAX_TOKENS` | Logged as `max_tokens_reached` and `cause: truncated`; one repair attempt (`shorten_request()`) asking for a shorter reply, otherwise the no-documentation reply; partial message removed from history |
+| Long conversation | History capped at `CONVERSATION_WINDOW_MESSAGES`; earlier turns' search results dropped on restore |
 | Exception mid-stream | In-band `error` event, then `[DONE]` |
-| Client disconnects | Cancel signal stops the agent |
-| Idle upstream | `: keepalive` comments every 10 s |
+| Client disconnects | Agent loop cancelled at once; nothing of the turn is saved (a model call in flight may finish in Strands' worker thread) |
+| Idle upstream | `: keepalive` whenever nothing was sent for 10 s (timer-based) |
+| Turn over `TURN_TIMEOUT_SECONDS` | Turn cancelled, in-band "took too long" error, nothing saved |
+| Stream cut by a proxy (no `[DONE]`) | UI shows "The response was interrupted" instead of an empty reply |

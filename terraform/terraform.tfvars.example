@@ -7,6 +7,12 @@ environment       = "sandbox"
 # Required — your Bedrock Knowledge Base ID
 knowledge_base_id = "REPLACE_WITH_YOUR_KNOWLEDGE_BASE_ID"
 
+# Required — Keycloak service-account authentication. The API accepts only
+# access tokens whose iss, aud and azp match these values exactly.
+keycloak_issuer_url       = "https://REPLACE_WITH_KEYCLOAK_HOST/auth/realms/REPLACE_WITH_REALM"
+keycloak_audience         = "REPLACE_WITH_API_AUDIENCE"
+keycloak_authorized_party = "REPLACE_WITH_SERVICE_ACCOUNT_CLIENT_ID"
+
 # Optional — override with full ECR URI after first push
 # api_image = "123456789012.dkr.ecr.ca-central-1.amazonaws.com/sso-rag-dev-api:latest"
 # ui_image  = "123456789012.dkr.ecr.ca-central-1.amazonaws.com/sso-rag-dev-ui:latest"

@@ -41,6 +41,13 @@ export interface ChatRequest {
   prompt: string;
 }
 
+/** GET /chat/config: limits the API also enforces (422 with a `detail`). */
+export interface ChatConfig {
+  max_prompt_tokens: number;
+  /** The token limit as characters (~4 per token). */
+  max_prompt_chars: number;
+}
+
 /** In-band error event sent if the stream fails after it has started. */
 export interface StreamError {
   error: string;

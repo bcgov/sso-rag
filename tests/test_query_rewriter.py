@@ -9,6 +9,7 @@ from app.services.query_rewriter import (
     SSO_QUESTION,
     QueryRewriter,
     RewrittenQuery,
+    fallback_query,
     is_greeting,
     parse_retry,
     parse_rewrite,
@@ -29,6 +30,14 @@ def test_greetings_are_detected(text):
 
 @pytest.mark.parametrize("text", [
     "hi, how do I add a redirect URI?",
+    "hi how do I add a redirect URI",
+    "hello\nhow do I add a redirect URI?",
+    "Thanks!\n\nHow do I get BCeID?",
+    "thanks. one more: what about prod?",
+    "hey! what is CSS?",
+    "who are you? what is IDIR",
+    "good morning team, my login is broken",
+    "ok so how do I rotate the secret",
     "thanks, and what about prod?",
     "how do I get BCeID in prod",
     "what can you tell me about IDIR?",
@@ -112,6 +121,39 @@ def test_recent_history_truncates():
     assert len(text) <= qr.HISTORY_MESSAGE_CHARS + 1 and text.endswith("…")
 
 
+# --- fallback query -----------------------------------------------------------
+
+def test_fallback_query_without_history_is_the_prompt():
+    assert fallback_query("  what   about prod? ", []) == "what about prod?"
+    assert fallback_query("what about prod?") == "what about prod?"
+
+
+def test_fallback_query_prepends_recent_user_messages():
+    history = [
+        ("user", "first question"),
+        ("assistant", "first answer"),
+        ("user", "How do I get BCeID in TEST?"),
+        ("assistant", "Request it in the CSS app."),
+        ("user", "and for IDIR?"),
+        ("assistant", "Same steps."),
+    ]
+    assert fallback_query("what about prod?", history) == \
+        "How do I get BCeID in TEST? and for IDIR? what about prod?"
+
+
+def test_fallback_query_keeps_the_most_recent_context_within_the_limit():
+    history = [("user", "older " * 100), ("user", "recent topic " + "x " * 200)]
+    query = fallback_query("what about prod?", history)
+    assert len(query) <= qr.MAX_QUERY_CHARS
+    assert query.startswith("recent topic") and query.endswith("what about prod?")
+    assert "older" not in query
+
+
+def test_fallback_query_keeps_a_long_prompt_whole():
+    prompt = "word " * 80
+    assert fallback_query(prompt, [("user", "earlier")]) == prompt.strip()
+
+
 # --- transform ----------------------------------------------------------------
 
 def _fake_converse(replies: dict, delays: dict | None = None, errors: set | None = None):
@@ -165,6 +207,45 @@ def test_transform_rewrite_error_falls_back_to_raw_prompt(monkeypatch):
     assert result.rewritten_query == "raw prompt"
     # Other techniques still contribute.
     assert result.sub_queries == ["BCeID PROD approval", "service account client roles"]
+    assert result.step_back_query == "CSS app integration approval process"
+
+
+FOLLOW_UP_HISTORY = [("user", "How do I get BCeID in TEST?"), ("assistant", "Request it in the CSS app.")]
+
+
+def test_transform_rewrite_error_on_follow_up_uses_history(monkeypatch):
+    monkeypatch.setattr(qr, "_converse", _fake_converse(GOOD, errors={"rewrite"}))
+    result = QueryRewriter().transform("what about prod?", FOLLOW_UP_HISTORY)
+    assert result.fallback
+    assert result.rewritten_query == "How do I get BCeID in TEST? what about prod?"
+
+
+def test_transform_all_techniques_fail_uses_history(monkeypatch):
+    monkeypatch.setattr(qr, "_converse", _fake_converse(GOOD, errors={"rewrite", "step_back", "decomposition"}))
+    result = QueryRewriter().transform("what about prod?", FOLLOW_UP_HISTORY)
+    assert result == RewrittenQuery(
+        intent=SSO_QUESTION,
+        rewritten_query="How do I get BCeID in TEST? what about prod?",
+        fallback=True,
+    )
+
+
+def test_transform_rewrite_timeout_keeps_other_techniques(monkeypatch):
+    monkeypatch.setattr(qr.settings, "query_rewriter_timeout_seconds", 0.2)
+    monkeypatch.setattr(qr, "_converse", _fake_converse(GOOD, delays={"rewrite": 1}))
+    result = QueryRewriter().transform("what about prod?", FOLLOW_UP_HISTORY)
+    assert result.fallback and result.rewritten_query.endswith("what about prod?")
+    assert result.step_back_query and result.sub_queries
+
+
+def test_transform_unexpected_error_uses_history(monkeypatch):
+    def boom(*_):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(QueryRewriter, "_transform", boom)
+    result = QueryRewriter().transform("what about prod?", FOLLOW_UP_HISTORY)
+    assert result == RewrittenQuery.raw("what about prod?", FOLLOW_UP_HISTORY)
+    assert result.rewritten_query == "How do I get BCeID in TEST? what about prod?"
 
 
 def test_transform_invalid_json_falls_back(monkeypatch):
@@ -200,7 +281,8 @@ def test_submit_short_circuits_greetings(monkeypatch):
 
     monkeypatch.setattr(qr, "_converse", boom)
     future = QueryRewriter().submit("Thanks!", [])
-    assert future.done() and future.result() == RewrittenQuery.conversational()
+    assert future.done() and future.result() == RewrittenQuery.greeting()
+    assert future.result().short_circuit
 
 
 def test_submit_runs_transform(monkeypatch):

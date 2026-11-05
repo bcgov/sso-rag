@@ -25,8 +25,8 @@ CITATIONS_KEY = "citations"
 SEARCH_TURN_KEY = "search_turn"
 
 NO_SEARCH_NEEDED = (
-    "NO_SEARCH_NEEDED: this message needs no documentation search; "
-    "reply conversationally."
+    "NO_SEARCH_NEEDED: this message is a greeting and needs no documentation "
+    "search; reply conversationally."
 )
 
 # Returned when the tool is called again in the same turn: the first call's
@@ -54,8 +54,13 @@ class SearchTurn:
     prompt: str
     # Resolves to the query rewriter's RewrittenQuery for this turn.
     rewrite: Future
+    # The rewriter's history, reused to build a fallback query.
+    history: list[tuple[str, str]] = field(default_factory=list)
     # The first call's output; later calls in the turn get ALREADY_SEARCHED.
     result: str | None = None
+    # True once the knowledge base was actually searched this turn
+    # (NO_SEARCH_NEEDED doesn't count).
+    searched: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -78,7 +83,7 @@ def search_knowledge_base(tool_context: ToolContext) -> str:
         section, source URL, score and text, possibly followed by a NOTE
         naming parts of the question the documentation doesn't cover; or a
         string starting with "NO_MATCH" if nothing relevant was found,
-        "NO_SEARCH_NEEDED" if the message needs no search, or
+        "NO_SEARCH_NEEDED" if the message is a greeting, or
         "ALREADY_SEARCHED" if it was already called this turn.
     """
 
@@ -94,8 +99,12 @@ def search_knowledge_base(tool_context: ToolContext) -> str:
             trace("search tool: repeated call in the same turn", returned="ALREADY_SEARCHED")
             return ALREADY_SEARCHED
         citations = state.get(CITATIONS_KEY)
-        turn.result = _search(turn, citations if isinstance(citations, list) else None)
-        return turn.result
+        result = _search(turn, citations if isinstance(citations, list) else None)
+        # NO_SEARCH_NEEDED is not cached: a later call in the turn (e.g. a
+        # search repair) gets the same cheap answer, not ALREADY_SEARCHED.
+        if result != NO_SEARCH_NEEDED:
+            turn.result = result
+        return result
 
 
 def _resolve_rewrite(turn: SearchTurn) -> tuple[RewrittenQuery, int]:
@@ -103,8 +112,9 @@ def _resolve_rewrite(turn: SearchTurn) -> tuple[RewrittenQuery, int]:
     try:
         rewrite = turn.rewrite.result(timeout=settings.query_rewriter_timeout_seconds)
     except Exception as e:
-        logger.warning("query rewrite unavailable (%s); searching the raw prompt", e or type(e).__name__)
-        rewrite = RewrittenQuery.raw(turn.prompt)
+        logger.warning("query rewrite unavailable (%s); searching the prompt with recent history",
+                       e or type(e).__name__)
+        rewrite = RewrittenQuery.raw(turn.prompt, turn.history)
     return rewrite, int((time.monotonic() - started) * 1000)
 
 
@@ -119,11 +129,19 @@ def build_queries(rewrite: RewrittenQuery) -> list[SearchQuery]:
 def _search(turn: SearchTurn, citations: list | None) -> str:
     rewrite, waited_ms = _resolve_rewrite(turn)
 
+    overridden = False
     if rewrite.intent == CONVERSATIONAL:
-        logger.info(json.dumps({"event": "search_skipped", "reason": CONVERSATIONAL}))
-        trace("search tool: skipped (conversational)", prompt=turn.prompt, returned="NO_SEARCH_NEEDED")
-        return NO_SEARCH_NEEDED
+        if rewrite.short_circuit:
+            logger.info(json.dumps({"event": "search_skipped", "reason": CONVERSATIONAL}))
+            trace("search tool: skipped (greeting)", prompt=turn.prompt, returned="NO_SEARCH_NEEDED")
+            return NO_SEARCH_NEEDED
+        # The rewriter's classification is a guess; the agent calling the
+        # tool says otherwise. A search is cheap, an ungrounded answer isn't.
+        overridden = True
+        logger.info(json.dumps({"event": "search_intent_override", "rewriter_intent": CONVERSATIONAL}))
+        rewrite = RewrittenQuery.raw(turn.prompt, turn.history)
 
+    turn.searched = True
     question = rewrite.rewritten_query or turn.prompt
     queries = build_queries(rewrite)
     hits, stats = multi_search(question, queries)
@@ -149,6 +167,7 @@ def _search(turn: SearchTurn, citations: list | None) -> str:
         "kept": len(hits),
         "waited_ms": waited_ms,
         "fallback": rewrite.fallback,
+        "intent_override": overridden,
         "retry": retry_stats,
         **stats,
     }))
@@ -157,7 +176,8 @@ def _search(turn: SearchTurn, citations: list | None) -> str:
         "search tool: queries and results",
         prompt=turn.prompt,
         waited_for_rewriter_ms=waited_ms,
-        fallback_to_raw_prompt=rewrite.fallback,
+        fallback_query=rewrite.fallback,
+        overrode_conversational_intent=overridden,
         rerank_question=question,
         queries=[f"[{o}] {q}" for q, o in zip(stats["queries"], stats["origins"])],
         acronym_expanded=stats.get("expanded", []),

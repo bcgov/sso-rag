@@ -64,14 +64,15 @@ For accepted answers, the sources are the cited URLs plus any retrieved page the
 In `ChatService.stream`:
 
 1. The agent's output is buffered (with `<thinking>` blocks removed by `ThinkingFilter`); the client only sees `status` progress chunks (`searching`, `writing`) and heartbeats meanwhile.
-2. `verify()` runs on the full reply.
+2. `verify()` runs on the full reply. If no search ran this turn, the turn's intent decides what may be delivered: only clarifying questions on a turn that needs a search (an SSO question, or a failed or timed-out rewrite); clarifications and conversational replies on a conversational turn. Anything else skipped the search: it is rejected (`search_skipped_by_model`) and, with `GROUNDING_REPAIR_ENABLED` on, the agent gets one `search_request()` turn to search and answer. If it still doesn't search, the no-documentation reply is sent. `Verdict.response_type` carries the reply's type for this decision.
 3. **Repair attempt.** If the reply was rejected (or cut off at `MODEL_MAX_TOKENS`, which raises Strands' `MaxTokensReachedException` and is treated as a rejection asking for a shorter reply), the search returned results, the client is still connected and `GROUNDING_REPAIR_ENABLED` is on, the agent is run once more:
-   - It receives `repair_request(reasons)` ([system_prompt.py](../../app/prompts/system_prompt.py)), which lists the rejection reasons and asks for a complete rewrite using only this turn's results.
+   - It receives `repair_request(reasons)` ([system_prompt.py](../../app/prompts/system_prompt.py)), which lists the rejection reasons and asks for a complete rewrite using only this turn's results; a cut-off reply gets `shorten_request()` instead, which asks for a shorter reply.
    - The search tool won't search again in the same turn (it returns `ALREADY_SEARCHED`), so the evidence is unchanged; the results are already in the conversation.
    - `verify()` runs again on the rewrite.
    - `drop_repair_exchange()` removes the repair request and the rejected reply from the history.
-   - Not repaired: a model-reported `NOT_SUPPORTED`, or a rejection with no retrieval results. Neither has evidence to fix it from.
-4. Rejections are logged as `{"event": "answer_rejected", "attempt": "first" | "repair", "reasons": [...], "retrieved": N}`, and repair outcomes as `{"event": "answer_repair", "repaired": bool}`.
+   - Not repaired: a model-reported `NOT_SUPPORTED` after a search, or a rejection when the search found nothing. Neither has evidence to fix it from.
+   - Only one repair (search or grounding) runs per turn.
+4. Rejections are logged as `{"event": "answer_rejected", "attempt": "first" | "repair", "cause": ..., "reasons": [...], "retrieved": N}`, with `"cause": "grounding" | "truncated" | "skipped_search"`, and repair outcomes as `{"event": "answer_repair", "kind": <cause>, "searched": bool, "repaired": bool}`. Each model call also logs `{"event": "model_call", "attempt", "stop_reason", "input_tokens", "output_tokens", "max_tokens"}`.
 5. If the final text was replaced, `replace_last_answer()` rewrites the stored assistant message (including a `NOT_SUPPORTED` grounding block), so the rejected answer is not reused as context next turn. After a successful repair the cleaned history is saved with `save_session()`.
 6. One `Answer(text, grounding_status, citations)` is yielded.
 

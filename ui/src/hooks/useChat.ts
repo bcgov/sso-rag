@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createTypewriter, type Typewriter } from "../lib/typewriter";
 import type {
   ChatCompletionChunk,
+  ChatConfig,
   ChatMessage,
   ChatRequest,
   Citation,
@@ -17,6 +18,8 @@ import type {
 // in AWS (/<stage>/chat) and to /chat locally.
 const API_URL = "chat";
 const HISTORY_URL = "chat/history";
+const CONFIG_URL = "chat/config";
+const INTERRUPTED_MESSAGE = "The response was interrupted. Please try again.";
 const DONE_SENTINEL = "[DONE]";
 const TAB_ID_HEADER = "X-Tab-Id";
 const TAB_ID_KEY = "sso-rag-tab-id";
@@ -37,6 +40,19 @@ function rotateTabId(): void {
   sessionStorage.setItem(TAB_ID_KEY, crypto.randomUUID());
 }
 
+// The API's error responses carry a user-facing `detail` string (e.g. a
+// message that is too long); fall back to the status text.
+async function errorDetail(response: Response): Promise<string> {
+  let detail = `HTTP ${response.status}: ${response.statusText}`;
+  try {
+    const body = (await response.json()) as { detail?: unknown };
+    if (typeof body.detail === "string") detail = body.detail;
+  } catch {
+    // Keep the status text.
+  }
+  return detail;
+}
+
 function parseChunk(line: string): ChatCompletionChunk | StreamError | null {
   const stripped = line.replace(/^data:\s*/, "");
   if (stripped === DONE_SENTINEL || stripped === "") return null;
@@ -51,8 +67,26 @@ export function useChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [maxPromptChars, setMaxPromptChars] = useState<number | null>(null);
   const typewriterRef = useRef<Typewriter | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  // The message length limit. Without it the input isn't capped, but the
+  // API still rejects an over-long message with a readable reason.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(CONFIG_URL, { credentials: "same-origin" })
+      .then((response) => (response.ok ? (response.json() as Promise<ChatConfig>) : null))
+      .then((config) => {
+        if (!cancelled && config) setMaxPromptChars(config.max_prompt_chars);
+      })
+      .catch(() => {
+        // Not fatal: see above.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Stops the in-flight answer, if any (the server cancels the agent run
   // when the client disconnects).
@@ -114,7 +148,7 @@ export function useChat() {
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        throw new Error(await errorDetail(response));
       }
 
       if (!response.body) {
@@ -178,6 +212,12 @@ export function useChat() {
 
       reader.cancel();
 
+      // The connection closed before the server finished (e.g. a proxy
+      // timeout): don't present a partial or empty reply as complete.
+      if (!done) {
+        throw new Error(INTERRUPTED_MESSAGE);
+      }
+
       // Let the remaining text finish revealing before showing the sources.
       await typewriter.finish();
       updateAssistant({
@@ -231,23 +271,20 @@ export function useChat() {
   // delete everything, leaving the current conversation on screen so the
   // user can retry.
   const deleteHistory = useCallback(async () => {
+    // Stop an answer in progress first: the server only saves a turn when it
+    // completes, so one finishing after the delete would store it again.
+    stopStreaming();
+    setIsStreaming(false);
+    setMessages((prev) => prev.filter((m) => !m.streaming));
+
     const response = await fetch(HISTORY_URL, {
       method: "DELETE",
       credentials: "same-origin",
     });
     if (!response.ok) {
-      let detail = `HTTP ${response.status}: ${response.statusText}`;
-      try {
-        const body = (await response.json()) as { detail?: unknown };
-        if (typeof body.detail === "string") detail = body.detail;
-      } catch {
-        // Keep the status text.
-      }
-      throw new Error(detail);
+      throw new Error(await errorDetail(response));
     }
 
-    stopStreaming();
-    setIsStreaming(false);
     setMessages([]);
     setError(null);
     rotateTabId();
@@ -257,6 +294,7 @@ export function useChat() {
     messages,
     isStreaming,
     error,
+    maxPromptChars,
     sendMessage,
     clearMessages,
     deleteHistory,

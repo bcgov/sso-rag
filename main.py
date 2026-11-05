@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,6 +21,15 @@ from app.api.routes.documents import (
     router as document_router
 )
 
+logger = logging.getLogger(__name__)
+
+# Fail at startup, before serving anything, if authentication isn't configured.
+settings.require_auth_config()
+
+if settings.auth_bypassed:
+    logger.warning("AUTH_LOCAL_BYPASS is on: API requests are NOT authenticated")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # Periodically delete conversations older than SESSION_RETENTION_DAYS.
@@ -39,7 +49,11 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Agentic RAG",
-    lifespan=lifespan
+    lifespan=lifespan,
+    # The API explorer and schema are only served for local development.
+    docs_url="/docs" if settings.is_local else None,
+    redoc_url="/redoc" if settings.is_local else None,
+    openapi_url="/openapi.json" if settings.is_local else None
 )
 
 # Answers CORS preflight (OPTIONS) requests; the UI's X-Tab-Id header and

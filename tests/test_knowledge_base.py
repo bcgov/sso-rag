@@ -78,3 +78,13 @@ def test_merge_hits_dedupes_and_sorts():
     assert merged[0].metadata["_queries"] == ["q1", "q2"]
     assert a.metadata["_queries"] == ["q1"]  # inputs untouched
     assert len(kb.merge_hits([a, c], [], limit=1)) == 1
+
+
+def test_knowledge_base_client_has_short_timeouts(monkeypatch):
+    from app.retrieval import bedrock_client
+
+    monkeypatch.setattr(bedrock_client, "_client", None)
+    client = bedrock_client.get_bedrock_runtime_client()
+    assert client.meta.config.connect_timeout == 5
+    assert client.meta.config.read_timeout == 20
+    monkeypatch.setattr(bedrock_client, "_client", None)

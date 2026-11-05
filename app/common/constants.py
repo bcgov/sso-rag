@@ -19,6 +19,14 @@ Include the following details, with secrets and tokens removed:
 - Timestamp
 """.strip()
 
+# Sent, without any model call, when the user's message is only one or more
+# links (app/services/prompt_policy.py).
+LINK_ONLY_RESPONSE = (
+    "I see you've shared a link. What would you like to know about it? "
+    "For example, are you trying to sign in, set up or change an integration, "
+    "or troubleshoot an error?"
+)
+
 # Acronyms and shorthand that the docs usually spell out. When a query uses
 # the short form, the expansion is appended so the embedding also matches the
 # documentation's wording. Keep this to genuine abbreviations: general words

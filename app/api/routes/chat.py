@@ -5,7 +5,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Header, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agents.rag_agent import (
@@ -17,16 +17,28 @@ from app.agents.rag_agent import (
     new_session_id
 )
 
+from app.api.dependencies.authentication import (
+    require_service_account
+)
+
 from app.common.config import settings
 
 from app.schemas.chat import (
+    ChatConfig,
     ChatRequest
 )
 
 from app.services.chat_service import (
     Heartbeat,
     Status,
+    TurnTimeout,
     chat_service
+)
+
+from app.services.prompt_policy import (
+    PromptRejected,
+    check_prompt,
+    max_prompt_chars
 )
 
 from app.services.session_cleanup import (
@@ -35,9 +47,21 @@ from app.services.session_cleanup import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(
+    dependencies=[Depends(require_service_account)],
+    responses={
+        401: {"description": "Missing or invalid Keycloak access token"},
+        503: {"description": "The realm's signing keys could not be loaded"}
+    }
+)
 
 DONE = "data: [DONE]\n\n"
+
+FAILED_MESSAGE = "The assistant failed to respond. Please try again."
+TIMEOUT_MESSAGE = (
+    "The assistant took too long to respond. Please try again, "
+    "or ask a shorter or more specific question."
+)
 
 TAB_ID_HEADER = "X-Tab-Id"
 
@@ -74,8 +98,9 @@ def _sse(completion_id: str, delta: dict, finish_reason: str | None = None) -> s
 
 async def _event_stream(prompt: str, session_id: str) -> AsyncIterator[str]:
     completion_id = f"chatcmpl-{uuid.uuid4()}"
-    # Set when the client disconnects (Starlette closes this generator), so
-    # the agent stops instead of running to completion for nobody.
+    # A client disconnect cancels this generator (Starlette), which stops the
+    # agent loop at once; nothing of the unfinished turn is saved. The model
+    # call already in flight may still finish in Strands' worker thread.
     cancel = threading.Event()
 
     try:
@@ -102,18 +127,33 @@ async def _event_stream(prompt: str, session_id: str) -> AsyncIterator[str]:
                     ]})
 
         yield _sse(completion_id, {}, finish_reason="stop")
+    except TurnTimeout:
+        logger.warning(json.dumps({"event": "turn_timeout", "seconds": settings.turn_timeout_seconds}))
+        yield f"data: {json.dumps({'error': TIMEOUT_MESSAGE})}\n\n"
     except Exception:
         # Headers (status 200) are already sent, so report the failure in-band.
         logger.exception("chat stream failed")
-        yield f"data: {json.dumps({'error': 'The assistant failed to respond. Please try again.'})}\n\n"
+        yield f"data: {json.dumps({'error': FAILED_MESSAGE})}\n\n"
     finally:
         cancel.set()
 
     yield DONE
 
 
+@router.get(
+    "/chat/config"
+)
+async def chat_config() -> ChatConfig:
+    """Limits the UI applies to the message box before sending."""
+    return ChatConfig(
+        max_prompt_tokens=settings.max_prompt_tokens,
+        max_prompt_chars=max_prompt_chars(),
+    )
+
+
 @router.post(
-    "/chat"
+    "/chat",
+    responses={422: {"description": "The message is blank or too long; `detail` says why"}}
 )
 async def chat(
     body: ChatRequest,
@@ -132,7 +172,15 @@ async def chat(
     chunk. Rejected answers are replaced with the no-documentation reply.
 
     History is kept per browser (session cookie) and, when the
-    `X-Tab-Id` header is sent, per tab within that browser."""
+    `X-Tab-Id` header is sent, per tab within that browser.
+
+    A blank message, or one over MAX_PROMPT_TOKENS (estimated), gets a 422
+    whose `detail` is a message for the user."""
+
+    try:
+        prompt = check_prompt(body.prompt)
+    except PromptRejected as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
     session_id = request.cookies.get(settings.session_cookie_name)
 
@@ -140,7 +188,7 @@ async def chat(
         session_id = new_session_id()
 
     response = StreamingResponse(
-        _event_stream(body.prompt, conversation_id(session_id, tab_id)),
+        _event_stream(prompt, conversation_id(session_id, tab_id)),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

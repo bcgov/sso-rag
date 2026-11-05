@@ -23,9 +23,10 @@ Ignore the `legacy/` folder; it is not part of the application.
 ## Repository layout
 
 ```text
-main.py                          FastAPI app: CORS middleware, lifespan (session cleanup loop), routers
+main.py                          FastAPI app: CORS middleware, lifespan (session cleanup loop), routers; auth config check; docs only when local
 app/
   agents/rag_agent.py            BedrockModel, agent storage, create_agent(), session-id helpers, delete_session()
+  api/dependencies/authentication.py  require_service_account: Bearer token → 401/503, local bypass
   api/routes/chat.py             POST /chat (SSE stream), DELETE /chat (reset), DELETE /chat/history; session cookie + X-Tab-Id
   api/routes/documents.py        GET /documents/search — raw single-query KB retrieval (debugging)
   api/routes/health.py           GET /health
@@ -39,7 +40,9 @@ app/
   retrieval/models.py            RetrievedChunk
   schemas/                       Pydantic request/response models
   services/chat_service.py       ChatService.stream() (buffer → verify), ThinkingFilter
+  services/authentication.py     Keycloak JWT verification (RS256, iss/aud/azp/exp), JwksCache
   services/grounding.py          grounding block parsing + rejection checks (verify)
+  services/prompt_policy.py      blank / too-long rejection (MAX_PROMPT_TOKENS), link-only detection
   services/session_cleanup.py    deletes sessions inactive > SESSION_RETENTION_DAYS; delete_browser_history()
   tools/knowledge_base_tool.py   @tool search_knowledge_base
 ui/src/
@@ -60,22 +63,32 @@ Python packages under `app/` are **namespace packages** (no `__init__.py`); don'
 
 1. UI sends `POST /chat` with `{"prompt": "..."}`, header `X-Tab-Id: <uuid>`, and
    the `strands_session` cookie (same-origin, sent automatically).
-2. `chat.py` reads the cookie; if missing or not `session_<uuid>`, it creates a new
+2. `chat.py` checks the prompt (`prompt_policy.check_prompt`: trimmed; blank or
+   over `MAX_PROMPT_TOKENS` → 422 with a user-facing `detail`) and reads the
+   cookie; if missing or not `session_<uuid>`, it creates a new
    id. Storage key = `conversation_id(session_id, tab_id)` →
    `session_<uuid>__<tab uuid>` (or just the session id if no valid tab id).
-3. `ChatService.stream()` builds a fresh agent with `create_agent(conversation_id)`
-   (in a thread — restoring the snapshot does blocking I/O) and iterates
-   `agent.stream_async(question, invocation_state={"citations": [...]}, cancel_signal=...)`.
+3. `ChatService.stream()` runs the turn (`_turn()`) in one background task:
+   it adds timer-based heartbeats and raises `TurnTimeout` after
+   `TURN_TIMEOUT_SECONDS` (sent in-band as a "took too long" error). The turn
+   builds a fresh agent with `create_agent(conversation_id)` (in a thread —
+   restoring the snapshot does blocking I/O); a links-only message gets
+   `LINK_ONLY_RESPONSE` without model calls; otherwise it iterates
+   `agent.stream_async(question, invocation_state={"citations": [...]}, cancel_signal=..., limits={"turns": 4})`.
 4. Text deltas pass through `ThinkingFilter` (removes `<thinking>…</thinking>`,
    including tags split across chunks) and are **buffered**, not streamed;
    `status` events (`searching` on a tool call, `writing` once text arrives) and
-   `: keepalive` comments (every 10s idle) are sent meanwhile.
+   `: keepalive` comments (whenever nothing was sent for 10s, on a timer) are
+   sent meanwhile.
 5. `grounding.verify(reply, retrieved, prompt)` strips the model's
    `<grounding>{"response_type", "grounding_status", "citations"}</grounding>`
    block and returns the text to send. It is replaced with
    `NO_DOCUMENTATION_RESPONSE` (`app/common/constants.py`) when the status is
    NOT_SUPPORTED, or on rejection: SUPPORTED with empty citations; a citation
    not among the retrieved `uri`s; no retrieval results but factual guidance;
+   a reply written without a search on a turn that needs one (only
+   clarifications may skip it; `ChatService` first gives the agent one
+   `search_request()` repair turn);
    any URL / endpoint path / inline code / quoted value in a code block not
    found in the retrieved text or the user's prompt (`<placeholders>`
    ignored); missing or malformed block. Rejections are logged as
@@ -118,14 +131,43 @@ On a partial failure: 500 `{"detail"}` and the cookie is kept for a retry. The
 ALB listener rule must route `/chat/*` to the API for this path. The UI calls it
 from "Delete history" after a confirmation dialog.
 
+## Authentication
+
+- Chat and document routers have a router-level
+  `Depends(require_service_account)`; only `/health` and CORS preflight are
+  public. New routers serving data or calling Bedrock must add it too.
+- Callers send `Authorization: Bearer <Keycloak service-account token>`.
+  `TokenVerifier` checks the RS256 signature (key from the trusted issuer's
+  JWKS only; algorithm fixed, never from the token), `iss`, `aud`, `azp` and
+  `exp` (all required, no leeway). Don't add claim requirements without being asked.
+- Failures are 401 (generic `detail`, reason code logged as `auth_rejected`,
+  never the token) or 503 when signing keys can't be loaded. They happen before
+  streaming starts. The dependency is sync so JWKS fetches run in the threadpool.
+- JWKS cache: 300s TTL per worker, refetch at most every 30s, 5s timeout, no
+  redirects, never uses expired keys.
+- `AUTH_LOCAL_BYPASS=true` is only accepted with `ENVIRONMENT=local`. The
+  browser UI sends no token, so it only works against a bypassed local API.
+- Tests: `tests/conftest.py` sets fake `KEYCLOAK_*` values; route tests override
+  `require_service_account`; `tests/test_authentication.py` signs real tokens.
+
 ## Sessions and storage
 
 - One `Agent` per request — **never share an Agent across requests/users**; it
   holds message history. The `BedrockModel` is module-level and shared.
-- History persists via `SnapshotSessionManager(conversation_id, storage=storage)`.
+- History persists via `SnapshotSessionManager(conversation_id, storage=storage,
+  save_latest_on="trigger")`: Strands never saves on its own; `ChatService`
+  saves once, after the grounding checks, when the turn completes
+  (`save_session` / `replace_last_answer`, shielded from cancellation). A
+  failed, timed-out or disconnected turn saves nothing — keep it that way.
   `storage` is `LocalFileStorage("./.agent-store/")` when `ENVIRONMENT=local`,
   otherwise `S3Storage(AGENT_STORAGE_S3_BUCKET)`. Keys live under
-  `session/<id>/…` (snapshots) and `context/<id>/…` (context-manager stash).
+  `session/<id>/…` (snapshots); `context/<id>/…` only holds the stash of
+  conversations stored before Strands' context manager was turned off.
+- History is capped by `SlidingWindowConversationManager(window_size=
+  CONVERSATION_WINDOW_MESSAGES)`, and `create_agent()` drops earlier turns'
+  tool calls/results on restore (`drop_tool_exchanges`). Don't use
+  `context_manager="auto"`: it truncates the current search result to a
+  short preview before the model reads it and injects a `retrieve_context` tool.
 - Cookie: `strands_session`, `HttpOnly`, `SameSite=Lax`, `Secure` per
   `SESSION_COOKIE_SECURE` (set `false` for plain-HTTP localhost or the browser drops it).
 - Cookie and tab ids are client-controlled and become storage keys: always
@@ -173,6 +215,10 @@ it elsewhere.
 | `AWS_REGION` | `ca-central-1` | |
 | `KNOWLEDGE_BASE_ID` | required | |
 | `MODEL_ARN` | – | model id = last path segment |
+| `MODEL_MAX_TOKENS` | `4096` | per model call, reasoning tokens included; check `model_call` logs before lowering |
+| `CONVERSATION_WINDOW_MESSAGES` | `20` | sliding-window history cap (messages) |
+| `MAX_PROMPT_TOKENS` | `200` | estimated at ~4 chars/token; 422 with a user-facing `detail` over it |
+| `TURN_TIMEOUT_SECONDS` | `240` | in-band "took too long" error; keep under API Gateway's 300s |
 | `RERANKER_MODEL_ARN` | unset | unset → no rerank |
 | `NUMBER_OF_RESULTS` | `25` | candidates per tool call |
 | `NUMBER_OF_RERANKED_RESULTS` | `6` | kept after rerank (+2 per extra query, max 12) |
@@ -185,6 +231,10 @@ it elsewhere.
 | `SESSION_COOKIE_SECURE` | `true` | |
 | `SESSION_RETENTION_DAYS` | `3` | must be > 0 |
 | `SESSION_CLEANUP_INTERVAL_HOURS` | `24` | `0` disables in-process cleanup |
+| `KEYCLOAK_ISSUER_URL` | required | https realm URL; equals token `iss` |
+| `KEYCLOAK_AUDIENCE` | required | must be in token `aud` |
+| `KEYCLOAK_AUTHORIZED_PARTY` | required | equals token `azp` |
+| `AUTH_LOCAL_BYPASS` | `false` | only with `ENVIRONMENT=local`; then `KEYCLOAK_*` may be unset |
 
 Read settings via `from app.common.config import settings`; never `os.environ`
 directly. Secrets never go in source or images — `.env` is local only and is
@@ -218,7 +268,8 @@ excluded by `.dockerignore`.
 - **New request header or HTTP method from the UI:** CORS in `main.py`
   (`terraform/apigateway.tf` needs no change — the REST API proxies `OPTIONS` to FastAPI).
 - **New env var:** `config.py`, the README env table, and the API task
-  `environment` list in `terraform/ecs.tf` if it must differ from the default.
+  `environment` list in `terraform/ecs.tf` if it must differ from the default
+  (required ones also need a `TF_VAR_*` in the workflow).
 - **New AWS call:** API task role in `terraform/iam.tf`.
 - **Stream format change:** `chat.py`, `ui/src/types.ts`, `ui/src/hooks/useChat.ts`, README.
 
@@ -227,8 +278,9 @@ excluded by `.dockerignore`.
 ```bash
 # API (from repo root)
 uv sync
-uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000   # docs at /docs
+uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000   # docs at /docs (ENVIRONMENT=local only)
 ENVIRONMENT=local SESSION_COOKIE_SECURE=false ...             # local storage + plain-HTTP cookie
+ENVIRONMENT=local AUTH_LOCAL_BYPASS=true ...                  # no token needed (e.g. for the UI)
 uv run python -m app.jobs.cleanup_sessions --days 3
 
 # UI (from ui/) — dev server on :5173 proxies /chat and /health to :8000

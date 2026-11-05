@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import threading
@@ -15,11 +16,17 @@ from app.agents.rag_agent import (
     save_session,
 )
 from app.common.config import settings
-from app.common.constants import NO_DOCUMENTATION_RESPONSE
+from app.common.constants import LINK_ONLY_RESPONSE, NO_DOCUMENTATION_RESPONSE
 from app.common.trace import preview, trace
-from app.prompts.system_prompt import repair_request
+from app.prompts.system_prompt import repair_request, search_request, shorten_request
 from app.services.grounding import NOT_SUPPORTED, Verdict, grounding_block, verify
-from app.services.query_rewriter import CONVERSATIONAL, query_rewriter, recent_history
+from app.services.prompt_policy import is_links_only
+from app.services.query_rewriter import (
+    CONVERSATIONAL,
+    RewrittenQuery,
+    query_rewriter,
+    recent_history,
+)
 from app.tools.knowledge_base_tool import CITATIONS_KEY, SEARCH_TURN_KEY, SearchTurn
 
 logger = logging.getLogger(__name__)
@@ -52,6 +59,15 @@ class ThinkingFilter:
         self._newlines = 0
 
     def feed(self, delta: str) -> str:
+        """
+        Feed a new chunk of text to the filter.
+
+        Args:
+            delta: The new text chunk.
+
+        Returns:
+            The text with <thinking>...</thinking> sections removed.
+        """
         self._buffer += delta
         out = []
 
@@ -91,6 +107,12 @@ class ThinkingFilter:
         return self._tidy("".join(out))
 
     def flush(self) -> str:
+        """
+        Flush the remaining text in the buffer.
+
+        Returns:
+            The text with <thinking>...</thinking> sections removed.
+        """
         rest = "" if self._in_thinking else self._buffer
         self._buffer = ""
         return self._tidy(rest)
@@ -140,28 +162,103 @@ class Answer:
 HEARTBEAT_SECONDS = 10
 
 
+# Agent loop iterations (one model call plus any tool run) allowed per agent
+# run: a run needs at most two (search, then answer); the rest is slack for
+# a repeated tool call. Bounds a model that keeps calling the tool.
+AGENT_MAX_TURNS = 4
+
+CLARIFICATION_BLOCK = '<grounding>{"response_type": "clarification", "citations": []}</grounding>'
+
+
+class TurnTimeout(TimeoutError):
+    """The turn ran past TURN_TIMEOUT_SECONDS and was stopped."""
+
+
 class _Progress:
-    """Status/heartbeat bookkeeping shared by the agent runs of one turn."""
+    """Status bookkeeping shared by the agent runs of one turn."""
 
     def __init__(self) -> None:
         self.status: str | None = None
-        self.last_sent = time.monotonic()
 
-    def update(self, phase: str | None) -> Status | Heartbeat | None:
+    def update(self, phase: str | None) -> Status | None:
         if phase and phase != self.status:
             self.status = phase
-            self.last_sent = time.monotonic()
             return Status(phase)
-        if time.monotonic() - self.last_sent >= HEARTBEAT_SECONDS:
-            self.last_sent = time.monotonic()
-            return Heartbeat()
         return None
+
+
+@dataclass(frozen=True)
+class _Failed:
+    error: Exception
+
+
+_END = object()
+
+
+async def _with_heartbeats(source: AsyncIterator, timeout: float) -> AsyncIterator:
+    """Passes on `source`'s items, adding a Heartbeat whenever nothing was
+    sent for HEARTBEAT_SECONDS (also while the agent is silent: a tool run,
+    a reasoning model before its first token, a storage call), and raising
+    TurnTimeout once `timeout` seconds have passed.
+
+    `source` runs in a task of its own, so it keeps one context throughout;
+    it is cancelled when this generator stops early (client disconnect or
+    timeout)."""
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pump() -> None:
+        try:
+            async with contextlib.aclosing(source) as items:
+                async for item in items:
+                    queue.put_nowait(item)
+        except Exception as e:
+            queue.put_nowait(_Failed(e))
+        else:
+            queue.put_nowait(_END)
+
+    task = asyncio.create_task(pump())
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TurnTimeout(f"turn took longer than {timeout:g}s")
+            try:
+                item = await asyncio.wait_for(queue.get(), min(HEARTBEAT_SECONDS, left))
+            except TimeoutError:
+                if time.monotonic() >= deadline:
+                    raise TurnTimeout(f"turn took longer than {timeout:g}s")
+                yield Heartbeat()
+                continue
+            if item is _END:
+                return
+            if isinstance(item, _Failed):
+                raise item.error
+            yield item
+    finally:
+        # Not awaited: on a client disconnect this generator is itself being
+        # cancelled. The turn saves nothing unless it completed.
+        task.cancel()
+
+
+async def _persist(save) -> None:
+    """Runs a save to completion even if the client disconnects meanwhile,
+    so a finished turn is never half-saved."""
+    await asyncio.shield(asyncio.ensure_future(save))
 
 
 TRUNCATED_REASON = (
     "the reply was cut off at the maximum output length before it was "
     "finished; write a shorter, complete reply"
 )
+
+SKIPPED_SEARCH_REASON = "the reply was written without searching the documentation"
+
+# Why a reply was rejected, for the logs and the repair request.
+CAUSE_SKIPPED_SEARCH = "skipped_search"
+CAUSE_TRUNCATED = "truncated"
+CAUSE_GROUNDING = "grounding"
 
 
 @dataclass
@@ -176,6 +273,20 @@ class _Run:
         return "".join(self.parts)
 
 
+def _log_model_call(attempt: str, stop_reason: str | None, usage: dict) -> None:
+    """One line per model call, so the output-token distribution (reasoning
+    included) can be compared with MODEL_MAX_TOKENS, and the input-token
+    growth with the conversation window."""
+    logger.info(json.dumps({
+        "event": "model_call",
+        "attempt": attempt,
+        "stop_reason": stop_reason,
+        "input_tokens": usage.get("inputTokens"),
+        "output_tokens": usage.get("outputTokens"),
+        "max_tokens": settings.model_max_tokens,
+    }))
+
+
 async def _run_agent(
     agent,
     prompt: str,
@@ -183,19 +294,39 @@ async def _run_agent(
     cancel_signal: threading.Event | None,
     progress: _Progress,
     run: _Run,
+    attempt: str,
 ) -> AsyncIterator[Status | Heartbeat]:
     """One agent invocation: collects the visible reply text (minus
     <thinking> blocks) in `run` and yields progress."""
 
     thinking = ThinkingFilter()
+    stop_reason = None
     try:
         async for event in agent.stream_async(
             prompt,
             invocation_state=invocation_state,
-            cancel_signal=cancel_signal
+            cancel_signal=cancel_signal,
+            limits={"turns": AGENT_MAX_TURNS},
         ):
             if not isinstance(event, dict):
                 continue
+
+            result = event.get("result")
+            if str(getattr(result, "stop_reason", "")).startswith("limit_"):
+                logger.warning(json.dumps({
+                    "event": "agent_limit_reached",
+                    "attempt": attempt,
+                    "stop_reason": result.stop_reason,
+                    "max_turns": AGENT_MAX_TURNS,
+                }))
+
+            # Raw model chunks: Bedrock sends messageStop, then the usage.
+            chunk = event.get("event")
+            if isinstance(chunk, dict):
+                if "messageStop" in chunk:
+                    stop_reason = chunk["messageStop"].get("stopReason")
+                elif "metadata" in chunk:
+                    _log_model_call(attempt, stop_reason, chunk["metadata"].get("usage") or {})
 
             phase = None
             if event.get("current_tool_use"):
@@ -212,6 +343,7 @@ async def _run_agent(
         # replaces or removes it.
         logger.warning(json.dumps({
             "event": "max_tokens_reached",
+            "attempt": attempt,
             "max_tokens": settings.model_max_tokens,
             "chars": len(run.text),
         }))
@@ -220,19 +352,60 @@ async def _run_agent(
     run.parts.append(thinking.flush())
 
 
-def _is_conversational(turn: SearchTurn) -> bool:
-    """True when the rewrite already finished and classified the prompt as
-    conversational (always the case for short-circuited greetings)."""
-    rewrite = turn.rewrite
-    if not rewrite.done() or rewrite.cancelled() or rewrite.exception() is not None:
+async def _wait_for_rewrite(turn: SearchTurn) -> RewrittenQuery | None:
+    """The rewriter's result for the turn, waiting for it (up to the rewriter
+    timeout) if it is still running. None if it failed, was cancelled or
+    timed out: the intent is then unknown and treated as needing a search."""
+
+    future = turn.rewrite
+    if not future.done():
+        await asyncio.wait(
+            [asyncio.wrap_future(future)],
+            timeout=settings.query_rewriter_timeout_seconds,
+        )
+    if not future.done() or future.cancelled() or future.exception() is not None:
+        return None
+    return future.result()
+
+
+def _ok_without_search(verdict: Verdict, conversational: bool) -> bool:
+    """Whether a reply written without a search may be delivered: a
+    clarifying question, or a conversational reply to a message classified
+    as conversational. Anything else (an answer, a no-documentation reply, a
+    reply labelled conversational for an SSO question) skipped the search."""
+
+    if verdict.rejected or verdict.replaced:
         return False
-    return rewrite.result().intent == CONVERSATIONAL
+    if verdict.response_type == "clarification":
+        return True
+    return conversational and verdict.response_type == "conversational"
 
 
-def _check(run: _Run, retrieved: list[dict], question: str, conversational: bool = False) -> Verdict:
+def _check(
+    run: _Run,
+    retrieved: list[dict],
+    question: str,
+    turn: SearchTurn,
+    conversational: bool,
+) -> tuple[Verdict, bool]:
+    """The verdict for one agent run, and whether it skipped a search the
+    turn needed (the verdict is then the no-documentation reply)."""
+
+    if turn.searched:
+        conversational = False
     if run.truncated:
-        return Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED, reasons=[TRUNCATED_REASON])
-    return verify(run.text, retrieved, question, conversational=conversational)
+        verdict = Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED, reasons=[TRUNCATED_REASON])
+    else:
+        verdict = verify(run.text, retrieved, question, conversational=conversational)
+
+    if turn.searched or _ok_without_search(verdict, conversational):
+        return verdict, False
+    return Verdict(
+        NO_DOCUMENTATION_RESPONSE,
+        NOT_SUPPORTED,
+        reasons=[SKIPPED_SEARCH_REASON, *verdict.reasons],
+        response_type=verdict.response_type,
+    ), True
 
 
 def _trace_attempt(attempt: str, prompt: str, run: _Run, retrieved: list[dict], verdict: Verdict) -> None:
@@ -256,13 +429,32 @@ def _trace_attempt(attempt: str, prompt: str, run: _Run, retrieved: list[dict], 
     )
 
 
+def _cause(verdict: Verdict) -> str:
+    """The main reason a reply was rejected: a skipped search, the
+    output-token limit, or the grounding checks."""
+    if SKIPPED_SEARCH_REASON in verdict.reasons:
+        return CAUSE_SKIPPED_SEARCH
+    if TRUNCATED_REASON in verdict.reasons:
+        return CAUSE_TRUNCATED
+    return CAUSE_GROUNDING
+
+
 def _log_rejection(verdict, retrieved: list[dict], attempt: str) -> None:
     logger.warning(json.dumps({
         "event": "answer_rejected",
         "attempt": attempt,
+        "cause": _cause(verdict),
         "reasons": verdict.reasons,
         "retrieved": len(retrieved),
     }))
+
+
+def _repair_prompt(cause: str, reasons: list[str]) -> str:
+    if cause == CAUSE_SKIPPED_SEARCH:
+        return search_request()
+    if cause == CAUSE_TRUNCATED:
+        return shorten_request()
+    return repair_request(reasons)
 
 
 class ChatService:
@@ -273,73 +465,127 @@ class ChatService:
         session_id: str,
         cancel_signal: threading.Event | None = None
     ) -> AsyncIterator[Status | Heartbeat | Answer]:
+        """One turn: progress (Status, and a Heartbeat whenever nothing else
+        was sent for HEARTBEAT_SECONDS), then exactly one Answer. Raises
+        TurnTimeout after TURN_TIMEOUT_SECONDS.
+
+        History is saved once, when the turn completes, with the delivered
+        reply; a turn that is cancelled (client disconnect), times out or
+        fails saves nothing."""
+
+        async for item in _with_heartbeats(
+            self._turn(question, session_id, cancel_signal),
+            settings.turn_timeout_seconds,
+        ):
+            yield item
+
+    async def _turn(
+        self,
+        question: str,
+        session_id: str,
+        cancel_signal: threading.Event | None,
+    ) -> AsyncIterator[Status | Answer]:
         """Runs the agent, buffering its reply (minus <thinking> blocks) so it
         can be checked against the retrieved documentation before anything
-        is shown. A reply that fails the checks or is cut off at the
-        output-token limit, when the search did return results, gets one
-        repair attempt: the agent is told why and rewrites it. Yields
-        progress, then exactly one Answer."""
+        is shown. Gets one repair attempt:
+
+        - a reply that fails the checks or is cut off at the output-token
+          limit, when the search did return results: the agent is told why
+          and rewrites it;
+        - a reply written without searching, when the turn needs a search
+          (the rewriter didn't classify it as conversational, or the reply
+          isn't conversational): the agent is told to search and answer.
+          Only clarifying questions may skip the search.
+
+        Yields progress, then exactly one Answer."""
 
         # Agent construction restores the session snapshot synchronously, so
         # keep that storage I/O off the event loop.
         agent = await asyncio.to_thread(create_agent, session_id)
+
+        if is_links_only(question):
+            # Nothing to search for yet: ask what they want to know, without
+            # any model call. Saved, so a follow-up can refer to the link.
+            logger.info(json.dumps({"event": "link_only_prompt"}))
+            agent.messages.append({"role": "user", "content": [{"text": question}]})
+            agent.messages.append({"role": "assistant", "content": [
+                {"text": f"{LINK_ONLY_RESPONSE}\n\n{CLARIFICATION_BLOCK}"}
+            ]})
+            await _persist(save_session(agent, session_id))
+            yield Answer(LINK_ONLY_RESPONSE, None, [])
+            return
         # The query rewriter runs while the agent makes its first model call;
         # the search tool waits for it only if the agent searches. History is
         # read before stream_async appends this turn.
+        history = recent_history(agent.messages, settings.query_rewriter_history_turns)
         turn = SearchTurn(
             prompt=question,
-            rewrite=query_rewriter.submit(
-                question,
-                recent_history(agent.messages, settings.query_rewriter_history_turns)
-            )
+            rewrite=query_rewriter.submit(question, history),
+            history=history,
         )
         retrieved: list[dict] = []
-        # The same state for a repair run: the tool answers ALREADY_SEARCHED,
-        # so the evidence for the second check is unchanged.
+        # The same state for a repair run: after a search the tool answers
+        # ALREADY_SEARCHED, so the evidence for the second check is unchanged.
         state = {CITATIONS_KEY: retrieved, SEARCH_TURN_KEY: turn}
         progress = _Progress()
         run = _Run()
 
         try:
-            async for item in _run_agent(agent, question, state, cancel_signal, progress, run):
+            async for item in _run_agent(agent, question, state, cancel_signal, progress, run, "first"):
                 yield item
+
+            conversational = False
+            if not turn.searched:
+                rewrite = await _wait_for_rewrite(turn)
+                conversational = rewrite is not None and rewrite.intent == CONVERSATIONAL
+            verdict, skipped = _check(run, retrieved, question, turn, conversational)
+            _trace_attempt("first", question, run, retrieved, verdict)
+            if skipped:
+                logger.warning(json.dumps({
+                    "event": "search_skipped_by_model",
+                    "rewriter_intent": CONVERSATIONAL if conversational else "sso_question_or_unknown",
+                    "response_type": verdict.response_type,
+                }))
+
+            feedback = None
+            if (
+                verdict.rejected
+                and (retrieved or skipped)
+                and settings.grounding_repair_enabled
+                and not (cancel_signal and cancel_signal.is_set())
+            ):
+                _log_rejection(verdict, retrieved, "first")
+                cause = _cause(verdict)
+                feedback = _repair_prompt(cause, verdict.reasons)
+                run = _Run()
+                async for item in _run_agent(agent, feedback, state, cancel_signal, progress, run, "repair"):
+                    yield item
+                verdict, _ = _check(run, retrieved, question, turn, conversational)
+                _trace_attempt("repair", feedback, run, retrieved, verdict)
+                drop_repair_exchange(agent, feedback)
+                logger.info(json.dumps({
+                    "event": "answer_repair",
+                    "kind": cause,
+                    "searched": turn.searched,
+                    "repaired": not verdict.replaced,
+                }))
         finally:
             # Drops the rewrite if it is still queued (e.g. client disconnected).
             turn.rewrite.cancel()
 
-        verdict = _check(run, retrieved, question, _is_conversational(turn))
-        _trace_attempt("first", question, run, retrieved, verdict)
-
-        feedback = None
-        if (
-            verdict.rejected
-            and retrieved
-            and settings.grounding_repair_enabled
-            and not (cancel_signal and cancel_signal.is_set())
-        ):
-            _log_rejection(verdict, retrieved, "first")
-            feedback = repair_request(verdict.reasons)
-            run = _Run()
-            async for item in _run_agent(agent, feedback, state, cancel_signal, progress, run):
-                yield item
-            verdict = _check(run, retrieved, question)
-            _trace_attempt("repair", feedback, run, retrieved, verdict)
-            drop_repair_exchange(agent, feedback)
-            logger.info(json.dumps({"event": "answer_repair", "repaired": not verdict.replaced}))
-
         if verdict.rejected:
             _log_rejection(verdict, retrieved, "repair" if feedback else "first")
 
+        # The only save of the turn (Strands doesn't save on its own; see
+        # create_agent), so stored history holds only the delivered reply.
         if verdict.replaced:
-            # Keep the delivered reply, not the rejected one, as context for
-            # the next turn.
-            await replace_last_answer(
+            await _persist(replace_last_answer(
                 agent,
                 session_id,
                 f"{NO_DOCUMENTATION_RESPONSE}\n\n{grounding_block(NOT_SUPPORTED)}"
-            )
-        elif feedback:
-            await save_session(agent, session_id)
+            ))
+        else:
+            await _persist(save_session(agent, session_id))
 
         yield Answer(verdict.text, verdict.status, verdict.citations)
 

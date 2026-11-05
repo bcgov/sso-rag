@@ -1,5 +1,6 @@
 import uuid
 from strands import Agent, ModelRetryStrategy
+from strands.agent.conversation_manager import SlidingWindowConversationManager
 from strands.models.bedrock import BedrockModel
 from strands.storage import S3Storage
 from strands.storage import LocalFileStorage
@@ -107,24 +108,70 @@ async def replace_last_answer(agent: Agent, session_id: str, text: str) -> None:
     await save_session(agent, session_id)
 
 
+def _has_tool_blocks(message: dict) -> bool:
+    return any(
+        isinstance(block, dict) and ("toolUse" in block or "toolResult" in block)
+        for block in message.get("content", [])
+    )
+
+
+def drop_tool_exchanges(messages: list[dict]) -> None:
+    """Removes earlier turns' tool calls and results in place, so restored
+    history is just the questions and the delivered answers.
+
+    Only the current turn's search results count as evidence, so older ones
+    are only token cost, and they tempt the model to answer from stale
+    results. The assistant message holding a tool call goes too: any text
+    in it is reasoning before the call. Messages left next to one of the
+    same role (an interrupted turn) are merged, as Bedrock expects the roles
+    to alternate, and the history must start with a user message."""
+
+    kept: list[dict] = []
+    for message in messages:
+        if _has_tool_blocks(message):
+            continue
+        if kept and kept[-1].get("role") == message.get("role"):
+            kept[-1] = {**kept[-1], "content": [*kept[-1]["content"], *message.get("content", [])]}
+            continue
+        kept.append(message)
+    # Bedrock expects the conversation to start with a user message.
+    while kept and kept[0].get("role") != "user":
+        kept.pop(0)
+    messages[:] = kept
+
+
 def create_agent(session_id: str) -> Agent:
     """A fresh agent per request, restored from the session's stored snapshot:
     Agent keeps its message history, so sharing one instance would leak
-    context between users."""
+    context between users.
 
-    return Agent(
+    History is capped by a sliding window instead of Strands' "auto" context
+    manager, which cut each search result down to a short preview before
+    the model read it and added a `retrieve_context` tool to grep the rest."""
+
+    agent = Agent(
         model=model,
         tools=[
             search_knowledge_base
         ],
         system_prompt=SYSTEM_PROMPT,
-        context_manager="auto",
+        context_manager=False,
+        conversation_manager=SlidingWindowConversationManager(
+            window_size=settings.conversation_window_messages,
+            should_truncate_results=True,
+        ),
         retry_strategy=ModelRetryStrategy(
             max_attempts=3,
             initial_delay=2,
             max_delay=60
         ),
-        session_manager=SnapshotSessionManager(session_id, storage=storage),
+        # Saved only explicitly, by ChatService once the turn's reply has
+        # passed the grounding checks: Strands' own save after each
+        # invocation would also store unverified replies and the partial
+        # turns of disconnected or failed requests.
+        session_manager=SnapshotSessionManager(session_id, storage=storage, save_latest_on="trigger"),
         # Output is streamed to the client; skip the default stdout printer.
         callback_handler=None,
     )
+    drop_tool_exchanges(agent.messages)
+    return agent

@@ -110,9 +110,13 @@ Document retrieval leverages:
 Each `search_knowledge_base` call:
 
 0. **Query rewriting** – waits for the turn's query rewriter result (started
-   when the request arrived, alongside the agent's first model call). A
-   conversational message returns `NO_SEARCH_NEEDED`. If the rewriter fails or
-   times out, the raw prompt is searched as the single query.
+   when the request arrived, alongside the agent's first model call). Only a
+   whole-message greeting matched by the regex returns `NO_SEARCH_NEEDED`; if
+   the rewriter classified the message as conversational but the agent calls
+   the tool anyway, the agent wins and the search runs. If the rewriter fails
+   or times out, the prompt is searched with up to two previous user messages
+   prepended (within 300 characters), so follow-ups such as "what about
+   prod?" keep their topic.
 1. **Acronym expansion** – queries using an acronym from `app/common/constants.py`
    (`BCSC`, `PKCE`, `M2M`, …) get its spelled-out form appended, so the
    embedding also matches the docs' wording. Only genuine abbreviations are
@@ -343,19 +347,22 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `AWS_REGION` | `ca-central-1` | Region for Bedrock calls |
 | `KNOWLEDGE_BASE_ID` | – (required) | Bedrock Knowledge Base to search |
 | `MODEL_ARN` | – | Foundation model the agent uses |
-| `MODEL_MAX_TOKENS` | `4096` | Output-token limit per agent model call; a reply cut off at it gets one repair attempt asking for a shorter answer |
+| `MODEL_MAX_TOKENS` | `4096` | Output-token limit per agent model call (reasoning models' reasoning tokens count towards it; see the `model_call` log lines before lowering it); a reply cut off at it gets one repair attempt asking for a shorter answer |
+| `MAX_PROMPT_TOKENS` | `200` | Longest accepted message, in tokens estimated at ~4 characters each (so ~800 characters). Longer or blank messages get a 422 with a readable `detail`; the UI reads the limit from `GET /chat/config` |
+| `TURN_TIMEOUT_SECONDS` | `240` | Wall-clock budget for one `/chat` turn; past it the turn is stopped and an in-band "took too long" error is sent. Keep it under API Gateway's 300s stream limit |
+| `CONVERSATION_WINDOW_MESSAGES` | `20` | Messages of history kept per conversation (sliding window). Earlier turns' search calls and results are dropped on restore, so this is about the last 10 questions and answers |
 | `RERANKER_MODEL_ARN` | unset | Bedrock reranker model; unset = order by vector score |
 | `NUMBER_OF_RESULTS` | `25` | Total candidates retrieved per search, split across queries (min 5 per query) |
 | `NUMBER_OF_RERANKED_RESULTS` | `6` | Results kept after reranking for a single-part question (+2 per extra part, max 12) |
 | `MIN_RERANK_SCORE` | `0.05` | Drop reranked results below this relevance score |
 | `SEARCH_TYPE` | `SEMANTIC` | Bedrock `overrideSearchType`; keep `SEMANTIC` on S3 Vectors |
 | `QUERY_REWRITER_MODEL_ID` | `meta.llama3-8b-instruct-v1:0` | Bedrock model the query rewriter calls (Converse API); enable it in Bedrock model access |
-| `QUERY_REWRITER_TIMEOUT_SECONDS` | `3` | Timeout per rewriter call; on timeout the search falls back to the raw prompt |
+| `QUERY_REWRITER_TIMEOUT_SECONDS` | `3` | Timeout per rewriter call; on timeout the search falls back to the prompt plus the previous user messages |
 | `QUERY_REWRITER_HISTORY_TURNS` | `3` | Conversation turns given to the rewriter to resolve follow-ups |
 | `QUERY_REWRITER_STEP_BACK_ENABLED` | `true` | Add a broader step-back query |
 | `QUERY_REWRITER_DECOMPOSITION_ENABLED` | `true` | Split multi-part questions into 2–4 sub-queries |
 | `QUERY_REWRITER_RETRY_ENABLED` | `true` | Reword queries that found nothing and search once more |
-| `GROUNDING_REPAIR_ENABLED` | `true` | Give a reply that fails the grounding checks one rewrite (from the same results) before falling back to the no-documentation reply |
+| `GROUNDING_REPAIR_ENABLED` | `true` | Give a reply that fails the grounding checks one rewrite (from the same results), or a reply written without a required search one chance to search, before falling back to the no-documentation reply |
 | `CORS_ORIGINS` | `["*"]` | Allowed origins for the UI (answers `OPTIONS` preflight). Cookies are only allowed cross-origin when this lists explicit origins, e.g. `["https://ui.example.gov.bc.ca"]` |
 | `AGENT_STORAGE_S3_BUCKET` | `sandbox-sso-rag-agent-context-store` | Bucket for conversation history when `ENVIRONMENT` is not `local` |
 | `SESSION_COOKIE_NAME` | `strands_session` | Name of the session cookie |
@@ -363,6 +370,15 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `SESSION_COOKIE_SECURE` | `true` | Send the cookie over HTTPS only; set `false` for plain-HTTP localhost |
 | `SESSION_RETENTION_DAYS` | `3` | Delete stored conversations with no activity for longer than this many days |
 | `SESSION_CLEANUP_INTERVAL_HOURS` | `24` | How often the API runs the session cleanup; `0` disables the in-process job |
+| `KEYCLOAK_ISSUER_URL` | – (required) | Keycloak realm URL, e.g. `https://<host>/auth/realms/<realm>`. Must be `https` and equal the tokens' `iss` exactly; signing keys are fetched from `<issuer>/protocol/openid-connect/certs` |
+| `KEYCLOAK_AUDIENCE` | – (required) | Value the tokens' `aud` claim must contain |
+| `KEYCLOAK_AUTHORIZED_PARTY` | – (required) | Client ID of the service account allowed to call the API; must equal the tokens' `azp` |
+| `AUTH_LOCAL_BYPASS` | `false` | Skip authentication. Only allowed with `ENVIRONMENT=local` (startup fails otherwise); the Keycloak settings may then be left unset |
+
+The API refuses to start if a `KEYCLOAK_*` setting is missing, unless
+`AUTH_LOCAL_BYPASS=true` with `ENVIRONMENT=local`. The cleanup job
+(`python -m app.jobs.cleanup_sessions`) doesn't serve requests and doesn't
+need them.
 
 ---
 
@@ -400,6 +416,69 @@ No credentials should ever be hardcoded.
 
 # Available Endpoints
 
+## Authentication
+
+Every endpoint except `GET /health` (and CORS `OPTIONS` preflight) requires a
+Keycloak access token from a **service account** (OAuth client-credentials
+grant), sent as `Authorization: Bearer <token>`. The API verifies the token
+locally (`app/services/authentication.py`):
+
+- **Signature**: RS256 only, with a key from the realm's JWKS
+  (`<KEYCLOAK_ISSUER_URL>/protocol/openid-connect/certs`). The algorithm is
+  fixed by the API, never taken from the token; key locations in the token
+  (`jku`, `x5u`) are ignored.
+- **`iss`** equals `KEYCLOAK_ISSUER_URL`; **`aud`** (string or list) contains
+  `KEYCLOAK_AUDIENCE`; **`azp`** equals `KEYCLOAK_AUTHORIZED_PARTY`;
+  **`exp`** is a number in the future (no leeway). All four are required.
+
+| Status | When |
+| --- | --- |
+| `401` + `WWW-Authenticate: Bearer` | No token, a non-Bearer scheme, or a token failing any check. `detail` is generic; the reason is logged as `{"event": "auth_rejected", "reason": …}` (tokens are never logged) |
+| `503` | The realm's signing keys can't be loaded (Keycloak unreachable and no unexpired cached keys) |
+
+Authentication runs before any work, so rejected requests reach neither
+Bedrock nor conversation storage and get no session cookie. The session
+cookie still only identifies a conversation; it does not authenticate.
+
+Signing keys are cached for 5 minutes per worker process. A token signed with
+an unknown key id triggers a refresh (key rotation), but the JWKS is fetched
+at most once every 30 seconds per worker (5-second timeout, redirects not
+followed), so a rotated key is accepted within about 30 seconds. Expired
+cached keys are never used.
+
+Getting a token and calling the API:
+
+```bash
+TOKEN=$(curl -s -X POST \
+  "$KEYCLOAK_ISSUER_URL/protocol/openid-connect/token" \
+  -d grant_type=client_credentials \
+  -d client_id="$CLIENT_ID" \
+  -d client_secret="$CLIENT_SECRET" | jq -r .access_token)
+
+# -c/-b keep the session cookie so follow-up questions share history.
+curl -N -c cookies.txt -b cookies.txt \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "How do I request an integration?"}' \
+  "$API_URL/chat"
+```
+
+Keycloak client setup: a confidential client with **service accounts
+enabled** and the standard (browser) and direct-access-grant flows disabled,
+plus an audience mapper that adds `KEYCLOAK_AUDIENCE` to its access tokens.
+Matching `azp` identifies the client but does not by itself prove the
+client-credentials grant was used, which is why user flows should be off on
+that client. Keep access tokens short-lived: the API verifies tokens offline,
+so a disabled client's unexpired tokens keep working until they expire.
+
+> **The browser UI is not supported with authentication on.** It doesn't send
+> a token (and must never hold a client secret), so its calls get `401`. Use
+> `AUTH_LOCAL_BYPASS` for local UI development; a deployed UI needs a separate
+> solution (e.g. user login or a server-side proxy).
+
+Authentication blocks anonymous use; it does not limit what a valid caller
+can do. Rate limits, quotas and spend controls are separate follow-ups.
+
 ## Health Check
 
 ```http
@@ -430,6 +509,20 @@ Request:
 }
 ```
 
+The prompt is trimmed. A blank prompt, or one over `MAX_PROMPT_TOKENS`
+(estimated at ~4 characters per token), is rejected with `422` and a
+user-facing `{"detail": "..."}`. A message that is only one or more links
+gets a fixed clarifying question (`LINK_ONLY_RESPONSE`) without any model
+call. Replies are always in English, whatever language the question is in;
+search queries are written in English too.
+
+```http
+GET /chat/config
+```
+
+Returns the limits the UI applies before sending:
+`{"max_prompt_tokens": 200, "max_prompt_chars": 800}`.
+
 The response is a `text/event-stream` of OpenAI-compatible
 `chat.completion.chunk` events, ending with `data: [DONE]`:
 
@@ -447,7 +540,9 @@ data: [DONE]
 
 - `status` chunks report progress while the answer is prepared: `searching`
   (a knowledge base search is running) and `writing` (the model is writing
-  the answer). `: keepalive` comments are sent every 10s of silence.
+  the answer). `: keepalive` comments are sent whenever nothing else was
+  sent for 10s, on a timer, so they also flow while a search runs or a
+  reasoning model hasn't produced its first token.
 - The answer is buffered and checked before it is sent (see
   [Grounding checks](#grounding-checks)), so it arrives as a single
   `content` chunk.
@@ -484,7 +579,21 @@ contacts) when:
   `https://<your-app-host>/callback` are ignored; the support contacts and
   example URLs on reserved or loopback hosts such as `example.com` and
   `localhost` are always allowed);
-- the grounding block is missing or malformed.
+- the grounding block is missing or malformed;
+- the agent replied without searching although the turn needs a search (see
+  below).
+
+**Skipped search.** A turn needs a search unless the query rewriter
+classified it as conversational (or the greeting regex matched); a failed or
+timed-out rewrite counts as needing one. If the agent replies without calling
+`search_knowledge_base` on such a turn, only a clarifying question is
+delivered; anything else (an answer, a reply labelled `conversational`, a
+missing grounding block, even the no-documentation text) is rejected. On a
+conversational turn, an `answer` written without a search is treated the same
+way. The agent then gets one repair turn (`search_request()`) telling it to
+search, even if the user asked it not to, and answer from the results; if it
+still doesn't search, the user gets `NO_DOCUMENTATION_RESPONSE`. Logged as
+`search_skipped_by_model`.
 
 **Repair attempt.** If the reply is rejected but the search did return
 results, the agent gets one chance to fix it. It is sent the rejection
@@ -496,10 +605,15 @@ if it also fails does the user get `NO_DOCUMENTATION_RESPONSE`. Set
 
 A reply cut off at the output-token limit (`MODEL_MAX_TOKENS`, Strands'
 `MaxTokensReachedException`) is handled the same way: the agent is asked for
-a shorter, complete reply, and the partial message is removed from history.
+a shorter, complete reply (`shorten_request()`), and the partial message is
+removed from history. It is logged as `max_tokens_reached` (with `attempt`).
 
 Rejections are logged as `answer_rejected` (with `attempt`: `first` or
-`repair`) and repairs as `answer_repair`. The stored conversation keeps only
+`repair`, and `cause`: `grounding`, `truncated` or `skipped_search`) and
+repairs as `answer_repair` (`kind`: the same causes). Every model call logs a
+`model_call` line with `stop_reason`, `input_tokens`, `output_tokens` and
+`max_tokens`, to compare real output lengths (reasoning included) with the
+limit and to watch input growth. The stored conversation keeps only
 the delivered reply: the rejected reply and the repair request are removed.
 
 The checks are exact string matches, not a semantic judge: plain-prose
@@ -507,7 +621,19 @@ statements aren't verified. The prompt asks the model to write every role,
 claim, configuration value and endpoint as `code`, so those are checked.
 
 If the agent fails after streaming has started, a `data: {"error": "…"}`
-event is sent before `[DONE]`.
+event is sent before `[DONE]`. The same happens, with a "took too long"
+message, when a turn runs past `TURN_TIMEOUT_SECONDS` (default 240s, under
+API Gateway's 300s stream limit). Each agent run is also capped at 4 loop
+iterations (`limits={"turns": 4}`), and knowledge base calls time out after
+5s (connect) / 20s (read). The UI treats a stream that ends without
+`[DONE]` as an error rather than an empty answer.
+
+History is saved once per turn, explicitly, after the grounding checks
+(`SnapshotSessionManager(save_latest_on="trigger")` turns off Strands' own
+saves). A turn that fails, times out or is abandoned by the client (the
+agent loop is cancelled on disconnect) saves nothing, so stored history only
+holds delivered replies. A model call already in flight at a disconnect may
+still run to completion in Strands' worker thread.
 
 Conversation history is kept per session. The response sets an `HttpOnly`
 `strands_session` cookie (name, lifetime and `Secure` flag via
@@ -540,8 +666,9 @@ cookie so the request can be retried. The UI's **Delete history** button calls
 it after a confirmation dialog.
 
 Conversations are kept in the agent storage (`.agent-store/` locally, the
-`AGENT_STORAGE_S3_BUCKET` bucket otherwise) under `session/<id>/` and
-`context/<id>/`. A background job in the API deletes every conversation whose
+`AGENT_STORAGE_S3_BUCKET` bucket otherwise) under `session/<id>/` (and
+`context/<id>/` for conversations stored before the context manager was
+removed). A background job in the API deletes every conversation whose
 newest object is older than `SESSION_RETENTION_DAYS` (default 3), running
 shortly after startup and then every `SESSION_CLEANUP_INTERVAL_HOURS`
 (default 24). Each API worker runs it; deletes are idempotent. Only ids in
@@ -590,11 +717,26 @@ def create_agent(session_id: str) -> Agent:
             search_knowledge_base
         ],
         system_prompt=SYSTEM_PROMPT,
-        context_manager="auto",
+        context_manager=False,
+        conversation_manager=SlidingWindowConversationManager(
+            window_size=settings.conversation_window_messages,
+            should_truncate_results=True,
+        ),
         session_manager=SnapshotSessionManager(session_id, storage=storage),
         callback_handler=None,
     )
+    drop_tool_exchanges(agent.messages)
+    return agent
 ```
+
+**Conversation history.** A sliding window keeps the last
+`CONVERSATION_WINDOW_MESSAGES` messages (trimmed after each request). When a
+conversation is restored, `drop_tool_exchanges()` removes earlier turns'
+search calls and results: only the current turn's results count as evidence,
+so older ones would only add tokens and tempt the model to reuse them. Strands'
+`context_manager="auto"` is deliberately not used: it cut every search result
+over ~1,500 tokens down to a ~750-token preview before the model read it, and
+added a `retrieve_context` tool the model then called to grep the rest.
 
 The `/chat` route is async and runs `agent.stream_async()`, buffering the
 reply for the grounding checks. If the client disconnects, the agent
@@ -687,14 +829,17 @@ The tool takes no model-facing arguments: the agent only decides *whether* to
 search. `tool_context` is injected by Strands. `ChatService` passes
 `invocation_state={"search_turn": SearchTurn(...), "citations": [...]}`:
 
-- `search_turn` holds the turn's raw prompt, the query rewriter's future, and
+- `search_turn` holds the turn's raw prompt, the query rewriter's future, the
+  rewriter's history (for the fallback query), whether a search ran, and
   the first call's result (repeated calls in a turn get `ALREADY_SEARCHED`
   instead of the same results again).
 - each returned result's title, source URL, score and text is appended to
   `citations`; `/chat` builds its citations and grounding checks from it.
 
-Returns `NO_SEARCH_NEEDED: ...` for conversational messages and
-`NO_MATCH: ...` when nothing relevant was found.
+Returns `NO_SEARCH_NEEDED: ...` for greetings matched by the regex and
+`NO_MATCH: ...` when nothing relevant was found. A message the rewriter
+classified as conversational is still searched when the agent calls the tool
+(logged as `search_intent_override`).
 
 Each call logs one JSON line with the rewritten question, queries and their
 origins (`rewrite`, `sub`, `step_back`, `retry`), which queries were
@@ -733,6 +878,20 @@ With `ENVIRONMENT=local`, each chat turn prints `TRACE` blocks to stderr
 
 These include user prompts and document text, so they never run outside
 `ENVIRONMENT=local`. Set `DEBUG_TRACE=false` to turn them off locally.
+
+Authentication: either set the `KEYCLOAK_*` variables and send a token (see
+[Authentication](#authentication)), or skip it locally (for example, for the UI
+dev server):
+
+```bash
+ENVIRONMENT=local AUTH_LOCAL_BYPASS=true SESSION_COOKIE_SECURE=false \
+  uv run uvicorn main:app --reload --port 8000
+```
+
+The API logs a warning at startup while the bypass is on.
+
+Swagger and Redoc are only served with `ENVIRONMENT=local` (not when
+deployed). Use **Authorize** in Swagger to paste a token.
 
 Swagger:
 
@@ -883,6 +1042,9 @@ variables. See `terraform/terraform.tfvars.example`.
 | `number_of_reranked_results` | `6` | → `NUMBER_OF_RERANKED_RESULTS` |
 | `min_rerank_score` | `0.05` | → `MIN_RERANK_SCORE` |
 | `search_type` | `SEMANTIC` | → `SEARCH_TYPE` |
+| `keycloak_issuer_url` | – (required) | → `KEYCLOAK_ISSUER_URL` (CI: `Development` environment variable `KEYCLOAK_ISSUER_URL`) |
+| `keycloak_audience` | – (required) | → `KEYCLOAK_AUDIENCE` (CI: `Development` environment variable `KEYCLOAK_AUDIENCE`) |
+| `keycloak_authorized_party` | – (required) | → `KEYCLOAK_AUTHORIZED_PARTY` (CI: `Development` environment variable `KEYCLOAK_AUTHORIZED_PARTY`) |
 | `api_cpu` / `api_memory` | `512` / `1024` | API task size |
 | `ui_cpu` / `ui_memory` | `256` / `512` | UI task size |
 | `api_desired_count` / `ui_desired_count` | `1` / `1` | Task counts (ignored after creation, so manual scaling sticks) |
@@ -937,7 +1099,9 @@ Logs: CloudWatch `/ecs/sso-rag/api` (app and tool logs) and
 - **Streaming limits.** A streamed response can last up to 5 minutes here
   (`timeout_milliseconds = 300000`; the API Gateway maximum is 15). The idle gap
   between chunks is limited by the ALB idle timeout (120s) and API Gateway's
-  5-minute idle timeout for Regional endpoints.
+  5-minute idle timeout for Regional endpoints. Keepalives every 10s cover the
+  idle limit, and `TURN_TIMEOUT_SECONDS` (240s) ends a turn before the
+  5-minute cap.
 - **No CORS at API Gateway.** `OPTIONS` requests are proxied to FastAPI's
   `CORSMiddleware` (configured via `CORS_ORIGINS`).
 - **Account-wide setting.** REST API access logs need a CloudWatch role in the
@@ -946,6 +1110,14 @@ Logs: CloudWatch `/ecs/sso-rag/api` (app and tool logs) and
 ---
 
 # Security Considerations
+
+## API Authentication
+
+All endpoints except `/health` require a Keycloak service-account access
+token; see [Authentication](#authentication). The API task needs outbound
+HTTPS access to the Keycloak host to fetch the realm's signing keys.
+`AUTH_LOCAL_BYPASS` is rejected outside `ENVIRONMENT=local` and is never set
+by Terraform.
 
 ## IAM
 
