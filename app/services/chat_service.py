@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import threading
@@ -15,10 +16,11 @@ from app.agents.rag_agent import (
     save_session,
 )
 from app.common.config import settings
-from app.common.constants import NO_DOCUMENTATION_RESPONSE
+from app.common.constants import LINK_ONLY_RESPONSE, NO_DOCUMENTATION_RESPONSE
 from app.common.trace import preview, trace
 from app.prompts.system_prompt import repair_request, search_request, shorten_request
 from app.services.grounding import NOT_SUPPORTED, Verdict, grounding_block, verify
+from app.services.prompt_policy import is_links_only
 from app.services.query_rewriter import (
     CONVERSATIONAL,
     RewrittenQuery,
@@ -160,22 +162,90 @@ class Answer:
 HEARTBEAT_SECONDS = 10
 
 
+# Agent loop iterations (one model call plus any tool run) allowed per agent
+# run: a run needs at most two (search, then answer); the rest is slack for
+# a repeated tool call. Bounds a model that keeps calling the tool.
+AGENT_MAX_TURNS = 4
+
+CLARIFICATION_BLOCK = '<grounding>{"response_type": "clarification", "citations": []}</grounding>'
+
+
+class TurnTimeout(TimeoutError):
+    """The turn ran past TURN_TIMEOUT_SECONDS and was stopped."""
+
+
 class _Progress:
-    """Status/heartbeat bookkeeping shared by the agent runs of one turn."""
+    """Status bookkeeping shared by the agent runs of one turn."""
 
     def __init__(self) -> None:
         self.status: str | None = None
-        self.last_sent = time.monotonic()
 
-    def update(self, phase: str | None) -> Status | Heartbeat | None:
+    def update(self, phase: str | None) -> Status | None:
         if phase and phase != self.status:
             self.status = phase
-            self.last_sent = time.monotonic()
             return Status(phase)
-        if time.monotonic() - self.last_sent >= HEARTBEAT_SECONDS:
-            self.last_sent = time.monotonic()
-            return Heartbeat()
         return None
+
+
+@dataclass(frozen=True)
+class _Failed:
+    error: Exception
+
+
+_END = object()
+
+
+async def _with_heartbeats(source: AsyncIterator, timeout: float) -> AsyncIterator:
+    """Passes on `source`'s items, adding a Heartbeat whenever nothing was
+    sent for HEARTBEAT_SECONDS (also while the agent is silent: a tool run,
+    a reasoning model before its first token, a storage call), and raising
+    TurnTimeout once `timeout` seconds have passed.
+
+    `source` runs in a task of its own, so it keeps one context throughout;
+    it is cancelled when this generator stops early (client disconnect or
+    timeout)."""
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pump() -> None:
+        try:
+            async with contextlib.aclosing(source) as items:
+                async for item in items:
+                    queue.put_nowait(item)
+        except Exception as e:
+            queue.put_nowait(_Failed(e))
+        else:
+            queue.put_nowait(_END)
+
+    task = asyncio.create_task(pump())
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TurnTimeout(f"turn took longer than {timeout:g}s")
+            try:
+                item = await asyncio.wait_for(queue.get(), min(HEARTBEAT_SECONDS, left))
+            except TimeoutError:
+                if time.monotonic() >= deadline:
+                    raise TurnTimeout(f"turn took longer than {timeout:g}s")
+                yield Heartbeat()
+                continue
+            if item is _END:
+                return
+            if isinstance(item, _Failed):
+                raise item.error
+            yield item
+    finally:
+        # Not awaited: on a client disconnect this generator is itself being
+        # cancelled. The turn saves nothing unless it completed.
+        task.cancel()
+
+
+async def _persist(save) -> None:
+    """Runs a save to completion even if the client disconnects meanwhile,
+    so a finished turn is never half-saved."""
+    await asyncio.shield(asyncio.ensure_future(save))
 
 
 TRUNCATED_REASON = (
@@ -235,10 +305,20 @@ async def _run_agent(
         async for event in agent.stream_async(
             prompt,
             invocation_state=invocation_state,
-            cancel_signal=cancel_signal
+            cancel_signal=cancel_signal,
+            limits={"turns": AGENT_MAX_TURNS},
         ):
             if not isinstance(event, dict):
                 continue
+
+            result = event.get("result")
+            if str(getattr(result, "stop_reason", "")).startswith("limit_"):
+                logger.warning(json.dumps({
+                    "event": "agent_limit_reached",
+                    "attempt": attempt,
+                    "stop_reason": result.stop_reason,
+                    "max_turns": AGENT_MAX_TURNS,
+                }))
 
             # Raw model chunks: Bedrock sends messageStop, then the usage.
             chunk = event.get("event")
@@ -385,6 +465,26 @@ class ChatService:
         session_id: str,
         cancel_signal: threading.Event | None = None
     ) -> AsyncIterator[Status | Heartbeat | Answer]:
+        """One turn: progress (Status, and a Heartbeat whenever nothing else
+        was sent for HEARTBEAT_SECONDS), then exactly one Answer. Raises
+        TurnTimeout after TURN_TIMEOUT_SECONDS.
+
+        History is saved once, when the turn completes, with the delivered
+        reply; a turn that is cancelled (client disconnect), times out or
+        fails saves nothing."""
+
+        async for item in _with_heartbeats(
+            self._turn(question, session_id, cancel_signal),
+            settings.turn_timeout_seconds,
+        ):
+            yield item
+
+    async def _turn(
+        self,
+        question: str,
+        session_id: str,
+        cancel_signal: threading.Event | None,
+    ) -> AsyncIterator[Status | Answer]:
         """Runs the agent, buffering its reply (minus <thinking> blocks) so it
         can be checked against the retrieved documentation before anything
         is shown. Gets one repair attempt:
@@ -402,6 +502,18 @@ class ChatService:
         # Agent construction restores the session snapshot synchronously, so
         # keep that storage I/O off the event loop.
         agent = await asyncio.to_thread(create_agent, session_id)
+
+        if is_links_only(question):
+            # Nothing to search for yet: ask what they want to know, without
+            # any model call. Saved, so a follow-up can refer to the link.
+            logger.info(json.dumps({"event": "link_only_prompt"}))
+            agent.messages.append({"role": "user", "content": [{"text": question}]})
+            agent.messages.append({"role": "assistant", "content": [
+                {"text": f"{LINK_ONLY_RESPONSE}\n\n{CLARIFICATION_BLOCK}"}
+            ]})
+            await _persist(save_session(agent, session_id))
+            yield Answer(LINK_ONLY_RESPONSE, None, [])
+            return
         # The query rewriter runs while the agent makes its first model call;
         # the search tool waits for it only if the agent searches. History is
         # read before stream_async appends this turn.
@@ -464,16 +576,16 @@ class ChatService:
         if verdict.rejected:
             _log_rejection(verdict, retrieved, "repair" if feedback else "first")
 
+        # The only save of the turn (Strands doesn't save on its own; see
+        # create_agent), so stored history holds only the delivered reply.
         if verdict.replaced:
-            # Keep the delivered reply, not the rejected one, as context for
-            # the next turn.
-            await replace_last_answer(
+            await _persist(replace_last_answer(
                 agent,
                 session_id,
                 f"{NO_DOCUMENTATION_RESPONSE}\n\n{grounding_block(NOT_SUPPORTED)}"
-            )
-        elif feedback:
-            await save_session(agent, session_id)
+            ))
+        else:
+            await _persist(save_session(agent, session_id))
 
         yield Answer(verdict.text, verdict.status, verdict.citations)
 

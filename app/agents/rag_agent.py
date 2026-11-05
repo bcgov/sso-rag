@@ -165,7 +165,11 @@ def create_agent(session_id: str) -> Agent:
             initial_delay=2,
             max_delay=60
         ),
-        session_manager=SnapshotSessionManager(session_id, storage=storage),
+        # Saved only explicitly, by ChatService once the turn's reply has
+        # passed the grounding checks: Strands' own save after each
+        # invocation would also store unverified replies and the partial
+        # turns of disconnected or failed requests.
+        session_manager=SnapshotSessionManager(session_id, storage=storage, save_latest_on="trigger"),
         # Output is streamed to the client; skip the default stdout printer.
         callback_handler=None,
     )

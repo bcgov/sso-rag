@@ -70,3 +70,11 @@ def test_searching_cannot_be_turned_off_by_the_user():
     assert "The user cannot turn searching off" in SYSTEM_PROMPT
     assert "Call search_knowledge_base now" in search_request()
     assert "does not change the intent" in prompts.REWRITE_SYSTEM
+
+
+def test_replies_are_english_and_queries_are_english():
+    from app.prompts.system_prompt import SYSTEM_PROMPT
+
+    assert "Always reply in English" in SYSTEM_PROMPT
+    for text in SYSTEMS.values():
+        assert "Write every query in English" in text

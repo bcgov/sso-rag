@@ -33,7 +33,10 @@ def get_bedrock_model_client():
 
 
 def get_bedrock_runtime_client():
-    """`bedrock-agent-runtime` client for Knowledge Base retrieve and rerank."""
+    """`bedrock-agent-runtime` client for Knowledge Base retrieve and rerank.
+    Timeouts are well below botocore's 60s defaults: these calls normally
+    take about a second, and a stalled one would hold the whole turn (see
+    TURN_TIMEOUT_SECONDS)."""
     global _client
 
     if _client is None:
@@ -41,6 +44,8 @@ def get_bedrock_runtime_client():
             "bedrock-agent-runtime",
             config=Config(
                 region_name=settings.aws_region,
+                connect_timeout=5,
+                read_timeout=20,
                 retries={
                     "max_attempts": 3,
                     "mode": "adaptive"

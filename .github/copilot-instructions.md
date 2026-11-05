@@ -40,6 +40,7 @@ app/
   schemas/                       Pydantic request/response models
   services/chat_service.py       ChatService.stream() (buffer → verify), ThinkingFilter
   services/grounding.py          grounding block parsing + rejection checks (verify)
+  services/prompt_policy.py      blank / too-long rejection (MAX_PROMPT_TOKENS), link-only detection
   services/session_cleanup.py    deletes sessions inactive > SESSION_RETENTION_DAYS; delete_browser_history()
   tools/knowledge_base_tool.py   @tool search_knowledge_base
 ui/src/
@@ -60,16 +61,23 @@ Python packages under `app/` are **namespace packages** (no `__init__.py`); don'
 
 1. UI sends `POST /chat` with `{"prompt": "..."}`, header `X-Tab-Id: <uuid>`, and
    the `strands_session` cookie (same-origin, sent automatically).
-2. `chat.py` reads the cookie; if missing or not `session_<uuid>`, it creates a new
+2. `chat.py` checks the prompt (`prompt_policy.check_prompt`: trimmed; blank or
+   over `MAX_PROMPT_TOKENS` → 422 with a user-facing `detail`) and reads the
+   cookie; if missing or not `session_<uuid>`, it creates a new
    id. Storage key = `conversation_id(session_id, tab_id)` →
    `session_<uuid>__<tab uuid>` (or just the session id if no valid tab id).
-3. `ChatService.stream()` builds a fresh agent with `create_agent(conversation_id)`
-   (in a thread — restoring the snapshot does blocking I/O) and iterates
-   `agent.stream_async(question, invocation_state={"citations": [...]}, cancel_signal=...)`.
+3. `ChatService.stream()` runs the turn (`_turn()`) in one background task:
+   it adds timer-based heartbeats and raises `TurnTimeout` after
+   `TURN_TIMEOUT_SECONDS` (sent in-band as a "took too long" error). The turn
+   builds a fresh agent with `create_agent(conversation_id)` (in a thread —
+   restoring the snapshot does blocking I/O); a links-only message gets
+   `LINK_ONLY_RESPONSE` without model calls; otherwise it iterates
+   `agent.stream_async(question, invocation_state={"citations": [...]}, cancel_signal=..., limits={"turns": 4})`.
 4. Text deltas pass through `ThinkingFilter` (removes `<thinking>…</thinking>`,
    including tags split across chunks) and are **buffered**, not streamed;
    `status` events (`searching` on a tool call, `writing` once text arrives) and
-   `: keepalive` comments (every 10s idle) are sent meanwhile.
+   `: keepalive` comments (whenever nothing was sent for 10s, on a timer) are
+   sent meanwhile.
 5. `grounding.verify(reply, retrieved, prompt)` strips the model's
    `<grounding>{"response_type", "grounding_status", "citations"}</grounding>`
    block and returns the text to send. It is replaced with
@@ -125,7 +133,11 @@ from "Delete history" after a confirmation dialog.
 
 - One `Agent` per request — **never share an Agent across requests/users**; it
   holds message history. The `BedrockModel` is module-level and shared.
-- History persists via `SnapshotSessionManager(conversation_id, storage=storage)`.
+- History persists via `SnapshotSessionManager(conversation_id, storage=storage,
+  save_latest_on="trigger")`: Strands never saves on its own; `ChatService`
+  saves once, after the grounding checks, when the turn completes
+  (`save_session` / `replace_last_answer`, shielded from cancellation). A
+  failed, timed-out or disconnected turn saves nothing — keep it that way.
   `storage` is `LocalFileStorage("./.agent-store/")` when `ENVIRONMENT=local`,
   otherwise `S3Storage(AGENT_STORAGE_S3_BUCKET)`. Keys live under
   `session/<id>/…` (snapshots); `context/<id>/…` only holds the stash of
@@ -184,6 +196,8 @@ it elsewhere.
 | `MODEL_ARN` | – | model id = last path segment |
 | `MODEL_MAX_TOKENS` | `4096` | per model call, reasoning tokens included; check `model_call` logs before lowering |
 | `CONVERSATION_WINDOW_MESSAGES` | `20` | sliding-window history cap (messages) |
+| `MAX_PROMPT_TOKENS` | `200` | estimated at ~4 chars/token; 422 with a user-facing `detail` over it |
+| `TURN_TIMEOUT_SECONDS` | `240` | in-band "took too long" error; keep under API Gateway's 300s |
 | `RERANKER_MODEL_ARN` | unset | unset → no rerank |
 | `NUMBER_OF_RESULTS` | `25` | candidates per tool call |
 | `NUMBER_OF_RERANKED_RESULTS` | `6` | kept after rerank (+2 per extra query, max 12) |

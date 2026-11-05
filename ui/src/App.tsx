@@ -11,6 +11,7 @@ export default function App() {
     messages,
     isStreaming,
     error,
+    maxPromptChars,
     sendMessage,
     clearMessages,
     deleteHistory,
@@ -131,7 +132,7 @@ export default function App() {
       </main>
 
       {/* Input */}
-      <ChatInput onSend={sendMessage} disabled={isStreaming} />
+      <ChatInput onSend={sendMessage} disabled={isStreaming} maxChars={maxPromptChars} />
     </div>
   );
 }

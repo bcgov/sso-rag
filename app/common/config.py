@@ -64,6 +64,25 @@ class Settings(BaseSettings):
         alias="CONVERSATION_WINDOW_MESSAGES"
     )
 
+    # Longest accepted user message, in tokens estimated at ~4 characters
+    # each (the deployed model's tokenizer isn't available locally), so the
+    # default allows about 800 characters. The UI reads it from
+    # GET /chat/config.
+    max_prompt_tokens: int = Field(
+        default=200,
+        gt=0,
+        alias="MAX_PROMPT_TOKENS"
+    )
+
+    # Wall-clock budget for one /chat turn. Keep it under the API Gateway
+    # integration timeout (300s) so the user gets an in-band "took too long"
+    # error rather than a cut-off stream.
+    turn_timeout_seconds: float = Field(
+        default=240,
+        gt=0,
+        alias="TURN_TIMEOUT_SECONDS"
+    )
+
     reranker_model_arn: str | None = Field(
         default=None,
         alias="RERANKER_MODEL_ARN"

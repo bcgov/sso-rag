@@ -49,7 +49,7 @@ class FakeAgent:
             {"role": "assistant", "content": [{"text": "earlier answer"}]},
         ]
 
-    async def stream_async(self, prompt, invocation_state, cancel_signal):
+    async def stream_async(self, prompt, invocation_state, cancel_signal, **kwargs):
         self.prompts.append(prompt)
         self.messages.append({"role": "user", "content": [{"text": prompt}]})
         turn = invocation_state[SEARCH_TURN_KEY]
@@ -144,9 +144,9 @@ def test_failed_repair_falls_back_to_no_documentation(harness):
 
 def test_no_repair_when_search_found_nothing(harness):
     class NoMatchAgent(FakeAgent):
-        async def stream_async(self, prompt, invocation_state, cancel_signal):
+        async def stream_async(self, prompt, invocation_state, cancel_signal, **kwargs):
             invocation_state[SEARCH_TURN_KEY].searched = True  # searched, NO_MATCH
-            async for event in super().stream_async(prompt, invocation_state, cancel_signal):
+            async for event in super().stream_async(prompt, invocation_state, cancel_signal, **kwargs):
                 yield event
 
     agent = NoMatchAgent([HALLUCINATED], search=False)
@@ -175,7 +175,8 @@ def test_grounded_first_reply_needs_no_repair(harness):
     answer, calls = harness(agent)
     assert len(agent.prompts) == 1
     assert answer.grounding_status == "SUPPORTED"
-    assert calls["saved"] == 0 and calls["replaced"] == []
+    # Every completed turn is saved exactly once (Strands doesn't save itself).
+    assert calls["saved"] == 1 and calls["replaced"] == []
 
 
 def test_max_tokens_gets_a_shorter_repair(harness):
@@ -217,7 +218,7 @@ def test_clarifying_question_is_delivered_without_repair(harness):
     answer, calls = harness(agent)
     assert len(agent.prompts) == 1
     assert answer.text == question and answer.grounding_status is None and answer.citations == []
-    assert calls["replaced"] == [] and calls["saved"] == 0
+    assert calls["replaced"] == [] and calls["saved"] == 1
 
 
 def test_greeting_without_grounding_block_is_delivered(harness, monkeypatch):
@@ -411,8 +412,8 @@ def test_truncation_repair_asks_for_a_shorter_reply_not_a_grounding_fix(harness)
 
 def test_each_model_call_logs_its_token_usage(harness, caplog):
     class UsageAgent(FakeAgent):
-        async def stream_async(self, prompt, invocation_state, cancel_signal):
-            async for event in super().stream_async(prompt, invocation_state, cancel_signal):
+        async def stream_async(self, prompt, invocation_state, cancel_signal, **kwargs):
+            async for event in super().stream_async(prompt, invocation_state, cancel_signal, **kwargs):
                 yield event
             yield {"event": {"messageStop": {"stopReason": "end_turn"}}}
             yield {"event": {"metadata": {"usage": {"inputTokens": 5000, "outputTokens": 640}}}}
@@ -423,3 +424,117 @@ def test_each_model_call_logs_its_token_usage(harness, caplog):
         "event": "model_call", "attempt": "first", "stop_reason": "end_turn",
         "input_tokens": 5000, "output_tokens": 640, "max_tokens": cs.settings.model_max_tokens,
     }]
+
+
+# --- heartbeats and the turn deadline (D3) -----------------------------------
+
+class SilentAgent(FakeAgent):
+    """Produces no events for `silence` seconds before replying, like a
+    long tool call or a reasoning model before its first token."""
+
+    def __init__(self, replies, silence, **kwargs):
+        super().__init__(replies, **kwargs)
+        self.silence = silence
+
+    async def stream_async(self, prompt, invocation_state, cancel_signal, **kwargs):
+        await asyncio.sleep(self.silence)
+        async for event in super().stream_async(prompt, invocation_state, cancel_signal, **kwargs):
+            yield event
+
+
+def _timed_items(monkeypatch, agent, question="how do I request an integration?"):
+    import time as _time
+
+    monkeypatch.setattr(cs, "create_agent", lambda session_id: agent)
+
+    async def collect():
+        out, start = [], _time.monotonic()
+        async for item in cs.chat_service.stream(question, "session_x"):
+            out.append((_time.monotonic() - start, item))
+        return out
+
+    return asyncio.run(collect())
+
+
+def test_heartbeats_flow_while_the_agent_is_silent(harness, monkeypatch):
+    monkeypatch.setattr(cs, "HEARTBEAT_SECONDS", 0.05)
+    items = _timed_items(monkeypatch, SilentAgent([REPAIRED], silence=0.5))
+
+    heartbeats = [t for t, item in items if isinstance(item, cs.Heartbeat)]
+    assert heartbeats and heartbeats[0] < 0.2
+    gaps = [b - a for a, b in zip([0.0] + [t for t, _ in items], [t for t, _ in items])]
+    assert max(gaps) < 0.2
+    assert isinstance(items[-1][1], Answer)
+
+
+def test_turn_stops_at_the_deadline(harness, monkeypatch):
+    monkeypatch.setattr(cs.settings, "turn_timeout_seconds", 0.3, raising=False)
+    agent = SilentAgent([REPAIRED], silence=30)
+
+    async def run():
+        monkeypatch.setattr(cs, "create_agent", lambda session_id: agent)
+        return [item async for item in cs.chat_service.stream("q", "session_x")]
+
+    async def bounded():
+        return await asyncio.wait_for(run(), 3)
+
+    with pytest.raises(TimeoutError) as raised:
+        asyncio.run(bounded())
+    # The service's own deadline fired, not the test's 3s guard.
+    assert type(raised.value).__name__ == "TurnTimeout"
+
+
+# --- persistence, link-only messages and limits (D1/D2) ----------------------
+
+def test_failed_turn_saves_nothing(harness, monkeypatch):
+    class FailingAgent(FakeAgent):
+        async def stream_async(self, prompt, invocation_state, cancel_signal, **kwargs):
+            yield {"current_tool_use": {"name": "search_knowledge_base"}}
+            raise RuntimeError("ThrottlingException")
+
+    saves = []
+
+    async def save_session(agent, session_id):
+        saves.append(session_id)
+
+    monkeypatch.setattr(cs, "save_session", save_session)
+    monkeypatch.setattr(cs, "create_agent", lambda session_id: FailingAgent([]))
+
+    async def run():
+        return [item async for item in cs.chat_service.stream("q", "session_x")]
+
+    with pytest.raises(RuntimeError, match="Throttling"):
+        asyncio.run(run())
+    assert saves == []
+
+
+def test_link_only_message_gets_the_fixed_reply_without_model_calls(harness, monkeypatch):
+    from app.common.constants import LINK_ONLY_RESPONSE
+
+    def no_rewrite(prompt, history):
+        raise AssertionError("no rewriter call expected")
+
+    monkeypatch.setattr(cs.query_rewriter, "submit", no_rewrite)
+    agent = FakeAgent([])
+    answer, calls = harness(agent, question="https://sso-requests.apps.gold.devops.gov.bc.ca/")
+
+    assert agent.prompts == []
+    assert answer.text == LINK_ONLY_RESPONSE and answer.grounding_status is None and answer.citations == []
+    assert calls["saved"] == 1
+    texts = _texts(agent)
+    assert texts[-2] == "https://sso-requests.apps.gold.devops.gov.bc.ca/"
+    assert texts[-1].startswith(LINK_ONLY_RESPONSE) and '"clarification"' in texts[-1]
+
+
+def test_agent_runs_are_limited_in_turns(harness):
+    class RecordingAgent(FakeAgent):
+        limits = []
+
+        async def stream_async(self, prompt, invocation_state, cancel_signal, **kwargs):
+            self.limits.append(kwargs.get("limits"))
+            async for event in super().stream_async(prompt, invocation_state, cancel_signal, **kwargs):
+                yield event
+
+    agent = RecordingAgent([HALLUCINATED, REPAIRED])
+    harness(agent)
+    assert agent.limits == [{"turns": cs.AGENT_MAX_TURNS}] * 2

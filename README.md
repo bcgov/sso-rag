@@ -348,6 +348,8 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `KNOWLEDGE_BASE_ID` | – (required) | Bedrock Knowledge Base to search |
 | `MODEL_ARN` | – | Foundation model the agent uses |
 | `MODEL_MAX_TOKENS` | `4096` | Output-token limit per agent model call (reasoning models' reasoning tokens count towards it; see the `model_call` log lines before lowering it); a reply cut off at it gets one repair attempt asking for a shorter answer |
+| `MAX_PROMPT_TOKENS` | `200` | Longest accepted message, in tokens estimated at ~4 characters each (so ~800 characters). Longer or blank messages get a 422 with a readable `detail`; the UI reads the limit from `GET /chat/config` |
+| `TURN_TIMEOUT_SECONDS` | `240` | Wall-clock budget for one `/chat` turn; past it the turn is stopped and an in-band "took too long" error is sent. Keep it under API Gateway's 300s stream limit |
 | `CONVERSATION_WINDOW_MESSAGES` | `20` | Messages of history kept per conversation (sliding window). Earlier turns' search calls and results are dropped on restore, so this is about the last 10 questions and answers |
 | `RERANKER_MODEL_ARN` | unset | Bedrock reranker model; unset = order by vector score |
 | `NUMBER_OF_RESULTS` | `25` | Total candidates retrieved per search, split across queries (min 5 per query) |
@@ -435,6 +437,20 @@ Request:
 }
 ```
 
+The prompt is trimmed. A blank prompt, or one over `MAX_PROMPT_TOKENS`
+(estimated at ~4 characters per token), is rejected with `422` and a
+user-facing `{"detail": "..."}`. A message that is only one or more links
+gets a fixed clarifying question (`LINK_ONLY_RESPONSE`) without any model
+call. Replies are always in English, whatever language the question is in;
+search queries are written in English too.
+
+```http
+GET /chat/config
+```
+
+Returns the limits the UI applies before sending:
+`{"max_prompt_tokens": 200, "max_prompt_chars": 800}`.
+
 The response is a `text/event-stream` of OpenAI-compatible
 `chat.completion.chunk` events, ending with `data: [DONE]`:
 
@@ -452,7 +468,9 @@ data: [DONE]
 
 - `status` chunks report progress while the answer is prepared: `searching`
   (a knowledge base search is running) and `writing` (the model is writing
-  the answer). `: keepalive` comments are sent every 10s of silence.
+  the answer). `: keepalive` comments are sent whenever nothing else was
+  sent for 10s, on a timer, so they also flow while a search runs or a
+  reasoning model hasn't produced its first token.
 - The answer is buffered and checked before it is sent (see
   [Grounding checks](#grounding-checks)), so it arrives as a single
   `content` chunk.
@@ -531,7 +549,19 @@ statements aren't verified. The prompt asks the model to write every role,
 claim, configuration value and endpoint as `code`, so those are checked.
 
 If the agent fails after streaming has started, a `data: {"error": "…"}`
-event is sent before `[DONE]`.
+event is sent before `[DONE]`. The same happens, with a "took too long"
+message, when a turn runs past `TURN_TIMEOUT_SECONDS` (default 240s, under
+API Gateway's 300s stream limit). Each agent run is also capped at 4 loop
+iterations (`limits={"turns": 4}`), and knowledge base calls time out after
+5s (connect) / 20s (read). The UI treats a stream that ends without
+`[DONE]` as an error rather than an empty answer.
+
+History is saved once per turn, explicitly, after the grounding checks
+(`SnapshotSessionManager(save_latest_on="trigger")` turns off Strands' own
+saves). A turn that fails, times out or is abandoned by the client (the
+agent loop is cancelled on disconnect) saves nothing, so stored history only
+holds delivered replies. A model call already in flight at a disconnect may
+still run to completion in Strands' worker thread.
 
 Conversation history is kept per session. The response sets an `HttpOnly`
 `strands_session` cookie (name, lifetime and `Secure` flag via
@@ -980,7 +1010,9 @@ Logs: CloudWatch `/ecs/sso-rag/api` (app and tool logs) and
 - **Streaming limits.** A streamed response can last up to 5 minutes here
   (`timeout_milliseconds = 300000`; the API Gateway maximum is 15). The idle gap
   between chunks is limited by the ALB idle timeout (120s) and API Gateway's
-  5-minute idle timeout for Regional endpoints.
+  5-minute idle timeout for Regional endpoints. Keepalives every 10s cover the
+  idle limit, and `TURN_TIMEOUT_SECONDS` (240s) ends a turn before the
+  5-minute cap.
 - **No CORS at API Gateway.** `OPTIONS` requests are proxied to FastAPI's
   `CORSMiddleware` (configured via `CORS_ORIGINS`).
 - **Account-wide setting.** REST API access logs need a CloudWatch role in the

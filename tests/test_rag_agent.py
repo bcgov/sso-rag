@@ -1,6 +1,8 @@
 """The real create_agent() with a fake model and local storage: what the model
 is actually sent, across turns restored from snapshots like production."""
 
+import asyncio
+
 import pytest
 from strands import tool
 from strands.models.model import Model
@@ -73,8 +75,11 @@ def fake(monkeypatch, tmp_path):
 
 
 def _turn(question: str):
-    # One request: a fresh agent restored from the stored snapshot.
-    rag_agent.create_agent("session_test")(question)
+    # One request: a fresh agent restored from the stored snapshot, saved
+    # explicitly at the end as ChatService does.
+    agent = rag_agent.create_agent("session_test")
+    agent(question)
+    asyncio.run(rag_agent.save_session(agent, "session_test"))
 
 
 def test_model_sees_the_whole_search_result_this_turn(fake):
