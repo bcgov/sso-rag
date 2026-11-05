@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     # a conversation is restored, so 20 is about the last 10 questions and
     # answers.
     conversation_window_messages: int = Field(
-        default=20,
+        default=10,
         ge=2,
         alias="CONVERSATION_WINDOW_MESSAGES"
     )
