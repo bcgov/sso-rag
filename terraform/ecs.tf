@@ -79,6 +79,10 @@ resource "aws_ecs_task_definition" "api" {
         { name = "QUERY_REWRITER_STEP_BACK_ENABLED", value = var.query_rewriter_step_back_enabled },
         { name = "QUERY_REWRITER_DECOMPOSITION_ENABLED", value = var.query_rewriter_decomposition_enabled },
         { name = "QUERY_REWRITER_RETRY_ENABLED", value = var.query_rewriter_retry_enabled },
+        # AUTH_LOCAL_BYPASS is never set here: deployed tasks always authenticate.
+        { name = "KEYCLOAK_ISSUER_URL", value = var.keycloak_issuer_url },
+        { name = "KEYCLOAK_AUDIENCE", value = var.keycloak_audience },
+        { name = "KEYCLOAK_AUTHORIZED_PARTY", value = var.keycloak_authorized_party },
       ]
 
       logConfiguration = {

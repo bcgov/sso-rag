@@ -5,7 +5,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agents.rag_agent import (
@@ -15,6 +15,10 @@ from app.agents.rag_agent import (
     is_valid_session_id,
     is_valid_tab_id,
     new_session_id
+)
+
+from app.api.dependencies.authentication import (
+    require_service_account
 )
 
 from app.common.config import settings
@@ -43,7 +47,13 @@ from app.services.session_cleanup import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(
+    dependencies=[Depends(require_service_account)],
+    responses={
+        401: {"description": "Missing or invalid Keycloak access token"},
+        503: {"description": "The realm's signing keys could not be loaded"}
+    }
+)
 
 DONE = "data: [DONE]\n\n"
 

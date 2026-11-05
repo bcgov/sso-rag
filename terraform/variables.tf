@@ -139,6 +139,38 @@ variable "search_type" {
   default     = "SEMANTIC"
 }
 
+# ── Authentication (Keycloak service accounts) ───────────────────────────────
+
+variable "keycloak_issuer_url" {
+  description = "Keycloak realm URL that issues the API's access tokens; must equal the tokens' iss claim (e.g. https://<host>/auth/realms/<realm>)"
+  type        = string
+
+  validation {
+    condition     = can(regex("^https://[^/?#@]+/([^?#]*/)?realms/[^/?#]+/?$", var.keycloak_issuer_url))
+    error_message = "keycloak_issuer_url must be an https Keycloak realm URL without credentials, query or fragment."
+  }
+}
+
+variable "keycloak_audience" {
+  description = "Audience the API requires in the tokens' aud claim"
+  type        = string
+
+  validation {
+    condition     = trimspace(var.keycloak_audience) != ""
+    error_message = "keycloak_audience must not be empty."
+  }
+}
+
+variable "keycloak_authorized_party" {
+  description = "Client ID of the service account allowed to call the API; must equal the tokens' azp claim"
+  type        = string
+
+  validation {
+    condition     = trimspace(var.keycloak_authorized_party) != ""
+    error_message = "keycloak_authorized_party must not be empty."
+  }
+}
+
 # ── ECS ───────────────────────────────────────────────────────────────────────
 
 variable "api_image" {

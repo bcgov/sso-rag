@@ -370,6 +370,15 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `SESSION_COOKIE_SECURE` | `true` | Send the cookie over HTTPS only; set `false` for plain-HTTP localhost |
 | `SESSION_RETENTION_DAYS` | `3` | Delete stored conversations with no activity for longer than this many days |
 | `SESSION_CLEANUP_INTERVAL_HOURS` | `24` | How often the API runs the session cleanup; `0` disables the in-process job |
+| `KEYCLOAK_ISSUER_URL` | – (required) | Keycloak realm URL, e.g. `https://<host>/auth/realms/<realm>`. Must be `https` and equal the tokens' `iss` exactly; signing keys are fetched from `<issuer>/protocol/openid-connect/certs` |
+| `KEYCLOAK_AUDIENCE` | – (required) | Value the tokens' `aud` claim must contain |
+| `KEYCLOAK_AUTHORIZED_PARTY` | – (required) | Client ID of the service account allowed to call the API; must equal the tokens' `azp` |
+| `AUTH_LOCAL_BYPASS` | `false` | Skip authentication. Only allowed with `ENVIRONMENT=local` (startup fails otherwise); the Keycloak settings may then be left unset |
+
+The API refuses to start if a `KEYCLOAK_*` setting is missing, unless
+`AUTH_LOCAL_BYPASS=true` with `ENVIRONMENT=local`. The cleanup job
+(`python -m app.jobs.cleanup_sessions`) doesn't serve requests and doesn't
+need them.
 
 ---
 
@@ -406,6 +415,69 @@ No credentials should ever be hardcoded.
 ---
 
 # Available Endpoints
+
+## Authentication
+
+Every endpoint except `GET /health` (and CORS `OPTIONS` preflight) requires a
+Keycloak access token from a **service account** (OAuth client-credentials
+grant), sent as `Authorization: Bearer <token>`. The API verifies the token
+locally (`app/services/authentication.py`):
+
+- **Signature**: RS256 only, with a key from the realm's JWKS
+  (`<KEYCLOAK_ISSUER_URL>/protocol/openid-connect/certs`). The algorithm is
+  fixed by the API, never taken from the token; key locations in the token
+  (`jku`, `x5u`) are ignored.
+- **`iss`** equals `KEYCLOAK_ISSUER_URL`; **`aud`** (string or list) contains
+  `KEYCLOAK_AUDIENCE`; **`azp`** equals `KEYCLOAK_AUTHORIZED_PARTY`;
+  **`exp`** is a number in the future (no leeway). All four are required.
+
+| Status | When |
+| --- | --- |
+| `401` + `WWW-Authenticate: Bearer` | No token, a non-Bearer scheme, or a token failing any check. `detail` is generic; the reason is logged as `{"event": "auth_rejected", "reason": …}` (tokens are never logged) |
+| `503` | The realm's signing keys can't be loaded (Keycloak unreachable and no unexpired cached keys) |
+
+Authentication runs before any work, so rejected requests reach neither
+Bedrock nor conversation storage and get no session cookie. The session
+cookie still only identifies a conversation; it does not authenticate.
+
+Signing keys are cached for 5 minutes per worker process. A token signed with
+an unknown key id triggers a refresh (key rotation), but the JWKS is fetched
+at most once every 30 seconds per worker (5-second timeout, redirects not
+followed), so a rotated key is accepted within about 30 seconds. Expired
+cached keys are never used.
+
+Getting a token and calling the API:
+
+```bash
+TOKEN=$(curl -s -X POST \
+  "$KEYCLOAK_ISSUER_URL/protocol/openid-connect/token" \
+  -d grant_type=client_credentials \
+  -d client_id="$CLIENT_ID" \
+  -d client_secret="$CLIENT_SECRET" | jq -r .access_token)
+
+# -c/-b keep the session cookie so follow-up questions share history.
+curl -N -c cookies.txt -b cookies.txt \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "How do I request an integration?"}' \
+  "$API_URL/chat"
+```
+
+Keycloak client setup: a confidential client with **service accounts
+enabled** and the standard (browser) and direct-access-grant flows disabled,
+plus an audience mapper that adds `KEYCLOAK_AUDIENCE` to its access tokens.
+Matching `azp` identifies the client but does not by itself prove the
+client-credentials grant was used, which is why user flows should be off on
+that client. Keep access tokens short-lived: the API verifies tokens offline,
+so a disabled client's unexpired tokens keep working until they expire.
+
+> **The browser UI is not supported with authentication on.** It doesn't send
+> a token (and must never hold a client secret), so its calls get `401`. Use
+> `AUTH_LOCAL_BYPASS` for local UI development; a deployed UI needs a separate
+> solution (e.g. user login or a server-side proxy).
+
+Authentication blocks anonymous use; it does not limit what a valid caller
+can do. Rate limits, quotas and spend controls are separate follow-ups.
 
 ## Health Check
 
@@ -807,6 +879,20 @@ With `ENVIRONMENT=local`, each chat turn prints `TRACE` blocks to stderr
 These include user prompts and document text, so they never run outside
 `ENVIRONMENT=local`. Set `DEBUG_TRACE=false` to turn them off locally.
 
+Authentication: either set the `KEYCLOAK_*` variables and send a token (see
+[Authentication](#authentication)), or skip it locally (for example, for the UI
+dev server):
+
+```bash
+ENVIRONMENT=local AUTH_LOCAL_BYPASS=true SESSION_COOKIE_SECURE=false \
+  uv run uvicorn main:app --reload --port 8000
+```
+
+The API logs a warning at startup while the bypass is on.
+
+Swagger and Redoc are only served with `ENVIRONMENT=local` (not when
+deployed). Use **Authorize** in Swagger to paste a token.
+
 Swagger:
 
 ```text
@@ -956,6 +1042,9 @@ variables. See `terraform/terraform.tfvars.example`.
 | `number_of_reranked_results` | `6` | → `NUMBER_OF_RERANKED_RESULTS` |
 | `min_rerank_score` | `0.05` | → `MIN_RERANK_SCORE` |
 | `search_type` | `SEMANTIC` | → `SEARCH_TYPE` |
+| `keycloak_issuer_url` | – (required) | → `KEYCLOAK_ISSUER_URL` (CI: `Development` environment variable `KEYCLOAK_ISSUER_URL`) |
+| `keycloak_audience` | – (required) | → `KEYCLOAK_AUDIENCE` (CI: `Development` environment variable `KEYCLOAK_AUDIENCE`) |
+| `keycloak_authorized_party` | – (required) | → `KEYCLOAK_AUTHORIZED_PARTY` (CI: `Development` environment variable `KEYCLOAK_AUTHORIZED_PARTY`) |
 | `api_cpu` / `api_memory` | `512` / `1024` | API task size |
 | `ui_cpu` / `ui_memory` | `256` / `512` | UI task size |
 | `api_desired_count` / `ui_desired_count` | `1` / `1` | Task counts (ignored after creation, so manual scaling sticks) |
@@ -1021,6 +1110,14 @@ Logs: CloudWatch `/ecs/sso-rag/api` (app and tool logs) and
 ---
 
 # Security Considerations
+
+## API Authentication
+
+All endpoints except `/health` require a Keycloak service-account access
+token; see [Authentication](#authentication). The API task needs outbound
+HTTPS access to the Keycloak host to fetch the realm's signing keys.
+`AUTH_LOCAL_BYPASS` is rejected outside `ENVIRONMENT=local` and is never set
+by Terraform.
 
 ## IAM
 

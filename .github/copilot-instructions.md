@@ -23,9 +23,10 @@ Ignore the `legacy/` folder; it is not part of the application.
 ## Repository layout
 
 ```text
-main.py                          FastAPI app: CORS middleware, lifespan (session cleanup loop), routers
+main.py                          FastAPI app: CORS middleware, lifespan (session cleanup loop), routers; auth config check; docs only when local
 app/
   agents/rag_agent.py            BedrockModel, agent storage, create_agent(), session-id helpers, delete_session()
+  api/dependencies/authentication.py  require_service_account: Bearer token → 401/503, local bypass
   api/routes/chat.py             POST /chat (SSE stream), DELETE /chat (reset), DELETE /chat/history; session cookie + X-Tab-Id
   api/routes/documents.py        GET /documents/search — raw single-query KB retrieval (debugging)
   api/routes/health.py           GET /health
@@ -39,6 +40,7 @@ app/
   retrieval/models.py            RetrievedChunk
   schemas/                       Pydantic request/response models
   services/chat_service.py       ChatService.stream() (buffer → verify), ThinkingFilter
+  services/authentication.py     Keycloak JWT verification (RS256, iss/aud/azp/exp), JwksCache
   services/grounding.py          grounding block parsing + rejection checks (verify)
   services/prompt_policy.py      blank / too-long rejection (MAX_PROMPT_TOKENS), link-only detection
   services/session_cleanup.py    deletes sessions inactive > SESSION_RETENTION_DAYS; delete_browser_history()
@@ -129,6 +131,25 @@ On a partial failure: 500 `{"detail"}` and the cookie is kept for a retry. The
 ALB listener rule must route `/chat/*` to the API for this path. The UI calls it
 from "Delete history" after a confirmation dialog.
 
+## Authentication
+
+- Chat and document routers have a router-level
+  `Depends(require_service_account)`; only `/health` and CORS preflight are
+  public. New routers serving data or calling Bedrock must add it too.
+- Callers send `Authorization: Bearer <Keycloak service-account token>`.
+  `TokenVerifier` checks the RS256 signature (key from the trusted issuer's
+  JWKS only; algorithm fixed, never from the token), `iss`, `aud`, `azp` and
+  `exp` (all required, no leeway). Don't add claim requirements without being asked.
+- Failures are 401 (generic `detail`, reason code logged as `auth_rejected`,
+  never the token) or 503 when signing keys can't be loaded. They happen before
+  streaming starts. The dependency is sync so JWKS fetches run in the threadpool.
+- JWKS cache: 300s TTL per worker, refetch at most every 30s, 5s timeout, no
+  redirects, never uses expired keys.
+- `AUTH_LOCAL_BYPASS=true` is only accepted with `ENVIRONMENT=local`. The
+  browser UI sends no token, so it only works against a bypassed local API.
+- Tests: `tests/conftest.py` sets fake `KEYCLOAK_*` values; route tests override
+  `require_service_account`; `tests/test_authentication.py` signs real tokens.
+
 ## Sessions and storage
 
 - One `Agent` per request — **never share an Agent across requests/users**; it
@@ -210,6 +231,10 @@ it elsewhere.
 | `SESSION_COOKIE_SECURE` | `true` | |
 | `SESSION_RETENTION_DAYS` | `3` | must be > 0 |
 | `SESSION_CLEANUP_INTERVAL_HOURS` | `24` | `0` disables in-process cleanup |
+| `KEYCLOAK_ISSUER_URL` | required | https realm URL; equals token `iss` |
+| `KEYCLOAK_AUDIENCE` | required | must be in token `aud` |
+| `KEYCLOAK_AUTHORIZED_PARTY` | required | equals token `azp` |
+| `AUTH_LOCAL_BYPASS` | `false` | only with `ENVIRONMENT=local`; then `KEYCLOAK_*` may be unset |
 
 Read settings via `from app.common.config import settings`; never `os.environ`
 directly. Secrets never go in source or images — `.env` is local only and is
@@ -243,7 +268,8 @@ excluded by `.dockerignore`.
 - **New request header or HTTP method from the UI:** CORS in `main.py`
   (`terraform/apigateway.tf` needs no change — the REST API proxies `OPTIONS` to FastAPI).
 - **New env var:** `config.py`, the README env table, and the API task
-  `environment` list in `terraform/ecs.tf` if it must differ from the default.
+  `environment` list in `terraform/ecs.tf` if it must differ from the default
+  (required ones also need a `TF_VAR_*` in the workflow).
 - **New AWS call:** API task role in `terraform/iam.tf`.
 - **Stream format change:** `chat.py`, `ui/src/types.ts`, `ui/src/hooks/useChat.ts`, README.
 
@@ -252,8 +278,9 @@ excluded by `.dockerignore`.
 ```bash
 # API (from repo root)
 uv sync
-uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000   # docs at /docs
+uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000   # docs at /docs (ENVIRONMENT=local only)
 ENVIRONMENT=local SESSION_COOKIE_SECURE=false ...             # local storage + plain-HTTP cookie
+ENVIRONMENT=local AUTH_LOCAL_BYPASS=true ...                  # no token needed (e.g. for the UI)
 uv run python -m app.jobs.cleanup_sessions --days 3
 
 # UI (from ui/) — dev server on :5173 proxies /chat and /health to :8000

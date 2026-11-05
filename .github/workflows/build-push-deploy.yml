@@ -21,6 +21,14 @@ env:
 
 jobs:
   terraform:
+    # Environment-scoped variables (vars.*) only resolve in a job that
+    # references the environment.
+    environment: Development
+    env:
+      # Keycloak service-account authentication (environment variables, not secrets).
+      TF_VAR_keycloak_issuer_url: ${{ vars.KEYCLOAK_ISSUER_URL }}
+      TF_VAR_keycloak_audience: ${{ vars.KEYCLOAK_AUDIENCE }}
+      TF_VAR_keycloak_authorized_party: ${{ vars.KEYCLOAK_AUTHORIZED_PARTY }}
     permissions:
       contents: read
       id-token: write

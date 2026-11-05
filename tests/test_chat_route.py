@@ -4,8 +4,19 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+from app.api.dependencies.authentication import require_service_account
 from app.api.routes import chat as chat_route
+from app.services.authentication import ServiceAccount
 from app.services.chat_service import Answer
+
+
+@pytest.fixture(autouse=True)
+def authenticated():
+    # These tests cover chat behaviour; authentication is tested in
+    # tests/test_authentication.py.
+    main.app.dependency_overrides[require_service_account] = lambda: ServiceAccount("test-client")
+    yield
+    main.app.dependency_overrides.pop(require_service_account, None)
 
 
 @pytest.fixture

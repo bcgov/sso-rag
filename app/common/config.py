@@ -1,4 +1,6 @@
-from pydantic import Field
+from urllib.parse import urlsplit
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
 
@@ -183,6 +185,88 @@ class Settings(BaseSettings):
         ge=0,
         alias="SESSION_CLEANUP_INTERVAL_HOURS"
     )
+
+    # Keycloak service-account authentication (app/services/authentication.py).
+    # Callers send `Authorization: Bearer <access token>`; the token's
+    # signature (RS256, realm JWKS), iss, aud, azp and exp are verified.
+    keycloak_issuer_url: str | None = Field(
+        default=None,
+        alias="KEYCLOAK_ISSUER_URL"
+    )
+
+    keycloak_audience: str | None = Field(
+        default=None,
+        alias="KEYCLOAK_AUDIENCE"
+    )
+
+    keycloak_authorized_party: str | None = Field(
+        default=None,
+        alias="KEYCLOAK_AUTHORIZED_PARTY"
+    )
+
+    # Skips authentication. Only allowed with ENVIRONMENT=local.
+    auth_local_bypass: bool = Field(
+        default=False,
+        alias="AUTH_LOCAL_BYPASS"
+    )
+
+    @property
+    def is_local(self) -> bool:
+        return self.environment == "local"
+
+    @property
+    def auth_bypassed(self) -> bool:
+        return self.auth_local_bypass and self.is_local
+
+    @model_validator(mode="after")
+    def _check_auth(self) -> "Settings":
+        if self.auth_local_bypass and not self.is_local:
+            raise ValueError("AUTH_LOCAL_BYPASS is only allowed when ENVIRONMENT=local")
+
+        for name in ("keycloak_issuer_url", "keycloak_audience", "keycloak_authorized_party"):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, value.strip() or None)
+
+        if self.keycloak_issuer_url:
+            self.keycloak_issuer_url = _validated_issuer(self.keycloak_issuer_url)
+
+        return self
+
+    def require_auth_config(self) -> None:
+        """Called at API startup; CLI jobs that serve no requests skip it."""
+        if self.auth_bypassed:
+            return
+        missing = [
+            name for name, value in (
+                ("KEYCLOAK_ISSUER_URL", self.keycloak_issuer_url),
+                ("KEYCLOAK_AUDIENCE", self.keycloak_audience),
+                ("KEYCLOAK_AUTHORIZED_PARTY", self.keycloak_authorized_party),
+            )
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(
+                f"{', '.join(missing)} must be set (or AUTH_LOCAL_BYPASS=true with ENVIRONMENT=local)"
+            )
+
+
+def _validated_issuer(url: str) -> str:
+    parts = urlsplit(url)
+    if (
+        parts.scheme != "https"
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+        or "/realms/" not in parts.path
+    ):
+        raise ValueError(
+            "KEYCLOAK_ISSUER_URL must be an https realm URL such as "
+            "https://<host>/auth/realms/<realm>, without credentials, query or fragment"
+        )
+    return url.rstrip("/")
 
 
 settings = Settings()
