@@ -170,3 +170,34 @@ def test_no_tool_messages_is_unchanged():
     messages = [_msg("user", Q), _msg("assistant", ANSWER)]
     rag_agent.drop_tool_exchanges(messages)
     assert messages == [_msg("user", Q), _msg("assistant", ANSWER)]
+
+
+# --- system prompt and prompt caching -----------------------------------------
+
+CACHE_POINT = {"cachePoint": {"type": "default"}}
+
+
+@pytest.mark.parametrize("model_arn, enabled, cached", [
+    ("arn:aws:bedrock:ca-central-1:123:inference-profile/global.amazon.nova-2-lite-v1:0", True, True),
+    ("arn:aws:bedrock:ca-central-1:123:inference-profile/global.anthropic.claude-sonnet-4-5", True, True),
+    ("arn:aws:bedrock:ca-central-1:123:inference-profile/global.moonshotai.kimi-k3", True, False),
+    ("arn:aws:bedrock:ca-central-1:123:inference-profile/global.amazon.nova-2-lite-v1:0", False, False),
+])
+def test_system_prompt_gets_a_cache_point_only_for_caching_models(monkeypatch, model_arn, enabled, cached):
+    monkeypatch.setattr(rag_agent.settings, "model_prompt_caching", enabled)
+    blocks = rag_agent.system_prompt_blocks(model_arn)
+    assert blocks[0] == {"text": rag_agent.SYSTEM_PROMPT}
+    assert blocks[1:] == ([CACHE_POINT] if cached else [])
+
+
+def test_restored_session_uses_the_current_system_prompt(fake, monkeypatch):
+    _turn("question 0")
+    # A conversation stored with an older prompt...
+    agent = rag_agent.create_agent("session_test")
+    agent.system_prompt = "an outdated prompt"
+    asyncio.run(rag_agent.save_session(agent, "session_test"))
+    # ...is restored with the current one.
+    monkeypatch.setattr(rag_agent, "system_prompt_blocks", lambda: [{"text": "current"}, CACHE_POINT])
+    agent = rag_agent.create_agent("session_test")
+    assert agent.system_prompt_content == [{"text": "current"}, CACHE_POINT]
+    assert agent.messages  # history is still restored

@@ -23,6 +23,8 @@ from app.services.grounding import NOT_SUPPORTED, Verdict, grounding_block, veri
 from app.services.prompt_policy import is_links_only
 from app.services.query_rewriter import (
     CONVERSATIONAL,
+    GENERAL_AUTH,
+    NO_SEARCH_INTENTS,
     RewrittenQuery,
     query_rewriter,
     recent_history,
@@ -275,14 +277,17 @@ class _Run:
 
 def _log_model_call(attempt: str, stop_reason: str | None, usage: dict) -> None:
     """One line per model call, so the output-token distribution (reasoning
-    included) can be compared with MODEL_MAX_TOKENS, and the input-token
-    growth with the conversation window."""
+    included) can be compared with MODEL_MAX_TOKENS, the input-token growth
+    with the conversation window, and prompt-cache hits with
+    MODEL_PROMPT_CACHING."""
     logger.info(json.dumps({
         "event": "model_call",
         "attempt": attempt,
         "stop_reason": stop_reason,
         "input_tokens": usage.get("inputTokens"),
         "output_tokens": usage.get("outputTokens"),
+        "cache_read_input_tokens": usage.get("cacheReadInputTokens"),
+        "cache_write_input_tokens": usage.get("cacheWriteInputTokens"),
         "max_tokens": settings.model_max_tokens,
     }))
 
@@ -396,7 +401,8 @@ def _check(
     if run.truncated:
         verdict = Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED, reasons=[TRUNCATED_REASON])
     else:
-        verdict = verify(run.text, retrieved, question, conversational=conversational)
+        verdict = verify(run.text, retrieved, question, conversational=conversational,
+                         general=turn.intent == GENERAL_AUTH)
 
     if turn.searched or _ok_without_search(verdict, conversational):
         return verdict, False
@@ -536,8 +542,9 @@ class ChatService:
 
             conversational = False
             if not turn.searched:
+                # Off-topic messages, like greetings, need no search.
                 rewrite = await _wait_for_rewrite(turn)
-                conversational = rewrite is not None and rewrite.intent == CONVERSATIONAL
+                conversational = rewrite is not None and rewrite.intent in NO_SEARCH_INTENTS
             verdict, skipped = _check(run, retrieved, question, turn, conversational)
             _trace_attempt("first", question, run, retrieved, verdict)
             if skipped:

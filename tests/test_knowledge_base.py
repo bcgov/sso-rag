@@ -31,13 +31,21 @@ def test_multi_search_dedupes_caps_and_tags(monkeypatch, no_reranker):
 
     hits, stats = kb.multi_search("question", queries)
 
-    assert stats["queries"] == ["aaaa one", "q000 sub", "q001 sub", "q002 sub", "q003 sub", "bbbb back"]
-    assert stats["origins"] == ["rewrite", "sub", "sub", "sub", "sub", "step_back"]
-    assert all(n == max(5, 25 // 6) for _, n in seen)
-    # 5 facets (rewrite + 4 sub; step-back excluded) -> 6 + 2*4 = 14, capped at 12.
+    # Deduped, then capped at MAX_QUERIES (7); "cccc extra" is the 7th.
+    assert stats["queries"] == ["aaaa one", "q000 sub", "q001 sub", "q002 sub", "q003 sub", "bbbb back", "cccc extra"]
+    assert stats["origins"] == ["rewrite", "sub", "sub", "sub", "sub", "step_back", "sub"]
+    assert all(n == max(5, 25 // 7) for _, n in seen)
+    # 6 facets (rewrite + 5 sub; step-back excluded) -> 6 + 2*5 = 16, capped at 12.
     assert len(hits) <= kb.MAX_RERANKED
     shared = next(h for h in hits if h.text == "shared")
-    assert len(shared.metadata["_queries"]) == 6
+    assert len(shared.metadata["_queries"]) == 7
+
+
+def test_multi_search_caps_queries(monkeypatch):
+    monkeypatch.setattr(kb, "retrieve", lambda query, max_results=None: [])
+    queries = [SearchQuery(text=f"query {i}", origin="sub") for i in range(10)]
+    _, stats = kb.multi_search("question", queries)
+    assert len(stats["queries"]) == kb.MAX_QUERIES == 7
 
 
 def test_multi_search_step_back_does_not_widen(monkeypatch, no_reranker):

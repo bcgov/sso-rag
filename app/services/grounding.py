@@ -26,11 +26,18 @@ The checks are deterministic string matches against the retrieved text. They
 can't judge plain-prose claims; the prompt therefore asks for every role,
 claim, configuration key/value and endpoint to be written as `code`, which
 is checked.
+
+General answers ("response_type": "general") are allowed only when the
+question was classified general_auth (OAuth, OIDC, SAML, Entra ID, Okta,
+Auth0, Clerk, Keycloak in general): the explanation comes from the model's
+own knowledge, so only its URLs are checked; the "For BC Gov teams" part that
+follows it gets the full value checks and needs a cited result. Such answers
+are delivered with the status GENERAL, which the UI flags.
 """
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from urllib.parse import urlsplit
 
 from app.common.constants import NO_DOCUMENTATION_RESPONSE
@@ -39,9 +46,21 @@ SUPPORTED = "SUPPORTED"
 PARTIALLY_SUPPORTED = "PARTIALLY_SUPPORTED"
 NOT_SUPPORTED = "NOT_SUPPORTED"
 GROUNDING_STATUSES = {SUPPORTED, PARTIALLY_SUPPORTED, NOT_SUPPORTED}
+# Status sent with a delivered general answer (not from the model's block).
+GENERAL_STATUS = "GENERAL"
 
 ANSWER = "answer"
-RESPONSE_TYPES = {ANSWER, "clarification", "conversational"}
+GENERAL = "general"
+RESPONSE_TYPES = {ANSWER, GENERAL, "clarification", "conversational"}
+
+# Where a general answer's BC Gov part starts: "**For BC Gov teams:**",
+# "For BC Gov teams:", "### For BC Gov teams", …
+_BCGOV_PART_RE = re.compile(r"^[ \t>#*_]*for bc gov(?:ernment)? teams\b", re.I | re.M)
+
+GENERAL_NOT_ALLOWED_REASON = (
+    "the reply is labelled general, but this is a BC Gov SSO question: "
+    "answer it from the search results only"
+)
 
 _BLOCK_RE = re.compile(r"<grounding>(.*?)</grounding>", re.S | re.I)
 # A block cut off before its closing tag (e.g. the model hit max tokens).
@@ -283,12 +302,67 @@ def _has_factual_markers(body: str) -> bool:
     )
 
 
-def verify(reply: str, retrieved: list[dict], prompt: str, conversational: bool = False) -> Verdict:
+def _split_bcgov_part(body: str) -> tuple[str, str]:
+    """(general explanation, "For BC Gov teams" part); the second is "" when
+    the answer has no BC Gov part."""
+    match = _BCGOV_PART_RE.search(body)
+    return (body[:match.start()], body[match.start():]) if match else (body, "")
+
+
+def _cited_sources(grounding: Grounding, urls: list[str], evidence: _Evidence) -> list[dict]:
+    """The cited results plus any retrieved page the answer links (only
+    pages retrieval returned; other citations are rejected separately)."""
+    cited = dict.fromkeys(_url_key(u) for u in [*grounding.citations, *urls])
+    return [evidence.sources[k] for k in cited if k in evidence.sources]
+
+
+def _verify_general(body: str, grounding: Grounding, retrieved: list[dict], evidence: _Evidence) -> Verdict:
+    """A general_auth answer: an explanation from general knowledge (URLs
+    checked: none may be invented) and an optional "For BC Gov teams" part,
+    held to the documentation like any answer."""
+
+    reasons: list[str] = []
+    urls, _ = _values(body)
+    unknown_urls = [u for u in dict.fromkeys(urls) if not _url_documented(u, evidence)]
+    if unknown_urls:
+        reasons.append(f"undocumented URLs (never write URLs from memory): {unknown_urls}")
+
+    uncited = [c for c in grounding.citations if _url_key(c) not in evidence.sources]
+    if uncited:
+        reasons.append(f"citations not returned by retrieval: {uncited}")
+
+    sources = _cited_sources(grounding, urls, evidence)
+    _, bcgov_part = _split_bcgov_part(body)
+    if bcgov_part:
+        if not retrieved:
+            reasons.append("the For BC Gov teams part has no search results to rely on; remove it")
+        elif not sources:
+            reasons.append("the For BC Gov teams part cites no search result")
+        _, values = _values(bcgov_part)
+        unknown_values = [v for v in values if not _documented(v, evidence)]
+        if unknown_values:
+            reasons.append(f"undocumented values in the For BC Gov teams part: {unknown_values}")
+
+    if reasons or not body:
+        return Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED,
+                       reasons=reasons or ["empty answer"], response_type=GENERAL)
+    return Verdict(text=body, status=GENERAL_STATUS, citations=sources, response_type=GENERAL)
+
+
+def verify(
+    reply: str,
+    retrieved: list[dict],
+    prompt: str,
+    conversational: bool = False,
+    general: bool = False,
+) -> Verdict:
     """Checks the model's reply against what retrieval returned this turn.
 
     `retrieved` holds one dict per result: {"title", "uri", "score", "text"}.
     `conversational` is True when the query rewriter classified the prompt as
-    a greeting/thanks/capability question.
+    a greeting/thanks/capability question (or off topic).
+    `general` is True when this turn's search ran for a general_auth
+    question, the only case where a "general" answer is allowed.
     """
 
     body, grounding = split_grounding(reply)
@@ -304,6 +378,13 @@ def verify(reply: str, retrieved: list[dict], prompt: str, conversational: bool 
     if grounding is None:
         reasons.append("missing or malformed grounding block")
         return Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED, reasons=reasons)
+
+    if grounding.response_type == GENERAL:
+        if general:
+            return _verify_general(body, grounding, retrieved, evidence)
+        # Any other question is held to the documentation, whatever the label.
+        reasons.append(GENERAL_NOT_ALLOWED_REASON)
+        grounding = replace(grounding, response_type=ANSWER)
 
     is_answer = grounding.response_type == ANSWER
     response_type = grounding.response_type
@@ -334,14 +415,9 @@ def verify(reply: str, retrieved: list[dict], prompt: str, conversational: bool 
         return Verdict(NO_DOCUMENTATION_RESPONSE, NOT_SUPPORTED,
                        reasons=reasons or ["empty answer"], response_type=response_type)
 
-    # Sources: the cited results plus any retrieved page the answer links.
-    cited = list(dict.fromkeys(
-        [_url_key(c) for c in grounding.citations]
-        + [_url_key(u) for u in urls if _url_key(u) in evidence.sources]
-    ))
     return Verdict(
         text=body,
         status=grounding.status if is_answer else None,
-        citations=[evidence.sources[k] for k in cited],
+        citations=_cited_sources(grounding, urls, evidence),
         response_type=response_type,
     )

@@ -15,8 +15,9 @@ from app.retrieval.models import (
 
 logger = logging.getLogger(__name__)
 
-# 1 rewritten query + up to 4 sub-queries + 1 step-back query.
-MAX_QUERIES = 6
+# 1 rewritten (or BC Gov) query + 1 generic query for general_auth questions
+# + up to 4 sub-queries + 1 step-back query.
+MAX_QUERIES = 7
 
 MAX_RERANKED = 12
 
@@ -138,7 +139,7 @@ def multi_search(
     """Search each query in parallel, dedupe, and rerank against the question.
 
     `queries` come from the query rewriter, tagged with their origin
-    ("rewrite", "sub", "step_back" or "retry"). Each returned chunk's
+    ("rewrite", "general", "sub", "step_back" or "retry"). Each returned chunk's
     metadata gets a "_queries" list naming the queries that found it, and
     stats["missing"] lists the queries with no surviving hit, so callers can
     tell which parts of the question came back empty.

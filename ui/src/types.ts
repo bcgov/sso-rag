@@ -7,7 +7,9 @@ export type ProgressStatus = "searching" | "writing";
 export type GroundingStatus =
   | "SUPPORTED"
   | "PARTIALLY_SUPPORTED"
-  | "NOT_SUPPORTED";
+  | "NOT_SUPPORTED"
+  /** General identity guidance (OAuth, OIDC, SAML, other vendors), not from the docs. */
+  | "GENERAL";
 
 export interface DeltaContent {
   role?: "assistant" | "user";

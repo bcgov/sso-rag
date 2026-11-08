@@ -56,6 +56,16 @@ class Settings(BaseSettings):
         alias="MODEL_MAX_TOKENS"
     )
 
+    # Bedrock prompt caching of the agent's system prompt (and the tool
+    # definitions before it), which is identical for every user. Applied only
+    # when MODEL_ARN is a model family that supports cache points (Amazon
+    # Nova, Anthropic Claude; see bedrock_client.supports_prompt_caching), so
+    # it is a no-op for e.g. Kimi.
+    model_prompt_caching: bool = Field(
+        default=True,
+        alias="MODEL_PROMPT_CACHING"
+    )
+
     # Messages of conversation history kept (sliding window, applied after
     # each request). Earlier turns' search calls and results are dropped when
     # a conversation is restored, so 20 is about the last 10 questions and
@@ -114,8 +124,16 @@ class Settings(BaseSettings):
     # turns the user's message into the search queries the agent's
     # search_knowledge_base tool runs.
     query_rewriter_model_id: str = Field(
-        default="meta.llama3-8b-instruct-v1:0",
+        default="amazon.nova-2-lite-v1:0",
         alias="QUERY_REWRITER_MODEL_ID"
+    )
+
+    # Bedrock prompt caching of the rewriter's static system prompts. Applied
+    # only when QUERY_REWRITER_MODEL_ID supports cache points (see
+    # bedrock_client.supports_prompt_caching).
+    query_rewriter_prompt_caching: bool = Field(
+        default=True,
+        alias="QUERY_REWRITER_PROMPT_CACHING"
     )
 
     query_rewriter_timeout_seconds: float = Field(

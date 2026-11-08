@@ -204,3 +204,73 @@ def test_placeholder_urls_still_checked(url):
 ])
 def test_verdict_reports_response_type(reply, conversational, expected):
     assert verify(reply, [], "q", conversational=conversational).response_type == expected
+
+
+# --- general answers (general_auth questions) ---------------------------------
+
+from app.services.grounding import GENERAL_STATUS  # noqa: E402
+
+
+def _general(body: str, citations=(DOC,)) -> str:
+    cites = ", ".join(f'"{c}"' for c in citations)
+    return f'{body}\n<grounding>{{"response_type": "general", "citations": [{cites}]}}</grounding>'
+
+
+GENERAL_BODY = (
+    "Refresh token rotation issues a new refresh token on every use and invalidates the old one; "
+    "SPAs request `offline_access` only when the provider supports it."
+)
+BCGOV_PART = f"\n\n**For BC Gov teams:** sign in to [CSS]({CSS}) with your IDIR with MFA account."
+
+
+def test_general_answer_values_are_not_held_to_the_docs():
+    verdict = verify(_general(GENERAL_BODY, citations=()), [], "q", general=True)
+    assert not verdict.rejected
+    assert verdict.status == GENERAL_STATUS and verdict.response_type == "general"
+    assert verdict.text == GENERAL_BODY and verdict.citations == []
+
+
+def test_general_answer_with_a_cited_bcgov_part():
+    verdict = verify(_general(GENERAL_BODY + BCGOV_PART), RETRIEVED, "q", general=True)
+    assert not verdict.rejected and verdict.status == GENERAL_STATUS
+    assert [c["uri"] for c in verdict.citations] == [DOC]
+
+
+def test_general_answer_may_not_invent_urls():
+    body = GENERAL_BODY + " See https://auth0.com/docs/refresh-tokens."
+    verdict = verify(_general(body, citations=()), [], "q", general=True)
+    assert verdict.replaced
+    assert verdict.reasons == [
+        "undocumented URLs (never write URLs from memory): ['https://auth0.com/docs/refresh-tokens']"
+    ]
+
+
+def test_general_answer_bcgov_part_is_held_to_the_docs():
+    body = GENERAL_BODY + "\n\n**For BC Gov teams:** set `refresh_token_rotation` to `true` in CSS."
+    verdict = verify(_general(body), RETRIEVED, "q", general=True)
+    assert verdict.replaced
+    assert verdict.reasons == [
+        "undocumented values in the For BC Gov teams part: ['refresh_token_rotation', 'true']"
+    ]
+
+
+def test_general_answer_bcgov_part_needs_results_and_a_citation():
+    verdict = verify(_general(GENERAL_BODY + BCGOV_PART, citations=()), [], "q", general=True)
+    assert "the For BC Gov teams part has no search results to rely on; remove it" in verdict.reasons
+
+    body = GENERAL_BODY + "\n\nFor BC Gov teams: request an integration with your IDIR with MFA account."
+    verdict = verify(_general(body, citations=()), RETRIEVED, "q", general=True)
+    assert verdict.reasons == ["the For BC Gov teams part cites no search result"]
+
+
+def test_general_answer_citations_must_come_from_retrieval():
+    verdict = verify(_general(GENERAL_BODY, citations=("https://bcgov.github.io/sso-docs/made-up",)),
+                     RETRIEVED, "q", general=True)
+    assert verdict.replaced and verdict.reasons[0].startswith("citations not returned by retrieval")
+
+
+def test_general_label_is_not_allowed_for_bcgov_questions():
+    verdict = verify(_general(GENERAL_BODY), RETRIEVED, "q", general=False)
+    assert verdict.replaced
+    assert verdict.reasons[0].startswith("the reply is labelled general")
+    assert "undocumented values: ['offline_access']" in verdict.reasons
