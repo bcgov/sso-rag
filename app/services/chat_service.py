@@ -18,6 +18,7 @@ from app.agents.rag_agent import (
 from app.common.config import settings
 from app.common.constants import LINK_ONLY_RESPONSE, NO_DOCUMENTATION_RESPONSE
 from app.common.trace import preview, trace
+from app.common.turn_report import record
 from app.prompts.system_prompt import repair_request, search_request, shorten_request
 from app.services.grounding import NOT_SUPPORTED, Verdict, grounding_block, verify
 from app.services.prompt_policy import is_links_only
@@ -280,6 +281,7 @@ def _log_model_call(attempt: str, stop_reason: str | None, usage: dict) -> None:
     included) can be compared with MODEL_MAX_TOKENS, the input-token growth
     with the conversation window, and prompt-cache hits with
     MODEL_PROMPT_CACHING."""
+    record("model_call", attempt=attempt, stop_reason=stop_reason, usage=usage)
     logger.info(json.dumps({
         "event": "model_call",
         "attempt": attempt,
@@ -416,7 +418,22 @@ def _check(
 
 def _trace_attempt(attempt: str, prompt: str, run: _Run, retrieved: list[dict], verdict: Verdict) -> None:
     """Local-only: the agent's reply as the grounding check received it
-    (thinking removed, grounding block still attached), and the verdict."""
+    (thinking removed, grounding block still attached), and the verdict.
+    Also recorded for an attached TurnReport (app/common/turn_report.py)."""
+    record(
+        "attempt",
+        attempt=attempt,
+        raw_reply=run.text,
+        truncated=run.truncated,
+        response_type=verdict.response_type,
+        grounding_status=verdict.status,
+        reasons=verdict.reasons,
+        replaced=verdict.replaced,
+        citations=[c.get("uri") for c in verdict.citations],
+        retrieved=[
+            {k: r.get(k) for k in ("uri", "title", "score", "text")} for r in retrieved
+        ],
+    )
     trace(
         f"agent reply before grounding check ({attempt} attempt)",
         prompt=prompt,
@@ -513,6 +530,7 @@ class ChatService:
             # Nothing to search for yet: ask what they want to know, without
             # any model call. Saved, so a follow-up can refer to the link.
             logger.info(json.dumps({"event": "link_only_prompt"}))
+            record("link_only")
             agent.messages.append({"role": "user", "content": [{"text": question}]})
             agent.messages.append({"role": "assistant", "content": [
                 {"text": f"{LINK_ONLY_RESPONSE}\n\n{CLARIFICATION_BLOCK}"}

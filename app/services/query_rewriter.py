@@ -26,6 +26,7 @@ with the previous user messages prepended (`fallback_query`), so follow-ups
 like "what about prod?" keep their topic.
 """
 
+import contextvars
 import json
 import logging
 import re
@@ -37,6 +38,7 @@ from typing import Literal
 
 from app.common.config import settings
 from app.common.trace import trace
+from app.common.turn_report import record
 from app.prompts.query_rewriter_prompt import (
     RETRY_SYSTEM,
     REWRITE_SYSTEM,
@@ -339,8 +341,12 @@ class QueryRewriter:
                 "event": "query_rewrite", "intent": CONVERSATIONAL, "short_circuit": True
             }))
             trace("query rewriter: greeting short-circuit (no model call)", prompt=prompt)
+            record("rewrite", intent=CONVERSATIONAL, short_circuit=True, fallback=False,
+                   status="short_circuit", latency_ms=0, usage={})
             return future
-        return _jobs.submit(self.transform, prompt, history)
+        # Run in a copy of the caller's context, so an attached TurnReport
+        # (app/common/turn_report.py) sees the rewrite.
+        return _jobs.submit(contextvars.copy_context().run, self.transform, prompt, history)
 
     def transform(self, prompt: str, history: list[tuple[str, str]]) -> RewrittenQuery:
         """One rewriter call: intent, query, bcgov_query, step-back and
@@ -367,14 +373,29 @@ class QueryRewriter:
             if not settings.query_rewriter_decomposition_enabled:
                 result = replace(result, sub_queries=[])
 
+        latency_ms = reply.latency_ms if reply else None
+        usage = reply.usage if reply else {}
+        record(
+            "rewrite",
+            intent=result.intent,
+            query=result.rewritten_query,
+            bcgov_query=result.bcgov_query,
+            sub_queries=result.sub_queries,
+            step_back_query=result.step_back_query,
+            fallback=result.fallback,
+            short_circuit=False,
+            status=status,
+            latency_ms=latency_ms,
+            usage=usage,
+        )
         logger.info(json.dumps({
             "event": "query_rewrite",
             "intent": result.intent,
             "short_circuit": False,
             "fallback": result.fallback,
             "status": status,
-            "latency_ms": reply.latency_ms if reply else None,
-            **_usage_log(reply.usage if reply else {}),
+            "latency_ms": latency_ms,
+            **_usage_log(usage),
             "n_sub_queries": len(result.sub_queries),
             "step_back": result.step_back_query is not None,
             "bcgov_query": result.bcgov_query is not None,
@@ -390,8 +411,8 @@ class QueryRewriter:
             step_back_query=result.step_back_query,
             fallback=result.fallback,
             status=status,
-            latency_ms=reply.latency_ms if reply else None,
-            usage=reply.usage if reply else None,
+            latency_ms=latency_ms,
+            usage=usage,
             raw_reply=reply.text if reply else None,
         )
         return result
@@ -409,6 +430,8 @@ class QueryRewriter:
             return []
 
         queries = parse_retry(reply.text, len(failed))
+        record("rewrite_retry", failed=failed, retry_queries=queries,
+               latency_ms=reply.latency_ms, usage=reply.usage)
         trace("query rewriter: retry", question=question, failed_queries=failed,
               retry_queries=queries, raw_reply=reply.text, usage=reply.usage)
         logger.info(json.dumps({
