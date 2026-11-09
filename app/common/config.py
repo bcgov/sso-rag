@@ -124,7 +124,7 @@ class Settings(BaseSettings):
     # turns the user's message into the search queries the agent's
     # search_knowledge_base tool runs.
     query_rewriter_model_id: str = Field(
-        default="amazon.nova-2-lite-v1:0",
+        default="global.amazon.nova-2-lite-v1:0",
         alias="QUERY_REWRITER_MODEL_ID"
     )
 

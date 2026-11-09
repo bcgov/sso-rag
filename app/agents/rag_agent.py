@@ -28,6 +28,10 @@ model = BedrockModel(
     model_id=extract_model_id(settings.model_arn),
     region_name=settings.aws_region,
     max_tokens=settings.model_max_tokens,
+    additional_request_fields={
+        # Supported values: "none", "low", "medium", "high", "xhigh", "max"
+        "reasoning_effort": "high"
+    },
 )
 
 
