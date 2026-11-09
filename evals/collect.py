@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -107,6 +108,11 @@ def summarize_turn(
         "rewrite_latency_ms": rewrite.get("latency_ms") if rewrite else None,
         "error": error,
     }
+
+
+def safe_label(label: str) -> str:
+    """A label usable in a directory name: a branch like feat/x becomes feat-x."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-.")
 
 
 def _git(*args: str) -> str | None:
@@ -246,7 +252,7 @@ def main(argv: list[str] | None = None) -> Path:
         _check_isolated_storage(store_dir)
         sha = _git("rev-parse", "--short", "HEAD") or "nogit"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        run_id = "-".join(p for p in (stamp, sha, args.label) if p)
+        run_id = "-".join(p for p in (stamp, sha, safe_label(args.label)) if p)
         run_dir = args.out_dir / run_id
         run_dir.mkdir(parents=True)
 

@@ -59,6 +59,9 @@ def test_summarize():
     assert s["grounding"]["first_pass_accepted"] == 2 / 3
     assert s["grounding"]["repairs"] == 1 and s["grounding"]["repaired"] == 0
     assert s["tokens_per_case"]["agent_input"] == 10000
+    # inputTokens excludes cache reads: 1800 of 2000 + 1800 prompt tokens.
+    assert s["tokens_per_case"]["rewriter_cache_read_share"] == 1800 / 3800
+    assert s["tokens_per_case"]["agent_cache_read_share"] == 0
     assert s["latency_ms"]["turn_p50"] == 8000
 
 

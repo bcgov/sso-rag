@@ -51,6 +51,24 @@ def _ordered(names) -> list[str]:
     return [m for m in METRIC_ORDER if m in names] + sorted(names - set(METRIC_ORDER))
 
 
+def _tokens_per_case(results: list[dict]) -> dict:
+    """Mean tokens per case, all turns included. Bedrock's inputTokens
+    excludes cache reads and writes, so a cache share is of all prompt
+    tokens: uncached input + cache read + cache write."""
+
+    def per_case(key: str) -> float | None:
+        return mean(sum(t["tokens"].get(key, 0) for t in r["turns"]) for r in results if r.get("turns"))
+
+    tokens = {key: per_case(key) for key in (
+        "agent_input", "agent_cache_read", "agent_cache_write", "agent_output",
+        "rewriter_input", "rewriter_cache_read", "rewriter_output")}
+    for prefix in ("agent", "rewriter"):
+        read = tokens[f"{prefix}_cache_read"] or 0
+        prompt = (tokens[f"{prefix}_input"] or 0) + read + (tokens.get(f"{prefix}_cache_write") or 0)
+        tokens[f"{prefix}_cache_read_share"] = read / prompt if prompt else None
+    return tokens
+
+
 def summarize(results: list[dict], scores: list[dict]) -> dict:
     last_turns = [r["turns"][-1] for r in results if r.get("turns")]
 
@@ -86,11 +104,6 @@ def summarize(results: list[dict], scores: list[dict]) -> dict:
     with_attempts = [t for t in last_turns if t.get("attempts")]
     repairs = [t for t in last_turns if t.get("repair_attempted")]
 
-    def per_case(key: str) -> float | None:
-        return mean(sum(t["tokens"].get(key, 0) for t in r["turns"]) for r in results if r.get("turns"))
-
-    agent_input = per_case("agent_input")
-    cache_read = per_case("agent_cache_read")
     return {
         "cases": len(results),
         "drafts": sum(1 for r in results if r["case"].get("draft")),
@@ -107,14 +120,7 @@ def summarize(results: list[dict], scores: list[dict]) -> dict:
             "repairs": len(repairs),
             "repaired": sum(t.get("grounding_status") != "NOT_SUPPORTED" for t in repairs),
         },
-        "tokens_per_case": {
-            "agent_input": agent_input,
-            "agent_output": per_case("agent_output"),
-            "agent_cache_read_share": (cache_read / agent_input) if agent_input and cache_read is not None else None,
-            "rewriter_input": per_case("rewriter_input"),
-            "rewriter_output": per_case("rewriter_output"),
-            "rewriter_cache_read": per_case("rewriter_cache_read"),
-        },
+        "tokens_per_case": _tokens_per_case(results),
         "latency_ms": {
             "turn_p50": percentile([t["latency_ms"] for t in last_turns], 50),
             "turn_p95": percentile([t["latency_ms"] for t in last_turns], 95),
@@ -173,10 +179,12 @@ def render(meta: dict, scoring: dict, summary: dict, scores: list[dict], results
         f"- Grounding status: {', '.join(f'{k} {v}' for k, v in sorted(g['status'].items()))}",
         f"- First reply accepted by the grounding check: {_pct(g['first_pass_accepted'])}; "
         f"repairs {g['repairs']}, of which delivered {g['repaired']}",
-        f"- Agent tokens per case: input {_fmt(t['agent_input'], 0)} "
-        f"(cache reads {_pct(t['agent_cache_read_share'])}), output {_fmt(t['agent_output'], 0)}",
-        f"- Rewriter tokens per case: input {_fmt(t['rewriter_input'], 0)} "
-        f"(cache reads {_fmt(t['rewriter_cache_read'], 0)}), output {_fmt(t['rewriter_output'], 0)}",
+        f"- Agent tokens per case: input {_fmt(t['agent_input'], 0)} uncached + "
+        f"{_fmt(t['agent_cache_read'], 0)} cache reads ({_pct(t['agent_cache_read_share'])} of the prompt "
+        f"from cache), output {_fmt(t['agent_output'], 0)}",
+        f"- Rewriter tokens per case: input {_fmt(t['rewriter_input'], 0)} uncached + "
+        f"{_fmt(t['rewriter_cache_read'], 0)} cache reads ({_pct(t['rewriter_cache_read_share'])} of the "
+        f"prompt from cache), output {_fmt(t['rewriter_output'], 0)}",
         f"- Turn latency p50 {_fmt(lat['turn_p50'], 0)} ms, p95 {_fmt(lat['turn_p95'], 0)} ms; "
         f"rewriter p50 {_fmt(lat['rewrite_p50'], 0)} ms, p95 {_fmt(lat['rewrite_p95'], 0)} ms",
     ]
@@ -252,8 +260,8 @@ def render_comparison(base_dir: Path, run_dir: Path) -> str:
     lines += ["", "## Cost and latency", ""]
     lines += _table(
         ["Per case", "Before", "After", "Δ"],
-        [[k, _fmt(ta[k], 0), _fmt(tb[k], 0), _delta(ta[k], tb[k])]
-         for k in ("agent_input", "agent_output", "rewriter_input", "rewriter_output")]
+        [[k, _fmt(ta.get(k), 0), _fmt(tb.get(k), 0), _delta(ta.get(k), tb.get(k))]
+         for k in ("agent_input", "agent_cache_read", "agent_output", "rewriter_input", "rewriter_output")]
         + [[k, _fmt(la[k], 0), _fmt(lb[k], 0), _delta(la[k], lb[k])] for k in la]
         + [["first_pass_accepted", _pct(base["grounding"]["first_pass_accepted"]),
             _pct(run["grounding"]["first_pass_accepted"]),

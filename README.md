@@ -941,7 +941,8 @@ uv run --group eval python -m evals.report evals/runs/<run id> --baseline evals/
 ```
 
 See [evals/README.md](evals/README.md) for the dataset, the metrics and the
-judge.
+judge, and [docs/components/evaluations.md](docs/components/evaluations.md)
+for how the evaluation works with DeepEval.
 
 ---
 

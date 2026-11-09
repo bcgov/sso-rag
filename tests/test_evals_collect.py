@@ -69,3 +69,13 @@ def test_environment_must_be_prepared_before_app_import():
     # os.environ alone).
     with pytest.raises(RuntimeError, match="app modules imported"):
         collect._prepare_environment("/tmp/x")
+
+
+@pytest.mark.parametrize("label, expected", [
+    ("feat/deepevals-setup", "feat-deepevals-setup"),
+    ("my branch!", "my-branch"),
+    ("main", "main"),
+    ("", ""),
+])
+def test_label_is_safe_for_a_directory_name(label, expected):
+    assert collect.safe_label(label) == expected

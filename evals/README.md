@@ -2,6 +2,8 @@
 
 Offline evaluation of the SSO assistant with [DeepEval](https://deepeval.com). Every case runs through the real pipeline (query rewriter, Knowledge Base search, rerank, the agent and the grounding check with its repair attempt) against Bedrock. The run is then scored with deterministic checks and LLM-judged DeepEval metrics, and summarised in a markdown report.
 
+For how the pieces fit together (the recording hooks, how results become DeepEval test cases, and how the judge is called), see [docs/components/evaluations.md](../docs/components/evaluations.md).
+
 The dataset in `datasets/goldens.jsonl` is marked `"draft": true` throughout. Its expectations have not been reviewed yet, so treat scores from it as provisional (see [Reviewing cases](#reviewing-cases)).
 
 ## Running
@@ -53,6 +55,8 @@ It sets `ENVIRONMENT=local`, `DEBUG_TRACE=false` and `AGENT_STORE_DIR=<temporary
 `results.jsonl` contains documentation text and the model's answers, so keep runs out of shared places that shouldn't hold them.
 
 ## Metrics
+
+[docs/components/evaluation-metrics.md](../docs/components/evaluation-metrics.md) explains every field of `summary.json` in detail, with an example run.
 
 All metrics are scored on the **last turn** of each case. A metric that doesn't apply to a case is skipped, not scored 0.
 
