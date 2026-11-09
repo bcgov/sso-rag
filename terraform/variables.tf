@@ -88,7 +88,7 @@ variable "number_of_reranked_results" {
 variable "query_rewriter_model_id" {
   description = "Bedrock model id of the query rewriter (Converse API); must be enabled in Bedrock model access"
   type        = string
-  default     = "meta.llama3-8b-instruct-v1:0"
+  default     = "global.amazon.nova-2-lite-v1:0"
 }
 
 variable "query_rewriter_timeout_seconds" {

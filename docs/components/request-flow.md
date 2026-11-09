@@ -10,7 +10,7 @@ How a user question travels from the browser to a grounded, streamed answer: req
 | Agent, model, session storage | [rag_agent.py](../../app/agents/rag_agent.py) |
 | Orchestration, `<thinking>` filter, status events | [chat_service.py](../../app/services/chat_service.py) |
 | System prompt | [system_prompt.py](../../app/prompts/system_prompt.py) |
-| Query rewriter (Llama 3 8B) | [query_rewriter.py](../../app/services/query_rewriter.py), [query_rewriter_prompt.py](../../app/prompts/query_rewriter_prompt.py) |
+| Query rewriter (Nova 2 Lite) | [query_rewriter.py](../../app/services/query_rewriter.py), [query_rewriter_prompt.py](../../app/prompts/query_rewriter_prompt.py) |
 | Retrieval tool | [knowledge_base_tool.py](../../app/tools/knowledge_base_tool.py) |
 | Search, merge, rerank | [knowledge_base.py](../../app/retrieval/knowledge_base.py) |
 | Answer verification | [grounding.py](../../app/services/grounding.py) |
@@ -26,7 +26,7 @@ FastAPI route chat()            validate body + cookie + tab id → conversation
 StreamingResponse(_event_stream)   Set-Cookie, SSE headers
     ↓
 ChatService.stream()            restore agent from stored snapshot
-    ├─► Query rewriter (background)   intent + rewrite, step-back, sub-queries (Llama 3 8B)
+    ├─► Query rewriter (background)   intent + rewrite, BC Gov query, step-back, sub-queries (Nova 2 Lite, one call)
     ↓
 Strands Agent → Bedrock model   system prompt + history + prompt
     ↓  (tool call, only for SSO questions)
@@ -85,12 +85,9 @@ A fresh agent per request prevents conversation history from leaking between use
 Right after the agent is restored, `ChatService` reads the last few turns from `agent.messages` (before the new prompt is appended) and calls `query_rewriter.submit(prompt, history)`. It wraps the returned future in a `SearchTurn`.
 
 - **Greetings.** Whole-message greetings, thanks and capability questions match a regex and resolve at once as conversational, with no model call.
-- **Everything else.** Three Llama 3 8B calls (Bedrock `Converse`) run in the background, in parallel:
-  - rewrite + intent;
-  - step-back query;
-  - sub-query decomposition.
-- **Overlap.** These calls overlap the agent's first model call.
-- **Fail-open.** A failed or timed-out rewrite falls back to `fallback_query()`: the prompt with up to two previous user messages prepended (300 characters max), so a follow-up such as "what about prod?" keeps its topic. Step-back and sub-queries that succeeded are kept.
+- **Everything else.** One Nova 2 Lite call (Bedrock `Converse`, cached system prompt) runs in the background and returns intent (`sso_question`, `general_auth`, `conversational`, `off_topic`), the rewritten query, a BC Gov query for general identity questions, a step-back query and sub-queries.
+- **Overlap.** The call overlaps the agent's first model call.
+- **Fail-open.** A failed or timed-out rewrite falls back to `fallback_query()`: the prompt with up to two previous user messages prepended (300 characters max), so a follow-up such as "what about prod?" keeps its topic.
 - **Cleanup.** The future is cancelled when the stream ends, in case it is still queued.
 
 Details: [query-decomposition.md](./query-decomposition.md).

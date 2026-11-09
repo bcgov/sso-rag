@@ -11,6 +11,8 @@ class RetrievedChunk(BaseModel):
 
 
 class SearchQuery(BaseModel):
-    """One search string and the query-rewriter technique that produced it."""
+    """One search string and the query-rewriter technique that produced it.
+    "general" is a general_auth question's generic query, searched alongside
+    its BC Gov query ("rewrite")."""
     text: str
-    origin: Literal["rewrite", "sub", "step_back", "retry"]
+    origin: Literal["rewrite", "general", "sub", "step_back", "retry"]

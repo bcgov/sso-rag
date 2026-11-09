@@ -9,6 +9,9 @@ Every answer is checked against the documentation retrieved in the same turn **b
 | `SUPPORTED` | Every fact is stated in this turn's search results | The model's answer, with citations |
 | `PARTIALLY_SUPPORTED` | Results cover only part of the question; the answer says which part is not covered | The model's answer, with citations |
 | `NOT_SUPPORTED` | Results don't answer the question, **or** the answer failed a check | `NO_DOCUMENTATION_RESPONSE` (Teams / email contacts) |
+| `GENERAL` | A `general` answer to a `general_auth` question (OAuth, OIDC, SAML, Entra ID, Okta, Auth0, Clerk, Keycloak in general): an explanation from the model's own knowledge, optionally followed by a cited "For BC Gov teams" part | The answer, a "General guidance, not from the BC Gov SSO documentation" note, and citations for the BC Gov part |
+
+`GENERAL` is set by the server, never by the model's block (see [General answers](#general-answers)).
 
 `grounding_status` is omitted for `clarification` and `conversational` replies (greetings, follow-up questions), which make no factual claims. They are still checked for URLs and `code` values, so the prompt asks for clarifying questions in plain text: `` `invalid_grant` `` in a clarification is rejected if the results don't contain it, while plain-text options pass.
 
@@ -20,8 +23,8 @@ Every answer is checked against the documentation retrieved in the same turn **b
    <grounding>{"response_type": "answer", "grounding_status": "SUPPORTED", "citations": ["https://bcgov.github.io/sso-docs/..."]}</grounding>
    ```
 
-   - `response_type`: `answer`, `clarification` or `conversational`.
-   - `grounding_status`: required for answers.
+   - `response_type`: `answer`, `general`, `clarification` or `conversational`.
+   - `grounding_status`: required for answers (not for `general`).
    - `citations`: the `source:` URLs of results relied on, copied exactly.
 
 2. **The server verifies.** `split_grounding()` strips the block (the last one wins; unterminated or code-fenced blocks are also removed) and parses it. `verify()` then compares the reply with what `search_knowledge_base` returned this turn.
@@ -55,6 +58,20 @@ The reply is replaced with `NO_DOCUMENTATION_RESPONSE` and the status becomes `N
 - URLs are found by `_URL_RE` (`http(s)://` or `mailto:` up to whitespace or `<>()[]"'` and backticks). The model writes them; nothing generates them. Realistic-looking invented examples (`https://your-app.gov.bc.ca/callback`) and addresses from the model's memory (`https://sso.gov.bc.ca/`) are rejected; reserved example and loopback hosts are not.
 - Matching is exact string containment, **not** a semantic judge. Plain-prose claims are not verified, which is why the prompt asks the model to write every role, claim, config value and endpoint as `code`.
 
+## General answers
+
+The assistant also answers general identity questions (OAuth 2.0, OIDC, SAML, JWT, PKCE, Keycloak in general, Entra ID, Okta, Auth0, Clerk) while leaning towards BC Gov SSO. The query rewriter classifies such questions `general_auth`, the search tool marks the turn (`SearchTurn.intent`) and runs a BC Gov version of the question too, and the agent answers with `"response_type": "general"`: a short explanation from its own knowledge, then a cited `**For BC Gov teams:**` part from the results (left out when no result covers it).
+
+`verify(..., general=True)` checks such answers differently:
+
+| Part | Checks |
+|---|---|
+| Whole reply | URLs: none may be invented (`undocumented URLs (never write URLs from memory)`); citations must be retrieved results |
+| General explanation | `code` values are **not** checked: they come from general knowledge, not the docs |
+| "For BC Gov teams" part (from a line starting `For BC Gov teams`) | Full value checks (`undocumented values in the For BC Gov teams part`); needs search results and a cited or linked result |
+
+A delivered general answer gets the status `GENERAL`, which the UI flags as general guidance. A reply labelled `general` for any other turn (an `sso_question`, a failed rewrite, or no search) is held to the documentation like an answer and rejected with `the reply is labelled general, but this is a BC Gov SSO question: answer it from the search results only`, which leads to the usual repair turn.
+
 ## Citations
 
 For accepted answers, the sources are the cited URLs plus any retrieved page the answer links to, deduplicated by URL key. Each maps to its best-scoring retrieved result (`title`, `uri`, `score`).
@@ -64,7 +81,7 @@ For accepted answers, the sources are the cited URLs plus any retrieved page the
 In `ChatService.stream`:
 
 1. The agent's output is buffered (with `<thinking>` blocks removed by `ThinkingFilter`); the client only sees `status` progress chunks (`searching`, `writing`) and heartbeats meanwhile.
-2. `verify()` runs on the full reply. If no search ran this turn, the turn's intent decides what may be delivered: only clarifying questions on a turn that needs a search (an SSO question, or a failed or timed-out rewrite); clarifications and conversational replies on a conversational turn. Anything else skipped the search: it is rejected (`search_skipped_by_model`) and, with `GROUNDING_REPAIR_ENABLED` on, the agent gets one `search_request()` turn to search and answer. If it still doesn't search, the no-documentation reply is sent. `Verdict.response_type` carries the reply's type for this decision.
+2. `verify()` runs on the full reply. If no search ran this turn, the turn's intent decides what may be delivered: only clarifying questions on a turn that needs a search (an SSO or general identity question, or a failed or timed-out rewrite); clarifications and conversational replies on a conversational or off-topic turn. Anything else skipped the search: it is rejected (`search_skipped_by_model`) and, with `GROUNDING_REPAIR_ENABLED` on, the agent gets one `search_request()` turn to search and answer. If it still doesn't search, the no-documentation reply is sent. `Verdict.response_type` carries the reply's type for this decision.
 3. **Repair attempt.** If the reply was rejected (or cut off at `MODEL_MAX_TOKENS`, which raises Strands' `MaxTokensReachedException` and is treated as a rejection asking for a shorter reply), the search returned results, the client is still connected and `GROUNDING_REPAIR_ENABLED` is on, the agent is run once more:
    - It receives `repair_request(reasons)` ([system_prompt.py](../../app/prompts/system_prompt.py)), which lists the rejection reasons and asks for a complete rewrite using only this turn's results; a cut-off reply gets `shorten_request()` instead, which asks for a shorter reply.
    - The search tool won't search again in the same turn (it returns `ALREADY_SEARCHED`), so the evidence is unchanged; the results are already in the conversation.
@@ -72,7 +89,7 @@ In `ChatService.stream`:
    - `drop_repair_exchange()` removes the repair request and the rejected reply from the history.
    - Not repaired: a model-reported `NOT_SUPPORTED` after a search, or a rejection when the search found nothing. Neither has evidence to fix it from.
    - Only one repair (search or grounding) runs per turn.
-4. Rejections are logged as `{"event": "answer_rejected", "attempt": "first" | "repair", "cause": ..., "reasons": [...], "retrieved": N}`, with `"cause": "grounding" | "truncated" | "skipped_search"`, and repair outcomes as `{"event": "answer_repair", "kind": <cause>, "searched": bool, "repaired": bool}`. Each model call also logs `{"event": "model_call", "attempt", "stop_reason", "input_tokens", "output_tokens", "max_tokens"}`.
+4. Rejections are logged as `{"event": "answer_rejected", "attempt": "first" | "repair", "cause": ..., "reasons": [...], "retrieved": N}`, with `"cause": "grounding" | "truncated" | "skipped_search"`, and repair outcomes as `{"event": "answer_repair", "kind": <cause>, "searched": bool, "repaired": bool}`. Each model call also logs `{"event": "model_call", "attempt", "stop_reason", "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_write_input_tokens", "max_tokens"}`.
 5. If the final text was replaced, `replace_last_answer()` rewrites the stored assistant message (including a `NOT_SUPPORTED` grounding block), so the rejected answer is not reused as context next turn. After a successful repair the cleaned history is saved with `save_session()`.
 6. One `Answer(text, grounding_status, citations)` is yielded.
 

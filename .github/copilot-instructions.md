@@ -188,10 +188,10 @@ to the model. Its docstring **is** the model-facing tool description — edit it
 deliberately.
 
 `multi_search` pipeline: acronym expansion (`constants.ACRONYMS`, genuine
-abbreviations only) → up to 4 queries retrieved in parallel → dedupe → Bedrock
+abbreviations only) → up to 7 queries retrieved in parallel → dedupe → Bedrock
 rerank against the **question** → drop below `MIN_RERANK_SCORE` → note queries
 that found nothing. Falls back to vector-score order without a reranker. Returns
-numbered text blocks (`[n] title / source: / score: / text`) or a string starting
+a `TYPE: / QUESTION:` header and numbered text blocks (`[n] title / source: / text`) or a string starting
 with `NO_MATCH`. Each call logs one JSON line; use it to tune retrieval settings.
 
 When the tool runs through the agent, it appends `{title, uri, score}` for each

@@ -10,6 +10,7 @@ from strands.session import SnapshotSessionManager
 from app.prompts.system_prompt import (
     SYSTEM_PROMPT
 )
+from app.retrieval.bedrock_client import cached_system, supports_prompt_caching
 
 from app.tools.knowledge_base_tool import (
     search_knowledge_base
@@ -27,7 +28,22 @@ model = BedrockModel(
     model_id=extract_model_id(settings.model_arn),
     region_name=settings.aws_region,
     max_tokens=settings.model_max_tokens,
+    additional_request_fields={
+        # Supported values: "none", "low", "medium", "high", "xhigh", "max"
+        "reasoning_effort": "high"
+    },
 )
+
+
+def system_prompt_blocks(model_arn: str | None = settings.model_arn) -> list[dict]:
+    """The agent's system prompt as Bedrock system blocks. It is the same for
+    every user and turn, so when the model supports prompt caching it ends
+    with a cache point: the tool definitions and system prompt before it are
+    then read from the cache on every model call within the cache TTL (each
+    turn makes two or three). Strands' own CacheConfig(strategy="auto") only
+    recognizes Claude, so the cache point is placed here."""
+    enabled = settings.model_prompt_caching and supports_prompt_caching(model_arn)
+    return cached_system(SYSTEM_PROMPT, enabled)
 
 
 SESSION_ID_PREFIX = "session_"
@@ -154,7 +170,7 @@ def create_agent(session_id: str) -> Agent:
         tools=[
             search_knowledge_base
         ],
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system_prompt_blocks(),
         context_manager=False,
         conversation_manager=SlidingWindowConversationManager(
             window_size=settings.conversation_window_messages,
@@ -173,5 +189,9 @@ def create_agent(session_id: str) -> Agent:
         # Output is streamed to the client; skip the default stdout printer.
         callback_handler=None,
     )
+    # Restoring the snapshot also restores the system prompt it was saved
+    # with, so a stored conversation would keep an outdated prompt (and miss
+    # the cache point). The current prompt always wins.
+    agent.system_prompt = system_prompt_blocks()
     drop_tool_exchanges(agent.messages)
     return agent

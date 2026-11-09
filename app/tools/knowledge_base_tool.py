@@ -11,7 +11,14 @@ from app.common.config import settings
 from app.common.trace import preview, trace
 from app.retrieval.knowledge_base import merge_hits, multi_search
 from app.retrieval.models import RetrievedChunk, SearchQuery
-from app.services.query_rewriter import CONVERSATIONAL, RewrittenQuery, query_rewriter
+from app.services.query_rewriter import (
+    CONVERSATIONAL,
+    GENERAL_AUTH,
+    OFF_TOPIC,
+    SSO_QUESTION,
+    RewrittenQuery,
+    query_rewriter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +49,21 @@ NO_MATCH = (
     "question. Reply with the no-documentation text."
 )
 
+# A general identity question with no BC Gov result is still answerable.
+NO_MATCH_GENERAL = (
+    "NO_MATCH: the BC Gov SSO documentation has nothing on this. Answer from "
+    "general knowledge (\"response_type\": \"general\", \"citations\": []) and "
+    "leave out the \"For BC Gov teams\" part."
+)
+
+OFF_TOPIC_RESULT = (
+    "OFF_TOPIC: this message is not about login, identity or access. Reply in "
+    "one sentence with what you can help with (\"response_type\": \"conversational\")."
+)
+
 # Origins whose misses trigger a reworded retry; step-back queries only add
-# background, so missing background isn't worth a retry.
+# background, and a general_auth question's generic query ("general") isn't
+# expected to match the BC Gov docs, so their misses aren't worth a retry.
 RETRYABLE_ORIGINS = {"rewrite", "sub"}
 
 
@@ -59,8 +79,12 @@ class SearchTurn:
     # The first call's output; later calls in the turn get ALREADY_SEARCHED.
     result: str | None = None
     # True once the knowledge base was actually searched this turn
-    # (NO_SEARCH_NEEDED doesn't count).
+    # (NO_SEARCH_NEEDED and OFF_TOPIC don't count).
     searched: bool = False
+    # The intent the search ran with (the rewriter's, or sso_question when the
+    # agent's call overrode a conversational one); None until the tool runs.
+    # ChatService allows "general" answers only for general_auth.
+    intent: str | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -69,21 +93,24 @@ def search_knowledge_base(tool_context: ToolContext) -> str:
     """Search the BC Gov SSO (Keycloak / CSS app) documentation for the
     user's current question.
 
-    Call it once whenever the user needs SSO facts: integrations, the CSS
-    app, identity providers (IDIR, BCeID, BC Services Card, GitHub), roles,
-    client types, redirects, OIDC/SAML, custom realms, service accounts,
-    errors and uptime. Never call it for greetings, thanks or questions about
-    what you can help with.
+    Call it once for every question about authentication, authorization or
+    identity: BC Gov SSO and the CSS app, identity providers (IDIR, BCeID,
+    BC Services Card, GitHub), roles, clients, redirects, tokens, OIDC, OAuth
+    2.0, SAML, Keycloak, Entra ID, Okta, Auth0, Clerk, errors and uptime.
+    Never call it for greetings, thanks or questions about what you can help
+    with.
 
     Takes no arguments: the search queries are prepared automatically from
     the conversation.
 
     Returns:
-        Numbered result blocks separated by "---", each with the page and
-        section, source URL, score and text, possibly followed by a NOTE
-        naming parts of the question the documentation doesn't cover; or a
-        string starting with "NO_MATCH" if nothing relevant was found,
-        "NO_SEARCH_NEEDED" if the message is a greeting, or
+        A header ("TYPE: sso_question | general_auth", "QUESTION: <the
+        question, resolved from the conversation>"), then numbered result
+        blocks separated by "---", each with the page and section, source URL
+        and text, possibly followed by a NOTE naming parts of the question
+        the documentation doesn't cover; or a string starting with
+        "NO_MATCH" if nothing relevant was found, "NO_SEARCH_NEEDED" if the
+        message is a greeting, "OFF_TOPIC" if it isn't about identity, or
         "ALREADY_SEARCHED" if it was already called this turn.
     """
 
@@ -100,9 +127,10 @@ def search_knowledge_base(tool_context: ToolContext) -> str:
             return ALREADY_SEARCHED
         citations = state.get(CITATIONS_KEY)
         result = _search(turn, citations if isinstance(citations, list) else None)
-        # NO_SEARCH_NEEDED is not cached: a later call in the turn (e.g. a
-        # search repair) gets the same cheap answer, not ALREADY_SEARCHED.
-        if result != NO_SEARCH_NEEDED:
+        # NO_SEARCH_NEEDED and OFF_TOPIC are not cached: a later call in the
+        # turn (e.g. a search repair) gets the same cheap answer, not
+        # ALREADY_SEARCHED.
+        if result not in (NO_SEARCH_NEEDED, OFF_TOPIC_RESULT):
             turn.result = result
         return result
 
@@ -119,22 +147,59 @@ def _resolve_rewrite(turn: SearchTurn) -> tuple[RewrittenQuery, int]:
 
 
 def build_queries(rewrite: RewrittenQuery) -> list[SearchQuery]:
-    queries = [SearchQuery(text=rewrite.rewritten_query, origin="rewrite")]
+    """The searches for a rewrite, main facet first. For general_auth the
+    BC Gov query is the main facet and the generic query only adds context."""
+
+    if rewrite.intent == GENERAL_AUTH and rewrite.bcgov_query:
+        queries = [
+            SearchQuery(text=rewrite.bcgov_query, origin="rewrite"),
+            SearchQuery(text=rewrite.rewritten_query, origin="general"),
+        ]
+    else:
+        queries = [SearchQuery(text=rewrite.rewritten_query, origin="rewrite")]
     queries += [SearchQuery(text=q, origin="sub") for q in rewrite.sub_queries]
     if rewrite.step_back_query:
         queries.append(SearchQuery(text=rewrite.step_back_query, origin="step_back"))
     return queries
 
 
+def rerank_question(rewrite: RewrittenQuery, prompt: str) -> str:
+    """What results are scored against: the BC Gov query for general_auth,
+    so CSS results survive the reranker, else the rewritten question."""
+    if rewrite.intent == GENERAL_AUTH and rewrite.bcgov_query:
+        return rewrite.bcgov_query
+    return rewrite.rewritten_query or prompt
+
+
+def _header(intent: str, question: str) -> str:
+    """Tells the agent how to answer and what was asked (follow-ups resolved)."""
+    return f"TYPE: {intent}\nQUESTION: {question}"
+
+
+def _skip_search(turn: SearchTurn, rewrite: RewrittenQuery) -> str | None:
+    """The tool's reply when this turn needs no search: off-topic messages
+    and greetings caught by the rewriter's short-circuit. None otherwise."""
+
+    if rewrite.intent == OFF_TOPIC:
+        result, reason = OFF_TOPIC_RESULT, OFF_TOPIC
+    elif rewrite.intent == CONVERSATIONAL and rewrite.short_circuit:
+        result, reason = NO_SEARCH_NEEDED, CONVERSATIONAL
+    else:
+        return None
+    turn.intent = rewrite.intent
+    logger.info(json.dumps({"event": "search_skipped", "reason": reason}))
+    trace(f"search tool: skipped ({reason})", prompt=turn.prompt, returned=result.split(":", 1)[0])
+    return result
+
+
 def _search(turn: SearchTurn, citations: list | None) -> str:
     rewrite, waited_ms = _resolve_rewrite(turn)
 
+    if (skipped := _skip_search(turn, rewrite)) is not None:
+        return skipped
+
     overridden = False
     if rewrite.intent == CONVERSATIONAL:
-        if rewrite.short_circuit:
-            logger.info(json.dumps({"event": "search_skipped", "reason": CONVERSATIONAL}))
-            trace("search tool: skipped (greeting)", prompt=turn.prompt, returned="NO_SEARCH_NEEDED")
-            return NO_SEARCH_NEEDED
         # The rewriter's classification is a guess; the agent calling the
         # tool says otherwise. A search is cheap, an ungrounded answer isn't.
         overridden = True
@@ -142,7 +207,8 @@ def _search(turn: SearchTurn, citations: list | None) -> str:
         rewrite = RewrittenQuery.raw(turn.prompt, turn.history)
 
     turn.searched = True
-    question = rewrite.rewritten_query or turn.prompt
+    turn.intent = GENERAL_AUTH if rewrite.intent == GENERAL_AUTH else SSO_QUESTION
+    question = rerank_question(rewrite, turn.prompt)
     queries = build_queries(rewrite)
     hits, stats = multi_search(question, queries)
 
@@ -164,6 +230,7 @@ def _search(turn: SearchTurn, citations: list | None) -> str:
 
     logger.info(json.dumps({
         "question": question,
+        "intent": turn.intent,
         "kept": len(hits),
         "waited_ms": waited_ms,
         "fallback": rewrite.fallback,
@@ -200,13 +267,14 @@ def _search(turn: SearchTurn, citations: list | None) -> str:
         returned="NO_MATCH" if not hits else f"{len(hits)} result blocks",
     )
 
+    header = _header(turn.intent, rewrite.rewritten_query or turn.prompt)
     if not hits:
-        return NO_MATCH
+        return f"{header}\n\n{NO_MATCH_GENERAL if turn.intent == GENERAL_AUTH else NO_MATCH}"
 
     if citations is not None:
         citations.extend(_citation(r) for r in hits)
 
-    blocks = [_block(i, r) for i, r in enumerate(hits, 1)]
+    blocks = [header, *(_block(i, r) for i, r in enumerate(hits, 1))]
 
     uncovered = [q for q in stats["queries"] if q in still_missing and origin_of.get(q) == "sub"]
     if uncovered:
@@ -238,9 +306,9 @@ def _citation(r: RetrievedChunk) -> dict:
 
 
 def _block(i: int, r: RetrievedChunk) -> str:
+    # Results arrive best first; the score itself is only for the logs.
     return (
         f"[{i}] {_title(r)}\n"
         f"source: {_uri(r)}\n"
-        f"score: {r.score:.3f}\n"
         f"{r.text}"
     )

@@ -166,8 +166,9 @@ async def chat(
     The answer is checked against the retrieved documentation before it is
     sent (app/services/grounding.py), so it arrives as one `content` chunk,
     preceded by `delta.status` progress chunks ("searching", "writing") and
-    followed by `delta.grounding_status` (SUPPORTED, PARTIALLY_SUPPORTED or
-    NOT_SUPPORTED; omitted for greetings and clarifying questions) and, when
+    followed by `delta.grounding_status` (SUPPORTED, PARTIALLY_SUPPORTED,
+    NOT_SUPPORTED, or GENERAL for general identity guidance that isn't from
+    the docs; omitted for greetings and clarifying questions) and, when
     sources were used, `delta.citations`, then the `finish_reason: "stop"`
     chunk. Rejected answers are replaced with the no-documentation reply.
 

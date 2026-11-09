@@ -80,15 +80,21 @@ Visit [link](https://htmlpreview.github.io/?https://github.com/bcgov/sso-rag/blo
 Unlike traditional RAG, retrieval is exposed as a tool, and query writing
 is kept separate from answering:
 
-- A **query rewriter** (Meta Llama 3 8B Instruct via the Bedrock Converse
-  API, `app/services/query_rewriter.py`) owns the search queries. It
-  classifies intent (SSO question vs greeting), resolves follow-ups from
-  recent history, rewrites the question into one specific query in the docs'
-  vocabulary, adds a broader step-back query, splits multi-part questions
-  into 2–4 sub-queries, and rewords queries that found nothing.
+- A **query rewriter** (Amazon Nova 2 Lite via the Bedrock Converse API,
+  `app/services/query_rewriter.py`) owns the search queries. In one call
+  (with a cached system prompt) it classifies intent (BC Gov SSO question,
+  general identity question about OAuth / OIDC / SAML / Entra ID / Okta /
+  Auth0 / Clerk, greeting or off topic), resolves follow-ups from recent
+  history, rewrites the question into one specific query in the docs'
+  vocabulary, adds a BC Gov version of general questions so the CSS way of
+  doing it is retrieved, adds a broader step-back query, and splits
+  multi-part questions into 2–4 sub-queries. It also rewords queries that
+  found nothing.
 - The **agent** decides when to search (never for greetings or thanks) by
   calling `search_knowledge_base()`, which takes no arguments and runs the
-  rewriter's queries, and writes the final response.
+  rewriter's queries, and writes the final response: from the docs only for
+  BC Gov SSO questions; for general identity questions, a short general
+  explanation plus a cited "For BC Gov teams" part that recommends CSS.
 
 See [docs/plans/plan_user_query_rewriting.md](docs/plans/plan_user_query_rewriting.md).
 
@@ -240,15 +246,16 @@ conversation's stored history (session cookie + browser tab id; see
 [Agent Configuration](#agent-configuration)).
 
 ```text
-Query rewriter (Llama 3 8B, in parallel with the agent's first model call)
+Query rewriter (Nova 2 Lite, one call, in parallel with the agent's first model call)
   ↓  intent="sso_question"
-  ↓  rewritten_query="How do I request PROD approval for BCeID and assign client roles to a service account?"
+  ↓  query="How do I request PROD approval for BCeID and assign client roles to a service account?"
   ↓  sub_queries=["BCeID PROD approval", "service account client roles"]
-  ↓  step_back_query="CSS app integration approval process"
+  ↓  step_back="CSS app integration approval process"
 Agent
   ↓  search_knowledge_base()          (no arguments)
 Knowledge Base Tool
   ↓  parallel retrieve → dedupe → rerank against rewritten query → reword misses once
+  ↓  (general_auth: also searches bcgov_query and reranks against it)
 Bedrock Knowledge Base + Reranker
   ↓
 Ranked chunks with source URLs (+ NOTE for any part with no results)
@@ -347,6 +354,7 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `AWS_REGION` | `ca-central-1` | Region for Bedrock calls |
 | `KNOWLEDGE_BASE_ID` | – (required) | Bedrock Knowledge Base to search |
 | `MODEL_ARN` | – | Foundation model the agent uses |
+| `MODEL_PROMPT_CACHING` | `true` | Bedrock prompt caching of the agent's system prompt and tool definitions; applied only when `MODEL_ARN` is an Amazon Nova or Anthropic Claude model (a no-op for e.g. Kimi). Check `cache_read_input_tokens` in the `model_call` log lines |
 | `MODEL_MAX_TOKENS` | `4096` | Output-token limit per agent model call (reasoning models' reasoning tokens count towards it; see the `model_call` log lines before lowering it); a reply cut off at it gets one repair attempt asking for a shorter answer |
 | `MAX_PROMPT_TOKENS` | `200` | Longest accepted message, in tokens estimated at ~4 characters each (so ~800 characters). Longer or blank messages get a 422 with a readable `detail`; the UI reads the limit from `GET /chat/config` |
 | `TURN_TIMEOUT_SECONDS` | `240` | Wall-clock budget for one `/chat` turn; past it the turn is stopped and an in-band "took too long" error is sent. Keep it under API Gateway's 300s stream limit |
@@ -356,11 +364,12 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `NUMBER_OF_RERANKED_RESULTS` | `6` | Results kept after reranking for a single-part question (+2 per extra part, max 12) |
 | `MIN_RERANK_SCORE` | `0.05` | Drop reranked results below this relevance score |
 | `SEARCH_TYPE` | `SEMANTIC` | Bedrock `overrideSearchType`; keep `SEMANTIC` on S3 Vectors |
-| `QUERY_REWRITER_MODEL_ID` | `meta.llama3-8b-instruct-v1:0` | Bedrock model the query rewriter calls (Converse API); enable it in Bedrock model access |
-| `QUERY_REWRITER_TIMEOUT_SECONDS` | `3` | Timeout per rewriter call; on timeout the search falls back to the prompt plus the previous user messages |
+| `QUERY_REWRITER_MODEL_ID` | `global.amazon.nova-2-lite-v1:0` | Bedrock model the query rewriter calls (Converse API); enable it in Bedrock model access |
+| `QUERY_REWRITER_PROMPT_CACHING` | `true` | Bedrock prompt caching of the rewriter's static system prompts; applied only for Amazon Nova or Anthropic Claude models. Check `cache_read_input_tokens` in the `query_rewrite` log lines |
+| `QUERY_REWRITER_TIMEOUT_SECONDS` | `3` | Timeout for the rewriter call; on timeout the search falls back to the prompt plus the previous user messages |
 | `QUERY_REWRITER_HISTORY_TURNS` | `3` | Conversation turns given to the rewriter to resolve follow-ups |
-| `QUERY_REWRITER_STEP_BACK_ENABLED` | `true` | Add a broader step-back query |
-| `QUERY_REWRITER_DECOMPOSITION_ENABLED` | `true` | Split multi-part questions into 2–4 sub-queries |
+| `QUERY_REWRITER_STEP_BACK_ENABLED` | `true` | Keep the broader step-back query |
+| `QUERY_REWRITER_DECOMPOSITION_ENABLED` | `true` | Keep the 2–4 sub-queries of multi-part questions |
 | `QUERY_REWRITER_RETRY_ENABLED` | `true` | Reword queries that found nothing and search once more |
 | `GROUNDING_REPAIR_ENABLED` | `true` | Give a reply that fails the grounding checks one rewrite (from the same results), or a reply written without a required search one chance to search, before falling back to the no-documentation reply |
 | `CORS_ORIGINS` | `["*"]` | Allowed origins for the UI (answers `OPTIONS` preflight). Cookies are only allowed cross-origin when this lists explicit origins, e.g. `["https://ui.example.gov.bc.ca"]` |
@@ -560,7 +569,9 @@ never sees:
 <grounding>{"response_type": "answer", "grounding_status": "SUPPORTED", "citations": ["https://bcgov.github.io/sso-docs/..."]}</grounding>
 ```
 
-`response_type` is `answer`, `clarification` or `conversational`.
+`response_type` is `answer`, `general` (general identity guidance, allowed
+only for questions the rewriter classified `general_auth`, delivered with the
+status `GENERAL`), `clarification` or `conversational`.
 `app/services/grounding.py` strips the block and compares the reply with the
 results `search_knowledge_base` returned in this turn. The reply is replaced
 with `NO_DOCUMENTATION_RESPONSE` (`app/common/constants.py`: the "documentation

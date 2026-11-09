@@ -76,7 +76,8 @@ def test_agent_call_overrides_conversational_classification(search):
     result, _ = _call(turn, citations)
     query = "How do I get BCeID approved in TEST? what's CSS?"
     assert search.calls[0] == (query, [(query, "rewrite")])
-    assert result.startswith("[1]") and citations and turn.searched
+    assert result.startswith(f"TYPE: sso_question\nQUESTION: {query}\n\n---\n\n[1]")
+    assert citations and turn.searched and turn.intent == "sso_question"
 
 
 def test_searches_rewriter_queries_in_order(search):
@@ -88,9 +89,58 @@ def test_searches_rewriter_queries_in_order(search):
     question, queries = search.calls[0]
     assert question == "main q"
     assert queries == [("main q", "rewrite"), ("part a", "sub"), ("part b", "sub"), ("background q", "step_back")]
-    assert "[1] Sec main q" in result and "source: https://docs/main q" in result
+    assert "[1] Sec main q\nsource: https://docs/main q\nmain q" in result
+    # Scores are for the logs only.
+    assert "score:" not in result
     assert [c["uri"] for c in citations] == [f"https://docs/{q}" for q, _ in queries]
     assert set(citations[0]) == {"title", "uri", "score", "text"}
+
+
+def test_general_auth_searches_the_bcgov_query_first_and_reranks_on_it(search):
+    rewrite = RewrittenQuery(intent="general_auth", rewritten_query="refresh token rotation for a SPA",
+                             bcgov_query="refresh token lifespan for a public client in CSS")
+    turn = SearchTurn(prompt="how does Auth0 rotate refresh tokens?", rewrite=_done(rewrite))
+    result, _ = _call(turn)
+
+    question, queries = search.calls[0]
+    assert question == "refresh token lifespan for a public client in CSS"
+    assert queries == [("refresh token lifespan for a public client in CSS", "rewrite"),
+                       ("refresh token rotation for a SPA", "general")]
+    # The agent sees the user's question, not the BC Gov query.
+    assert result.startswith("TYPE: general_auth\nQUESTION: refresh token rotation for a SPA\n")
+    assert turn.intent == "general_auth" and turn.searched
+
+
+def test_general_auth_without_bcgov_query_searches_the_query(search):
+    rewrite = RewrittenQuery(intent="general_auth", rewritten_query="what is PKCE")
+    _call(SearchTurn(prompt="what is PKCE?", rewrite=_done(rewrite)))
+    assert search.calls[0] == ("what is PKCE", [("what is PKCE", "rewrite")])
+
+
+def test_general_auth_misses_of_the_generic_query_are_not_retried(search, monkeypatch):
+    search.empty = {"generic q"}
+    retries = []
+    monkeypatch.setattr(kbt.query_rewriter, "retry", lambda q, failed: retries.append(failed) or [])
+    rewrite = RewrittenQuery(intent="general_auth", rewritten_query="generic q", bcgov_query="bcgov q")
+    _call(SearchTurn(prompt="raw", rewrite=_done(rewrite)))
+    assert retries == []
+
+
+def test_general_auth_no_match_is_still_answerable(search, monkeypatch):
+    search.empty = {"bcgov q", "generic q"}
+    monkeypatch.setattr(kbt.query_rewriter, "retry", lambda q, failed: [])
+    rewrite = RewrittenQuery(intent="general_auth", rewritten_query="generic q", bcgov_query="bcgov q")
+    result, _ = _call(SearchTurn(prompt="raw", rewrite=_done(rewrite)))
+    assert result == f"TYPE: general_auth\nQUESTION: generic q\n\n{kbt.NO_MATCH_GENERAL}"
+
+
+def test_off_topic_skips_search(search):
+    turn = SearchTurn(prompt="write a poem", rewrite=_done(RewrittenQuery.off_topic()))
+    result, _ = _call(turn)
+    assert result == kbt.OFF_TOPIC_RESULT and search.calls == []
+    assert not turn.searched and turn.intent == "off_topic"
+    # Not cached as the turn's search either.
+    assert _call(turn)[0] == kbt.OFF_TOPIC_RESULT and turn.result is None
 
 
 def test_searches_once_per_turn(search):
@@ -98,7 +148,7 @@ def test_searches_once_per_turn(search):
     citations = []
     first, _ = _call(turn, citations)
     second, _ = _call(turn, citations)
-    assert first.startswith("[1]")
+    assert first.startswith("TYPE: sso_question\nQUESTION: q\n") and "[1]" in first
     assert second == kbt.ALREADY_SEARCHED
     assert len(search.calls) == 1 and len(citations) == 1
 
@@ -162,7 +212,7 @@ def test_no_match(search, monkeypatch):
     citations = []
     result, _ = _call(SearchTurn(prompt="raw", rewrite=_done(
         RewrittenQuery(intent="sso_question", rewritten_query="main q"))), citations)
-    assert result == NO_MATCH and citations == []
+    assert result == f"TYPE: sso_question\nQUESTION: main q\n\n{NO_MATCH}" and citations == []
 
 
 def test_missing_turn_returns_no_match(search):

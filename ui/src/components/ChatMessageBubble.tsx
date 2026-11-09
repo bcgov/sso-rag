@@ -83,6 +83,13 @@ export const ChatMessageBubble = memo(function ChatMessageBubble({
             </p>
           )}
 
+        {!message.streaming && message.groundingStatus === "GENERAL" && (
+          <p className="mt-3 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+            General guidance, not from the BC Gov SSO documentation. Check
+            your identity provider's documentation for details.
+          </p>
+        )}
+
         {!message.streaming &&
           message.citations &&
           message.citations.length > 0 && (

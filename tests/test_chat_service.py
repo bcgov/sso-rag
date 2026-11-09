@@ -40,9 +40,11 @@ class FakeAgent:
     messages; the runs listed in `search_runs` (1-based; the first by
     default) "search" (mark the turn searched and fill the citations list)."""
 
-    def __init__(self, replies, search=True, search_runs=None):
+    def __init__(self, replies, search=True, search_runs=None, intent="sso_question"):
         self.replies = list(replies)
         self.search_runs = set(search_runs if search_runs is not None else ({1} if search else ()))
+        # The intent the search tool records on the turn when it searches.
+        self.intent = intent
         self.prompts = []
         self.messages = [
             {"role": "user", "content": [{"text": "earlier question"}]},
@@ -56,6 +58,7 @@ class FakeAgent:
         if len(self.prompts) in self.search_runs and not turn.searched:
             yield {"current_tool_use": {"name": "search_knowledge_base"}}
             turn.searched = True
+            turn.intent = self.intent
             invocation_state[CITATIONS_KEY].append(dict(EVIDENCE))
             self.messages.append({"role": "assistant", "content": [{"toolUse": {"name": "search_knowledge_base"}}]})
             self.messages.append({"role": "user", "content": [{"toolResult": {"content": []}}]})
@@ -362,6 +365,41 @@ def test_conversational_intent_with_conversational_reply_is_delivered(harness, m
     assert len(agent.prompts) == 1 and answer.text == "Glad that helped!"
 
 
+def test_off_topic_reply_without_search_is_delivered(harness, monkeypatch):
+    _rewriter(monkeypatch, RewrittenQuery.off_topic())
+    reply = ("I help with authentication and BC Gov SSO questions.\n"
+             '<grounding>{"response_type": "conversational", "citations": []}</grounding>')
+    agent = FakeAgent([reply], search=False)
+    answer, _ = harness(agent, question="write me a poem")
+    assert len(agent.prompts) == 1 and answer.text.startswith("I help with")
+
+
+# --- general identity questions -----------------------------------------------
+
+GENERAL_REPLY = (
+    "PKCE binds the authorization code to the client that started the login, using a "
+    "`code_verifier` and a `code_challenge`.\n\n"
+    f"**For BC Gov teams:** sign in to the [CSS app]({CSS_URL}) with IDIR with MFA and request a new integration.\n"
+    '<grounding>{"response_type": "general", "citations": ["' + DOC_URL + '"]}</grounding>'
+)
+
+
+def test_general_answer_is_delivered_for_general_auth_questions(harness):
+    agent = FakeAgent([GENERAL_REPLY], intent="general_auth")
+    answer, _ = harness(agent, question="what is PKCE?")
+    assert len(agent.prompts) == 1
+    assert answer.grounding_status == "GENERAL"
+    assert "`code_verifier`" in answer.text and "For BC Gov teams" in answer.text
+    assert [c["uri"] for c in answer.citations] == [DOC_URL]
+
+
+def test_general_label_on_a_bcgov_question_is_repaired(harness):
+    agent = FakeAgent([GENERAL_REPLY, REPAIRED])
+    answer, _ = harness(agent, question="how do I request an integration?")
+    assert len(agent.prompts) == 2 and "labelled general" in agent.prompts[1]
+    assert answer.grounding_status == "SUPPORTED"
+
+
 def test_rewriter_gets_recent_history(harness):
     agent = FakeAgent([REPAIRED])
     _, calls = harness(agent)
@@ -416,13 +454,17 @@ def test_each_model_call_logs_its_token_usage(harness, caplog):
             async for event in super().stream_async(prompt, invocation_state, cancel_signal, **kwargs):
                 yield event
             yield {"event": {"messageStop": {"stopReason": "end_turn"}}}
-            yield {"event": {"metadata": {"usage": {"inputTokens": 5000, "outputTokens": 640}}}}
+            yield {"event": {"metadata": {"usage": {
+                "inputTokens": 5000, "outputTokens": 640, "cacheReadInputTokens": 1800,
+            }}}}
 
     caplog.set_level("INFO", logger="app.services.chat_service")
     harness(UsageAgent([REPAIRED]))
     assert _events(caplog, "model_call") == [{
         "event": "model_call", "attempt": "first", "stop_reason": "end_turn",
-        "input_tokens": 5000, "output_tokens": 640, "max_tokens": cs.settings.model_max_tokens,
+        "input_tokens": 5000, "output_tokens": 640,
+        "cache_read_input_tokens": 1800, "cache_write_input_tokens": None,
+        "max_tokens": cs.settings.model_max_tokens,
     }]
 
 
