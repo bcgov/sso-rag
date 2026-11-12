@@ -18,6 +18,7 @@ results.jsonl (one line per case). Score them with `python -m evals.score`.
 
 import argparse
 import asyncio
+import aiofiles
 import hashlib
 import json
 import logging
@@ -214,8 +215,8 @@ async def _run_all(cases: list[EvalCase], concurrency: int, out: Path) -> int:
             result = await _run_case(case)
         async with lock:
             done += 1
-            with out.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(result, ensure_ascii=False, default=str) + "\n")
+            async with aiofiles.open(out, "a", encoding="utf-8") as f:
+                await f.write(json.dumps(result, ensure_ascii=False, default=str) + "\n")
             last = result["turns"][-1] if result["turns"] else {}
             failures += bool(result["error"])
             status = result["error"] or f"{last.get('outcome')} {last.get('grounding_status') or ''}".strip()

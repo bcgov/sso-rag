@@ -197,6 +197,60 @@ GEval normally spends an extra call writing its evaluation steps from a descript
 
 Every metric passes at 0.5 (`JUDGE_THRESHOLD` in [config.py](../../evals/config.py)). The judged metrics run concurrently, `--concurrency` at a time (default 4).
 
+### One chunk list, not two
+
+It's tempting to read the pipeline as "the agent retrieves chunks, then the judge also produces chunks, and the two are compared" — that's not what happens. There is exactly **one** set of chunks per turn, retrieved once by the real Knowledge Base search during `collect`, and the judge only ever receives that same list as text in a prompt:
+
+```text
+collect (real pipeline, once per turn)                 score (offline, after the fact)
+────────────────────────────────────                   ──────────────────────────────
+search_knowledge_base() runs the real
+KB search + rerank → real chunks
+   │
+   ▼
+invocation_state["citations"]
+(uri, title, score, text per chunk)
+   │
+   ▼
+grounding.verify() checks the agent's        ← deterministic string/URL
+reply against THESE chunks                     matching, no LLM involved
+   │
+   ▼
+record("attempt", ..., retrieved=[...])      ← chat_service.py (_trace_attempt)
+   │
+   ▼
+results.jsonl: turn["retrieved"] =           ← collect.py (summarize_turn):
+  the first attempt's retrieved chunks         the first attempt's chunks, since
+   │                                           a repair attempt searches nothing new
+   ▼
+turn["retrieved"]'s text becomes             ← score.py (plan_metrics)
+  LLMTestCase.retrieval_context                 "context = [r.get('text') ... ]"
+   │
+   ▼
+Kimi is given THIS SAME retrieval_context
+in every judge prompt that needs it
+```
+
+The judge (`BedrockJudge` / Kimi K3) never calls the Knowledge Base, the reranker, or `search_knowledge_base()` itself — it has no way to retrieve anything. It only ever sees chunks that were already retrieved by the real pipeline and copied into the prompt as plain text. So "are the chunks compared?" is true in a narrower sense than it might sound: **the one real chunk list is compared against the answer's claims (`faithfulness`) or against the reference answer (`contextual_precision`/`contextual_recall`)** — never against a second, judge-produced chunk list, because there isn't one.
+
+This is also why the grounding check and `faithfulness` can disagree even though they look at the same evidence: the grounding check is exact string/URL matching on the agent's self-reported `<grounding>` block ([grounding.py](../../app/services/grounding.py)), while `faithfulness` asks an LLM to extract claims from the prose and judge whether the same retrieved text supports their *meaning*. A low `faithfulness` score on a reply the grounding check accepted usually means a plain-language claim the documentation doesn't actually back, not a disagreement about which chunks exist.
+
+**Worked example.** Say a turn retrieved 3 chunks and the agent answered:
+
+```text
+retrieval_context (the 3 chunks, unmodified, handed to Kimi):
+[1] "...client secrets are found in the Installation JSON under the client's credentials tab..."
+[2] "...PROD approval requires the integration to have been tested in TEST first..."
+[3] "...Business BCeID is approved per-integration by the IDIM team..."
+
+actual_output (the agent's delivered answer, also handed to Kimi):
+"Your client secret is in the Installation JSON. For PROD, you need PROD
+approval, which requires TEST sign-off first, and for Business BCeID this is
+approved by the Service BC team."
+```
+
+`faithfulness`'s claim-by-claim pass: "client secret is in the Installation JSON" → supported by [1]; "PROD approval requires TEST sign-off first" → supported by [2]; "Business BCeID is approved by the **Service BC** team" → [3] says **IDIM team**, not Service BC → contradicted. Score = 2 of 3 claims not contradicted ≈ `0.67`. Kimi never retrieved anything here — it was handed the 3 chunks once and asked to adjudicate each claim against them.
+
 ## The judge
 
 DeepEval calls the judge through `a_generate(prompt, schema)`. [`BedrockJudge`](../../evals/judge.py) implements that with the Bedrock Converse API and `boto3`:

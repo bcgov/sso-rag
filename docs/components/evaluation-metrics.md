@@ -69,6 +69,19 @@ Checks compare what happened with the case's expectations. They need no model ca
 
 Retrieval and citation checks compare **pages**: the fragment, query string, trailing slash and case are ignored, so any chunk of an expected page counts. "Retrieved pages" means the distinct pages of the chunks the first reply was checked against, in rank order. A page's best chunk gives its rank.
 
+**How page-matching works, concretely** (all in [metrics.py](../../evals/metrics.py)):
+
+1. `page_key(url)` reduces a chunk's URL to `scheme://netloc/path`, lowercased, with no trailing slash, query string or `#fragment`. So `.../FAQs/css-app#redirect-uris`, `.../FAQs/css-app/?utm_source=x` and `.../FAQs/CSS-App` all become the same page key — this is what lets several chunks of one documentation page count as a single "page".
+2. `ranked_pages(uris)` walks `turn["retrieved"]`'s chunk URIs (already best-score-first — the same list `faithfulness` is scored against; see [evaluations.md § One chunk list, not two](evaluations.md#one-chunk-list-not-two)) and keeps the first occurrence of each page key, in order. Three chunks from one page and one from another become a 2-page ranked list, the page's rank set by whichever of its chunks scored highest.
+3. `hit_at_k(retrieved, expected, k)` = `1.0` if `{expected page keys} ∩ {first k ranked pages}` is non-empty, else `0.0` — it only asks *whether* any expected page made the cut, not how many or at what rank.
+4. `recall_at_k(retrieved, expected, k)` = `|{expected page keys} ∩ {first k ranked pages}| / |expected page keys|` — the same intersection, but divided by the **total number of expected pages** for the case (not by `k`), which is why a case with more expected pages than `k` can never reach a perfect score (see the `retrieval_recall@k` note below).
+5. Both are wrapped by the same `_retrieval_check()`, which returns `None` (metric doesn't apply, not counted in `n`) when the case sets no `expected_sources` at all, or `(0.0, "no search ran")` (applies, scored, but fails) when `expected_sources` is set yet the turn never searched — a greeting, off-topic or conversational turn, for instance.
+
+*Worked example* — `k = 6`, `expected_sources` = two pages (`integrating-your-application`, `FAQs/redirect-uris`), and `turn["retrieved"]`'s 6 chunks collapse (via `ranked_pages`) to 5 distinct pages in this order: `css-app-errors`, `integrating-your-application`, `service-accounts`, `redirect-uris`, `release-notes`.
+- `hit_at_k` = **1.0** (both expected pages appear somewhere in the top 5).
+- `recall_at_k` = **1.0** (2 of 2 expected pages found).
+- If only `integrating-your-application` had been retrieved (not `redirect-uris`), `hit_at_k` would still be **1.0** (one match is enough), but `recall_at_k` would drop to **0.5** — exactly its passing threshold, which is why `hit_at_k` (any single match already counts as a full pass) is stricter about passing at 1.0 while `recall_at_k` only needs half the expected pages to pass.
+
 #### `outcome_match`
 
 - **Measures:** whether the user got the kind of reply the case expects.
@@ -89,18 +102,18 @@ Retrieval and citation checks compare **pages**: the fragment, query string, tra
 #### `retrieval_hit@k`
 
 - **Measures:** whether at least one expected page is in the top k retrieved pages.
+- **Score:** `1.0` if the expected pages and the top-k ranked pages intersect at all, else `0.0` (`hit_at_k`, see the mechanics above) — not how many matched or at what rank.
 - **k:** the run's `NUMBER_OF_RERANKED_RESULTS`, recorded as `k` in `scoring.json`.
-- **Score:** 1 or 0.
 - **Passes at:** 1.
-- **Applies when:** `expected_sources` is set. Scores 0 when no search ran.
+- **Applies when:** `expected_sources` is set (otherwise skipped, not scored). Scores 0, not skipped, when `expected_sources` is set but no search ran.
 - **A failure usually means:** the agent answered from the wrong pages, or had nothing to answer from.
 
 #### `retrieval_recall@k`
 
 - **Measures:** the share of expected pages that are in the top k.
-- **Score:** expected pages found ÷ expected pages.
+- **Score:** `|expected pages ∩ top-k ranked pages| / |expected pages|` (`recall_at_k`, see the mechanics above) — divided by the case's total expected pages, not by k or by how many chunks came back.
 - **Passes at:** 0.5.
-- **Applies when:** `expected_sources` is set. Scores 0 when no search ran.
+- **Applies when:** `expected_sources` is set (otherwise skipped, not scored). Scores 0, not skipped, when `expected_sources` is set but no search ran.
 - **Note:** a case with more expected pages than k can't reach 1. With k = 3 and four expected pages, the best possible score is 0.75.
 
 #### `retrieval_mrr`
@@ -137,6 +150,7 @@ These are DeepEval metrics scored by the LLM judge (Kimi K3 by default). They do
 - **Score:** the share of the answer's claims that the retrieved chunks don't contradict.
 - **Applies to:** `answer` outcomes. For a `general` answer, only its "For BC Gov teams" part is scored, because the general explanation is meant to come from the model's own knowledge.
 - **Compared with the grounding check:** the grounding check matches URLs and values exactly; faithfulness judges the meaning of the prose. A low score on an answer the grounding check accepted points to a plain-language claim that the documentation doesn't support.
+- **Where the chunks come from:** the judge is never given new chunks to find — it only judges the one chunk list the real pipeline already retrieved ([details](evaluations.md#one-chunk-list-not-two)).
 
 #### `answer_relevancy`
 

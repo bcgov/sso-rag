@@ -4,6 +4,8 @@ All search-query writing happens in a dedicated **query rewriter**, separate fro
 
 Design rationale: [plan_user_query_rewriting.md](../plans/plan_user_query_rewriting.md). The plan describes three parallel calls; they were merged into one so the system prompt and history are sent once per question, not three times.
 
+For a worked, example-driven walkthrough of each stage (greeting check, vocabulary selection, the model call, parsing, query building, retrieval, retry, fail-open), see [query-rewriter-stages.md](./query-rewriter-stages.md).
+
 | Concern | Where |
 |---|---|
 | Rewriter: intent, rewrite, BC Gov query, step-back, decomposition, retry, fail-open, prompt caching | [query_rewriter.py](../../app/services/query_rewriter.py) |
