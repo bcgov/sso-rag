@@ -1,6 +1,16 @@
 # Plan: Evaluations Module
 
-Status: proposed · Scope: answer, retrieval and grounding quality · Library: `strands-agents-evals` 1.8.0 (`strands_evals`)
+> **Superseded.** Evaluations were built with DeepEval instead of `strands-agents-evals`. See [evals/README.md](../../evals/README.md). Kept from this plan:
+>
+> - in-process runs through `ChatService.stream`;
+> - isolated temporary storage, with the guard against S3 (`AGENT_STORE_DIR`);
+> - page-level URL matching;
+> - judging the delivered answer;
+> - re-scoring without re-running the agent.
+>
+> The observer is a `ContextVar` `TurnReport` rather than a `stream(..., observer=)` parameter. The rest of this document is the original proposal, not the implementation.
+
+Status: superseded · Scope: answer, retrieval and grounding quality · Library: `strands-agents-evals` 1.8.0 (`strands_evals`)
 
 ## 1. Summary
 

@@ -1,0 +1,160 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 990" width="100%" role="img" aria-labelledby="t d">
+<title id="t">How a user message is processed in sso-rag</title>
+<desc id="d">The user's message reaches the /chat route and ChatService. The query rewriter (Nova 2 Lite) runs in the background while the main agent (Grok 4.7) calls search_knowledge_base, which waits for the rewriter's queries, searches the Knowledge Base and reranks. The agent writes an answer with a hidden grounding block. grounding.verify checks citations, URLs and code values against the retrieved chunks. A passing answer is delivered; a failing one gets one repair attempt, and if that fails too the user gets the no-documentation reply. The response is streamed back to the user.</desc>
+<style>
+  .bg { fill: #ffffff; }
+  text { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .h { font-size: 14px; font-weight: 600; text-anchor: middle; }
+  .s { font-size: 12px; text-anchor: middle; }
+  .lbl { font-size: 11px; fill: #6b6a66; }
+  .edge { fill: none; stroke: #898781; stroke-width: 1.5; }
+  .head { fill: #898781; }
+
+  .n rect { fill: #fcfcfb; stroke: #c9c8c4; } .n .h { fill: #0b0b0b; } .n .s { fill: #52514e; }
+  .rw rect { fill: #eeedfe; stroke: #534ab7; } .rw .h { fill: #3c3489; } .rw .s { fill: #534ab7; }
+  .ag rect { fill: #e6f1fb; stroke: #185fa5; } .ag .h { fill: #0c447c; } .ag .s { fill: #185fa5; }
+  .tl rect { fill: #e1f5ee; stroke: #0f6e56; } .tl .h { fill: #085041; } .tl .s { fill: #0f6e56; }
+  .gr rect { fill: #faeeda; stroke: #854f0b; } .gr .h { fill: #633806; } .gr .s { fill: #854f0b; }
+  .ok rect { fill: #eaf3de; stroke: #3b6d11; } .ok .h { fill: #27500a; } .ok .s { fill: #3b6d11; }
+  .no rect { fill: #fcebeb; stroke: #a32d2d; } .no .h { fill: #791f1f; } .no .s { fill: #a32d2d; }
+
+  @media (prefers-color-scheme: dark) {
+    .bg { fill: #16161a; }
+    .lbl { fill: #a8a7a2; }
+    .n rect { fill: #24242a; stroke: #4a4a52; } .n .h { fill: #ededed; } .n .s { fill: #b4b3ae; }
+    .rw rect { fill: #262350; stroke: #a39cf0; } .rw .h { fill: #dcd8ff; } .rw .s { fill: #bcb6f5; }
+    .ag rect { fill: #102a44; stroke: #6aa8e0; } .ag .h { fill: #d4e7f8; } .ag .s { fill: #9cc6ec; }
+    .tl rect { fill: #0e3329; stroke: #5dc4a3; } .tl .h { fill: #cdf1e4; } .tl .s { fill: #93dcc3; }
+    .gr rect { fill: #3a280b; stroke: #e0a64a; } .gr .h { fill: #f8e3bf; } .gr .s { fill: #ecc283; }
+    .ok rect { fill: #1d3110; stroke: #8fc45c; } .ok .h { fill: #dbefc6; } .ok .s { fill: #b2d98c; }
+    .no rect { fill: #3b1515; stroke: #e57a7a; } .no .h { fill: #f8d4d4; } .no .s { fill: #eda5a5; }
+  }
+</style>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M1 1L9 5L1 9z" class="head"/>
+  </marker>
+</defs>
+
+<rect class="bg" x="0" y="0" width="760" height="990" rx="12"/>
+
+<!-- 1. User -->
+<g class="n">
+  <rect x="230" y="24" width="300" height="52" rx="8"/>
+  <text class="h" x="380" y="45">User</text>
+  <text class="s" x="380" y="64">types a question in the chat UI</text>
+</g>
+<path class="edge" d="M380 76 L380 108" marker-end="url(#arrow)"/>
+<text class="lbl" x="390" y="96">POST /chat</text>
+
+<!-- 2. Route -->
+<g class="n">
+  <rect x="200" y="110" width="360" height="52" rx="8"/>
+  <text class="h" x="380" y="131">/chat route · FastAPI</text>
+  <text class="s" x="380" y="150">session cookie → conversation id, opens the SSE stream</text>
+</g>
+<path class="edge" d="M380 162 L380 192" marker-end="url(#arrow)"/>
+
+<!-- 3. ChatService -->
+<g class="n">
+  <rect x="200" y="194" width="360" height="52" rx="8"/>
+  <text class="h" x="380" y="215">ChatService.stream</text>
+  <text class="s" x="380" y="234">restores this conversation's history</text>
+</g>
+
+<!-- fork: rewriter and agent start together -->
+<path class="edge" d="M380 246 L380 266 L200 266 L200 296" marker-end="url(#arrow)"/>
+<path class="edge" d="M380 266 L560 266 L560 296" marker-end="url(#arrow)"/>
+<text class="lbl" x="380" y="284" text-anchor="middle">both start at once</text>
+
+<!-- 4a. Query rewriter -->
+<g class="rw">
+  <rect x="30" y="298" width="340" height="76" rx="8"/>
+  <text class="h" x="200" y="320">① Query rewriter · Nova 2 Lite</text>
+  <text class="s" x="200" y="340">runs in the background</text>
+  <text class="s" x="200" y="358">intent, rewritten + step-back + sub-queries</text>
+</g>
+
+<!-- 4b. Main agent, first call -->
+<g class="ag">
+  <rect x="390" y="298" width="340" height="76" rx="8"/>
+  <text class="h" x="560" y="320">② Main agent · Grok 4.7</text>
+  <text class="s" x="560" y="340">system prompt + history + question</text>
+  <text class="s" x="560" y="358">calls search_knowledge_base() (no arguments)</text>
+</g>
+
+<path class="edge" d="M200 374 L200 400 L330 400 L330 430" marker-end="url(#arrow)"/>
+<text class="lbl" x="265" y="394" text-anchor="middle">queries</text>
+<path class="edge" d="M560 374 L560 400 L430 400 L430 430" marker-end="url(#arrow)"/>
+<text class="lbl" x="495" y="394" text-anchor="middle">tool call</text>
+
+<!-- 5. Search tool -->
+<g class="tl">
+  <rect x="180" y="432" width="400" height="60" rx="8"/>
+  <text class="h" x="380" y="455">③ search_knowledge_base()</text>
+  <text class="s" x="380" y="475">waits for rewriter → KB search → rerank → top k chunks</text>
+</g>
+<path class="edge" d="M380 492 L380 522" marker-end="url(#arrow)"/>
+<text class="lbl" x="390" y="511">chunks</text>
+
+<!-- 6. Agent writes the answer -->
+<g class="ag">
+  <rect x="180" y="524" width="400" height="60" rx="8"/>
+  <text class="h" x="380" y="547">② Main agent writes the answer</text>
+  <text class="s" x="380" y="567">answer + hidden &lt;grounding&gt; block: status, citations</text>
+</g>
+<path class="edge" d="M380 584 L380 614" marker-end="url(#arrow)"/>
+<text class="lbl" x="390" y="603">buffered, not shown yet</text>
+
+<!-- 7. Grounding check -->
+<g class="gr">
+  <rect x="160" y="616" width="440" height="78" rx="8"/>
+  <text class="h" x="380" y="639">④ Grounding check · grounding.verify()</text>
+  <text class="s" x="380" y="659">Are the citations from this turn's retrieved chunks?</text>
+  <text class="s" x="380" y="677">Are URLs and code / config values found in those chunks?</text>
+</g>
+
+<!-- outcomes -->
+<path class="edge" d="M240 694 L240 726 L125 726 L125 758" marker-end="url(#arrow)"/>
+<text class="lbl" x="182" y="719" text-anchor="middle">pass</text>
+<path class="edge" d="M365 694 L365 758" marker-end="url(#arrow)"/>
+<text class="lbl" x="357" y="731" text-anchor="end">fail</text>
+<path class="edge" d="M395 758 L395 696" marker-end="url(#arrow)"/>
+<text class="lbl" x="403" y="731">re-check</text>
+
+<g class="ok">
+  <rect x="15" y="760" width="220" height="90" rx="8"/>
+  <text class="h" x="125" y="784">✓ Accepted</text>
+  <text class="s" x="125" y="805">SUPPORTED, GENERAL or</text>
+  <text class="s" x="125" y="822">PARTIALLY_SUPPORTED</text>
+  <text class="s" x="125" y="839">answer + citations</text>
+</g>
+
+<g class="gr">
+  <rect x="270" y="760" width="220" height="90" rx="8"/>
+  <text class="h" x="380" y="784">↻ Rejected: repair once</text>
+  <text class="s" x="380" y="805">agent rewrites the reply</text>
+  <text class="s" x="380" y="822">from the same chunks,</text>
+  <text class="s" x="380" y="839">with the rejection reasons</text>
+</g>
+<path class="edge" d="M490 805 L523 805" marker-end="url(#arrow)"/>
+
+<g class="no">
+  <rect x="525" y="760" width="220" height="90" rx="8"/>
+  <text class="h" x="635" y="784">✕ Repair also fails</text>
+  <text class="s" x="635" y="805">NOT_SUPPORTED</text>
+  <text class="s" x="635" y="822">no-documentation reply with</text>
+  <text class="s" x="635" y="839">Teams and email contacts</text>
+</g>
+
+<path class="edge" d="M125 850 L125 888" marker-end="url(#arrow)"/>
+<path class="edge" d="M635 850 L635 888" marker-end="url(#arrow)"/>
+
+<!-- 8. Response -->
+<g class="n">
+  <rect x="15" y="890" width="730" height="76" rx="8"/>
+  <text class="h" x="380" y="913">User receives the response (SSE stream)</text>
+  <text class="s" x="380" y="933">status: searching → writing · content · grounding_status · citations · [DONE]</text>
+  <text class="s" x="380" y="951">The answer is sent only after the check, so a rejected draft never reaches the user.</text>
+</g>
+</svg>

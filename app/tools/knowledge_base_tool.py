@@ -9,6 +9,7 @@ from strands import ToolContext, tool
 
 from app.common.config import settings
 from app.common.trace import preview, trace
+from app.common.turn_report import record
 from app.retrieval.knowledge_base import merge_hits, multi_search
 from app.retrieval.models import RetrievedChunk, SearchQuery
 from app.services.query_rewriter import (
@@ -187,6 +188,7 @@ def _skip_search(turn: SearchTurn, rewrite: RewrittenQuery) -> str | None:
     else:
         return None
     turn.intent = rewrite.intent
+    record("search_skipped", reason=reason)
     logger.info(json.dumps({"event": "search_skipped", "reason": reason}))
     trace(f"search tool: skipped ({reason})", prompt=turn.prompt, returned=result.split(":", 1)[0])
     return result
@@ -228,6 +230,8 @@ def _search(turn: SearchTurn, citations: list | None) -> str:
             hits = merge_hits(hits, retry_hits)
             still_missing -= {f for f, r in pairs if r not in retry_stats["missing"]}
 
+    _record_search(turn, question, stats, retry_stats, hits,
+                   waited_ms=waited_ms, fallback=rewrite.fallback, intent_override=overridden)
     logger.info(json.dumps({
         "question": question,
         "intent": turn.intent,
@@ -285,6 +289,28 @@ def _search(turn: SearchTurn, citations: list | None) -> str:
         )
 
     return "\n\n---\n\n".join(blocks)
+
+
+def _record_search(turn: SearchTurn, question: str, stats: dict, retry_stats: dict | None,
+                   hits: list[RetrievedChunk], **flags) -> None:
+    """The search, for an attached TurnReport (app/common/turn_report.py)."""
+    record(
+        "search",
+        intent=turn.intent,
+        rerank_question=question,
+        queries=[{"text": q, "origin": o} for q, o in zip(stats["queries"], stats["origins"])],
+        missing=stats["missing"],
+        retry_queries=retry_stats["queries"] if retry_stats else [],
+        candidates=stats.get("candidates"),
+        reranked=stats.get("reranked"),
+        # Best first, as the agent sees them.
+        hits=[
+            {"uri": _uri(r), "title": _title(r), "score": r.score,
+             "found_by": r.metadata.get("_queries", [])}
+            for r in hits
+        ],
+        **flags,
+    )
 
 
 def _title(r: RetrievedChunk) -> str:

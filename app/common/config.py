@@ -175,6 +175,13 @@ class Settings(BaseSettings):
         default="sandbox-sso-rag-agent-context-store"
     )
 
+    # Where conversations are stored when ENVIRONMENT=local. The evaluation
+    # harness (evals/collect.py) points it at a temporary directory.
+    agent_store_dir: str = Field(
+        alias="AGENT_STORE_DIR",
+        default="./.agent-store/"
+    )
+
     session_cookie_name: str = Field(
         default="strands_session",
         alias="SESSION_COOKIE_NAME"

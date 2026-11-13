@@ -349,7 +349,8 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ENVIRONMENT` | `sandbox` | `local` stores conversations in `./.agent-store/` and turns on trace logs; anything else uses `AGENT_STORAGE_S3_BUCKET` |
+| `ENVIRONMENT` | `sandbox` | `local` stores conversations in `AGENT_STORE_DIR` and turns on trace logs; anything else uses `AGENT_STORAGE_S3_BUCKET` |
+| `AGENT_STORE_DIR` | `./.agent-store/` | Conversation storage when `ENVIRONMENT=local` (the evals point it at a temporary directory) |
 | `DEBUG_TRACE` | `true` | Trace logs of rewritten queries, search results and the agent's reply before the grounding check. Only has an effect when `ENVIRONMENT=local`; set `false` to silence them locally |
 | `AWS_REGION` | `ca-central-1` | Region for Bedrock calls |
 | `KNOWLEDGE_BASE_ID` | – (required) | Bedrock Knowledge Base to search |
@@ -928,10 +929,20 @@ uv sync
 uv run pytest
 ```
 
-Before changing the prompts, the query rewriter or retrieval settings, also
-run a fixed set of 15–20 real user questions (including follow-ups,
-multi-part questions, error messages and greetings) and compare answers,
-grounding statuses and the `query_rewrite` / tool log lines.
+Before changing the prompts, the models, the query rewriter or retrieval
+settings, run the evaluation set against Bedrock and compare it with a run
+from `main`:
+
+```bash
+uv sync --group eval
+uv run --group eval python -m evals.collect --label my-change
+uv run --group eval python -m evals.score evals/runs/<run id>
+uv run --group eval python -m evals.report evals/runs/<run id> --baseline evals/runs/<main run id>
+```
+
+See [evals/README.md](evals/README.md) for the dataset, the metrics and the
+judge, and [docs/components/evaluations.md](docs/components/evaluations.md)
+for how the evaluation works with DeepEval.
 
 ---
 

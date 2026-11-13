@@ -1,0 +1,37 @@
+name: Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+
+# A newer push to the same branch supersedes a run still in progress.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same uv as the Dockerfile; Python comes from .python-version.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.6"
+          enable-cache: true
+
+      # dev (pytest) is installed by default; eval adds deepeval so the
+      # evals tests run instead of being skipped.
+      - name: Install dependencies
+        run: uv sync --frozen --group eval
+
+      # tests/conftest.py supplies fake settings, so no secrets or AWS access
+      # are needed.
+      - name: Run tests
+        run: uv run --frozen pytest

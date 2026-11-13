@@ -16,7 +16,7 @@ from app.tools.knowledge_base_tool import (
     search_knowledge_base
 )
 
-LOCAL_STORAGE_DIR = "./.agent-store/"
+LOCAL_STORAGE_DIR = settings.agent_store_dir
 
 storage = LocalFileStorage(LOCAL_STORAGE_DIR) if settings.environment == "local" else S3Storage(settings.agent_storage_s3_bucket)
 
