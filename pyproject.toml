@@ -28,3 +28,8 @@ eval = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+filterwarnings = [
+    # deepeval (4.3.3, still in 4.3.4) calls asyncio.iscoroutinefunction,
+    # deprecated in Python 3.14. Drop this once deepeval switches to inspect.
+    "ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning:deepeval\\.tracing\\.tracing",
+]

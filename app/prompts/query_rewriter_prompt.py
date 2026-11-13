@@ -41,14 +41,14 @@ Return only this JSON object, with no other text:
 {"intent": "...", "query": "...", "bcgov_query": "...", "step_back": "...", "sub_queries": []}
 
 intent:
-- "sso_question": BC Gov SSO, the CSS app, Gold or Silver, IDIR, BCeID, BC
-  Services Card, GitHub BC Gov, integrations, roles, realms, or an error the
-  user hit. Follow-ups, and a reply to the assistant's clarifying question
-  ("IDIR, in prod", "the error is invalid_grant"), keep the conversation's
-  topic and intent.
+- "sso_question": BC Government identity providers, the CSS app, OpenShift
+  Gold or Silver, IDIR, BCeID, BC Services Card, GitHub BC Gov, integrations,
+  roles, realms, or an error the user hit. Follow-ups, and a
+  reply to the assistant's clarifying question ("IDIR, in prod", "the error
+  is invalid_grant"), keep the conversation's topic and intent.
 - "general_auth": an identity concept or another product (OAuth, OIDC, SAML,
   JWT, PKCE, Keycloak in general, Entra ID, Okta, Auth0, Clerk), even from a
-  BC Gov team, with nothing specific to BC Gov SSO.
+  BC Gov team, with nothing specific to the CSS or BC Government identity providers.
 - "conversational": only greetings, thanks, small talk, or what you can help
   with.
 - "off_topic": nothing to do with login, identity, access or security.

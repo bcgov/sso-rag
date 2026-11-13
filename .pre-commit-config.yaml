@@ -1,0 +1,31 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+        files: \.sh
+      - id: check-json
+      - id: check-vcs-permalinks
+      - id: check-yaml
+        exclude: "helm/.*|helm-cron-job/.*"
+      - id: check-ast
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+  - repo: local
+    hooks:
+      - id: python-formatter
+        name: Format Python codes
+        language: system
+        files: "src/.*py$"
+        entry: autopep8 --in-place --recursive src
+        pass_filenames: false
+  - repo: https://github.com/jumanjihouse/pre-commit-hooks
+    rev: 3.0.0 # or specific git tag
+    hooks:
+      - id: shellcheck
+  - repo: https://github.com/jorisroovers/gitlint
+    rev: v0.19.1
+    hooks:
+      - id: gitlint
+default_stages: [commit]
