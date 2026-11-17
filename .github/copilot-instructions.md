@@ -33,7 +33,10 @@ app/
   common/config.py               Settings (pydantic-settings, env vars / .env)
   common/constants.py            ACRONYMS used for query expansion
   common/logging.py              logging.basicConfig (import for side effect in CLIs)
+  common/metrics.py              CloudWatch EMF metric lines (plain JSON on stdout)
+  common/turn_report.py          TurnReport: per-turn pipeline values (evals + turn records)
   jobs/cleanup_sessions.py       CLI: python -m app.jobs.cleanup_sessions [--days N]
+  jobs/feedback_report.py        CLI: rated answers by day/range (python -m app.jobs.feedback_report)
   prompts/system_prompt.py       SYSTEM_PROMPT
   retrieval/bedrock_client.py    cached bedrock-agent-runtime client
   retrieval/knowledge_base.py    expand_query, retrieve, rerank, multi_search
@@ -44,6 +47,8 @@ app/
   services/grounding.py          grounding block parsing + rejection checks (verify)
   services/prompt_policy.py      blank / too-long rejection (MAX_PROMPT_TOKENS), link-only detection
   services/session_cleanup.py    deletes sessions inactive > SESSION_RETENTION_DAYS; delete_browser_history()
+  services/interaction_store.py  DynamoDB turn + rating records, credential masking, gsi1 rating queries
+  services/feedback_service.py   set_rating() (channel-agnostic), list_rated_turns()
   tools/knowledge_base_tool.py   @tool search_knowledge_base
 ui/src/
   hooks/useChat.ts               fetch + SSE parsing, tab id, new chat / delete history, stream abort
@@ -97,6 +102,19 @@ Python packages under `app/` are **namespace packages** (no `__init__.py`); don'
    Checks are deterministic string matches only (no LLM judge) — keep it that
    way unless asked.
 6. The response sets the session cookie on every call (sliding expiry).
+7. When turns are stored (`settings.analytics_active`), the route passes a
+   `TurnReport` to `ChatService.stream` and, before the `stop` chunk (or the
+   in-band error), writes the turn to DynamoDB (`interaction_store`), 5s limit,
+   failures only logged. A client disconnect records nothing.
+
+### `POST /chat/feedback`
+
+`{"turn_id": "chatcmpl-<uuid>", "rating": "up"|"down"|null}` → 204. The turn's
+`session_hash` must match the cookie's, else 404 (also when
+`FEEDBACK_ENABLED=false`). Ratings are items `FB#<rater hash>` under the turn
+with `gsi1` keys `RATING#<rating>#<YYYY-MM>` / `<date>#<created_at>` (BC
+dates). Design: `docs/plans/plan_feedback_analytics.md`. Delete history never
+deletes these records.
 
 ### SSE contract (`text/event-stream`)
 
@@ -235,6 +253,12 @@ it elsewhere.
 | `KEYCLOAK_AUDIENCE` | required | must be in token `aud` |
 | `KEYCLOAK_AUTHORIZED_PARTY` | required | equals token `azp` |
 | `AUTH_LOCAL_BYPASS` | `false` | only with `ENVIRONMENT=local`; then `KEYCLOAK_*` may be unset |
+| `ANALYTICS_ENABLED` | `true` | store turns; locally only with `AWS_ENDPOINT_URL_DYNAMODB` |
+| `ANALYTICS_TABLE_NAME` | `sso-rag-interactions` | |
+| `ANALYTICS_RETENTION_DAYS` | `180` | TTL of turns and ratings |
+| `FEEDBACK_ENABLED` | `true` | `POST /chat/feedback`; needs stored turns |
+| `AWS_ENDPOINT_URL_DYNAMODB` | unset | DynamoDB Local; read by `Settings` so `.env` works |
+| `APP_VERSION` | unset | image build arg (git SHA), stored on turns |
 
 Read settings via `from app.common.config import settings`; never `os.environ`
 directly. Secrets never go in source or images — `.env` is local only and is
@@ -291,6 +315,10 @@ yarn build
 # Docker
 docker build --platform linux/amd64 -t sso-rag-api:local .
 docker build --platform linux/amd64 -t sso-rag-ui:local ui
+docker compose up --build                  # UI :8080 + API :8000 + DynamoDB Local :8001 (exported AWS creds)
+
+# Rated answers (own AWS credentials, sso-rag-feedback-reader policy)
+uv run python -m app.jobs.feedback_report --rating down --days 30
 
 # Terraform (from terraform/)
 terraform fmt && terraform validate && terraform plan
@@ -302,10 +330,11 @@ aws s3 sync ./chunks s3://<bucket>/sso-docs/ --delete
 
 ## Testing
 
-There is no automated test suite yet. When adding tests use `pytest`
-(`uv run pytest`) with FastAPI's `TestClient`, and mock the agent
-(`app.services.chat_service.create_agent`) and boto3 so tests need no AWS
-access. For local storage tests, run from a temp directory — `./.agent-store/`
+Tests use `pytest` (`uv run pytest`) with FastAPI's `TestClient`; mock the
+agent (`app.services.chat_service.create_agent`) and boto3 so tests need no AWS
+access. DynamoDB code is tested against `moto` (`mock_aws`, see
+`tests/test_feedback.py`); `tests/conftest.py` sets `ANALYTICS_ENABLED=false`
+so other tests never store turns. For local storage tests, run from a temp directory — `./.agent-store/`
 is relative to the working directory and holds real dev sessions. For prompt or
 retrieval changes, compare answers and tool log lines on a fixed set of real
 questions (including multi-part ones).

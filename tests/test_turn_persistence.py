@@ -11,6 +11,8 @@ from strands.models.model import Model
 from strands.storage import LocalFileStorage
 
 from app.agents import rag_agent
+from app.common import turn_report
+from app.common.turn_report import TurnReport
 from app.services import chat_service as cs
 from app.services.chat_service import Status
 from app.services.query_rewriter import RewrittenQuery
@@ -151,3 +153,18 @@ def test_disconnect_during_repair_does_not_keep_the_rejected_answer(model):
     texts = " ".join(text for _, text in _stored_texts())
     assert "pathfinder" not in texts
     assert "failed the automatic grounding check" not in texts
+
+
+def test_report_passed_to_stream_collects_the_turn(model):
+    # The /chat route passes a TurnReport to record the turn; the turn runs
+    # in a task of its own, which must see it.
+    model.steps = ["tool", HALLUCINATED, HALLUCINATED]
+    report = TurnReport()
+
+    async def run():
+        return [item async for item in cs.chat_service.stream("q", SESSION, report=report)]
+
+    asyncio.run(run())
+
+    assert [e["attempt"] for e in report.of("attempt")] == ["first", "repair"]
+    assert turn_report._current.get() is None

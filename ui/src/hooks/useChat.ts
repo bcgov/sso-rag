@@ -6,7 +6,9 @@ import type {
   ChatMessage,
   ChatRequest,
   Citation,
+  FeedbackRequest,
   GroundingStatus,
+  Rating,
   StreamError,
 } from "../types";
 
@@ -19,6 +21,8 @@ import type {
 const API_URL = "chat";
 const HISTORY_URL = "chat/history";
 const CONFIG_URL = "chat/config";
+const FEEDBACK_URL = "chat/feedback";
+const RATING_FAILED_MESSAGE = "Your rating could not be saved. Please try again.";
 const INTERRUPTED_MESSAGE = "The response was interrupted. Please try again.";
 const DONE_SENTINEL = "[DONE]";
 const TAB_ID_HEADER = "X-Tab-Id";
@@ -68,17 +72,23 @@ export function useChat() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [maxPromptChars, setMaxPromptChars] = useState<number | null>(null);
+  const [feedbackEnabled, setFeedbackEnabled] = useState(false);
+  const [retentionDays, setRetentionDays] = useState<number | null>(null);
   const typewriterRef = useRef<Typewriter | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  // The message length limit. Without it the input isn't capped, but the
-  // API still rejects an over-long message with a readable reason.
+  // The message length limit, and whether answers can be rated. Without it
+  // the input isn't capped (the API still rejects an over-long message with
+  // a readable reason) and no rating buttons are shown.
   useEffect(() => {
     let cancelled = false;
     fetch(CONFIG_URL, { credentials: "same-origin" })
       .then((response) => (response.ok ? (response.json() as Promise<ChatConfig>) : null))
       .then((config) => {
-        if (!cancelled && config) setMaxPromptChars(config.max_prompt_chars);
+        if (cancelled || !config) return;
+        setMaxPromptChars(config.max_prompt_chars);
+        setFeedbackEnabled(config.feedback_enabled === true);
+        setRetentionDays(config.analytics_retention_days ?? null);
       })
       .catch(() => {
         // Not fatal: see above.
@@ -132,6 +142,7 @@ export function useChat() {
     typewriterRef.current = typewriter;
     const citations: Citation[] = [];
     let grounding: GroundingStatus | undefined;
+    let turnId: string | undefined;
 
     try {
       const body: ChatRequest = { prompt };
@@ -188,6 +199,9 @@ export function useChat() {
             throw new Error(chunk.error);
           }
 
+          // Every chunk carries the turn's id; a rating refers to it.
+          turnId ??= chunk.id;
+
           const choice = chunk.choices[0];
           if (!choice) continue;
 
@@ -225,6 +239,7 @@ export function useChat() {
         status: undefined,
         groundingStatus: grounding,
         citations: citations.length ? citations : undefined,
+        turnId,
       });
     } catch (err) {
       typewriter.cancel();
@@ -290,13 +305,48 @@ export function useChat() {
     rotateTabId();
   }, [stopStreaming]);
 
+  // Rates an answer (null clears the rating). The buttons update at once and
+  // roll back if the rating can't be saved; one request at a time per answer.
+  const rateMessage = useCallback(
+    async (message: ChatMessage, rating: Rating | null) => {
+      if (!message.turnId || message.ratingPending) return;
+      const previous = message.rating ?? null;
+      const patch = (fields: Partial<ChatMessage>) =>
+        setMessages((prev) =>
+          prev.map((m) => (m.id === message.id ? { ...m, ...fields } : m)),
+        );
+
+      patch({ rating, ratingPending: true });
+      try {
+        const body: FeedbackRequest = { turn_id: message.turnId, rating };
+        const response = await fetch(FEEDBACK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) {
+          throw new Error(await errorDetail(response));
+        }
+        patch({ ratingPending: false });
+      } catch (err) {
+        patch({ rating: previous, ratingPending: false });
+        setError(err instanceof Error ? err.message : RATING_FAILED_MESSAGE);
+      }
+    },
+    [],
+  );
+
   return {
     messages,
     isStreaming,
     error,
     maxPromptChars,
+    feedbackEnabled,
+    retentionDays,
     sendMessage,
     clearMessages,
     deleteHistory,
+    rateMessage,
   };
 }

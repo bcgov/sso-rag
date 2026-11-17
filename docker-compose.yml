@@ -1,0 +1,76 @@
+# Local development: the UI, the API and DynamoDB Local (turn and rating
+# records). The API still calls real Bedrock, so export AWS credentials in
+# the shell first, e.g.:
+#
+#   eval "$(aws configure export-credentials --profile <profile> --format env)"
+#   docker compose up --build                  # UI on http://localhost:8080
+#   docker compose --profile tools up --build  # + dynamodb-admin on :8002
+#
+# Settings come from .env (KNOWLEDGE_BASE_ID, MODEL_ARN, ...); the values
+# below override it.
+
+name: sso-rag
+
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:3.3.2
+    # -sharedDb: one database whatever credentials or region a client uses.
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/home/dynamodblocal/data"]
+    working_dir: /home/dynamodblocal
+    # A new named volume is owned by root; the image's user can't write it.
+    user: root
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
+    ports:
+      - "8001:8000"
+
+  api:
+    build:
+      context: .
+      args:
+        APP_VERSION: local
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      ENVIRONMENT: local
+      AUTH_LOCAL_BYPASS: "true"
+      SESSION_COOKIE_SECURE: "false"
+      AWS_ENDPOINT_URL_DYNAMODB: http://dynamodb:8000
+      # Passed through from the shell when set (Bedrock calls).
+      AWS_ACCESS_KEY_ID: ""
+      AWS_SECRET_ACCESS_KEY: ""
+      AWS_SESSION_TOKEN: ""
+    volumes:
+      # Conversation history (ENVIRONMENT=local stores it in ./.agent-store/).
+      - agent-store:/app/.agent-store
+    ports:
+      - "8000:8000"
+    depends_on:
+      - dynamodb
+
+  ui:
+    build: ./ui
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "8080:8080"
+    depends_on:
+      - api
+
+  dynamodb-admin:
+    image: aaronshaf/dynamodb-admin:5.3.4
+    profiles: [tools]
+    environment:
+      DYNAMO_ENDPOINT: http://dynamodb:8000
+      AWS_REGION: ca-central-1
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    ports:
+      - "8002:8001"
+    depends_on:
+      - dynamodb
+
+volumes:
+  dynamodb-data:
+  agent-store:

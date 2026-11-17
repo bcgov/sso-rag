@@ -107,3 +107,57 @@ resource "aws_iam_role_policy_attachment" "api_agent_storage" {
   role       = aws_iam_role.api_task.name
   policy_arn = aws_iam_policy.api_agent_storage.arn
 }
+
+# ── Chat turns and ratings (terraform/dynamodb.tf) ────────────────────────────
+
+data "aws_iam_policy_document" "api_interactions" {
+  # PutItem: turn records. GetItem: the owner check before a rating.
+  # UpdateItem / DeleteItem: setting and clearing a rating. Query: all
+  # ratings of one turn. The gsi1 index is maintained by DynamoDB.
+  statement {
+    sid    = "TurnsAndRatings"
+    effect = "Allow"
+    actions = [
+      "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
+      "dynamodb:GetItem",
+      "dynamodb:DeleteItem",
+      "dynamodb:Query",
+    ]
+    resources = [aws_dynamodb_table.interactions.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "api_interactions" {
+  name   = "interactions-access"
+  role   = aws_iam_role.api_task.id
+  policy = data.aws_iam_policy_document.api_interactions.json
+}
+
+# Read-only access for people reviewing ratings with
+# `python -m app.jobs.feedback_report` (and ad hoc scans). Not attached to the
+# API task: attach it to the role or permission set of whoever reviews.
+data "aws_iam_policy_document" "feedback_reader" {
+  statement {
+    sid       = "ListRatedTurns"
+    effect    = "Allow"
+    actions   = ["dynamodb:Query"]
+    resources = ["${aws_dynamodb_table.interactions.arn}/index/gsi1"]
+  }
+
+  statement {
+    sid    = "ReadTurns"
+    effect = "Allow"
+    actions = [
+      "dynamodb:BatchGetItem",
+      "dynamodb:Scan",
+    ]
+    resources = [aws_dynamodb_table.interactions.arn]
+  }
+}
+
+resource "aws_iam_policy" "feedback_reader" {
+  name        = "${local.name_prefix}-feedback-reader"
+  description = "Read rated chat turns from the interactions table"
+  policy      = data.aws_iam_policy_document.feedback_reader.json
+}

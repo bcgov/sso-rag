@@ -23,7 +23,7 @@ def authenticated():
 def client(monkeypatch):
     calls = []
 
-    async def stream(question, session_id, cancel_signal=None):
+    async def stream(question, session_id, cancel_signal=None, report=None):
         calls.append(question)
         yield Answer("ok", None, [])
 
@@ -61,7 +61,8 @@ def test_normal_prompt_streams(client):
 
 def test_config_reports_the_limit(client, monkeypatch):
     monkeypatch.setattr(chat_route.settings, "max_prompt_tokens", 150)
-    assert client.get("/chat/config").json() == {"max_prompt_tokens": 150, "max_prompt_chars": 600}
+    config = client.get("/chat/config").json()
+    assert (config["max_prompt_tokens"], config["max_prompt_chars"]) == (150, 600)
 
 
 def test_too_long_message_names_the_limit(client, monkeypatch):
@@ -77,7 +78,7 @@ def test_prompt_is_passed_on_stripped(client):
 
 
 def _stream_failing_with(monkeypatch, error):
-    async def stream(question, session_id, cancel_signal=None):
+    async def stream(question, session_id, cancel_signal=None, report=None):
         yield chat_route.Status("searching")
         raise error
 

@@ -211,6 +211,43 @@ class Settings(BaseSettings):
         alias="SESSION_CLEANUP_INTERVAL_HOURS"
     )
 
+    # Turn and feedback records (app/services/interaction_store.py), kept in
+    # DynamoDB for ANALYTICS_RETENTION_DAYS (TTL).
+    analytics_enabled: bool = Field(
+        default=True,
+        alias="ANALYTICS_ENABLED"
+    )
+
+    analytics_table_name: str = Field(
+        default="sso-rag-interactions",
+        alias="ANALYTICS_TABLE_NAME"
+    )
+
+    analytics_retention_days: int = Field(
+        default=180,
+        gt=0,
+        alias="ANALYTICS_RETENTION_DAYS"
+    )
+
+    # POST /chat/feedback (thumbs up/down); needs ANALYTICS_ENABLED.
+    feedback_enabled: bool = Field(
+        default=True,
+        alias="FEEDBACK_ENABLED"
+    )
+
+    # Points only the DynamoDB client at DynamoDB Local (docker-compose.yml).
+    # Read here as well as by boto3 so it also works from .env.
+    aws_endpoint_url_dynamodb: str | None = Field(
+        default=None,
+        alias="AWS_ENDPOINT_URL_DYNAMODB"
+    )
+
+    # Git SHA of the deployed image (Dockerfile build arg), stored on turns.
+    app_version: str | None = Field(
+        default=None,
+        alias="APP_VERSION"
+    )
+
     # Keycloak service-account authentication (app/services/authentication.py).
     # Callers send `Authorization: Bearer <access token>`; the token's
     # signature (RS256, realm JWKS), iss, aud, azp and exp are verified.
@@ -238,6 +275,18 @@ class Settings(BaseSettings):
     @property
     def is_local(self) -> bool:
         return self.environment == "local"
+
+    @property
+    def analytics_active(self) -> bool:
+        """Whether turns are stored. Locally only against DynamoDB Local, so a
+        developer's AWS credentials never write dev turns to a real table."""
+        if not self.analytics_enabled:
+            return False
+        return not self.is_local or bool(self.aws_endpoint_url_dynamodb)
+
+    @property
+    def feedback_active(self) -> bool:
+        return self.feedback_enabled and self.analytics_active
 
     @property
     def auth_bypassed(self) -> bool:

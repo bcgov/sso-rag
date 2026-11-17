@@ -33,3 +33,12 @@ output "tfstate_bucket" {
   value       = aws_s3_bucket.tfstate.bucket
 }
 
+output "interactions_table_name" {
+  description = "DynamoDB table of chat turns and ratings (ANALYTICS_TABLE_NAME)"
+  value       = aws_dynamodb_table.interactions.name
+}
+
+output "feedback_reader_policy_arn" {
+  description = "IAM policy to attach to whoever reviews ratings with app.jobs.feedback_report"
+  value       = aws_iam_policy.feedback_reader.arn
+}

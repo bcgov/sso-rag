@@ -139,6 +139,14 @@ variable "search_type" {
   default     = "SEMANTIC"
 }
 
+# ── Chat turns and ratings ───────────────────────────────────────────────────
+
+variable "analytics_retention_days" {
+  description = "Days chat turns and their ratings are kept in the interactions table (DynamoDB TTL)"
+  type        = string
+  default     = "180"
+}
+
 # ── Authentication (Keycloak service accounts) ───────────────────────────────
 
 variable "keycloak_issuer_url" {

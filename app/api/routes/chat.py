@@ -1,9 +1,11 @@
+import asyncio
 import json
 import logging
 import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -21,14 +23,20 @@ from app.api.dependencies.authentication import (
     require_service_account
 )
 
+from app.common import metrics
 from app.common.config import settings
+from app.common.turn_report import TurnReport
 
 from app.schemas.chat import (
     ChatConfig,
-    ChatRequest
+    ChatRequest,
+    FeedbackRequest
 )
 
+from app.services import feedback_service, interaction_store
+
 from app.services.chat_service import (
+    Answer,
     Heartbeat,
     Status,
     TurnTimeout,
@@ -65,6 +73,13 @@ TIMEOUT_MESSAGE = (
 
 TAB_ID_HEADER = "X-Tab-Id"
 
+FEEDBACK_NOT_FOUND = "This answer can't be rated."
+FEEDBACK_FAILED = "Your rating could not be saved. Please try again."
+
+# A turn record is written before the stream's "stop" chunk, so the user
+# waits for it; past this the turn goes unrecorded.
+TURN_RECORD_TIMEOUT_SECONDS = 5
+
 
 def _set_session_cookie(response: Response, session_id: str) -> None:
     response.set_cookie(
@@ -96,23 +111,77 @@ def _sse(completion_id: str, delta: dict, finish_reason: str | None = None) -> s
     return f"data: {json.dumps(chunk)}\n\n"
 
 
-async def _event_stream(prompt: str, session_id: str) -> AsyncIterator[str]:
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
+async def _record_turn(report: TurnReport, **fields) -> None:
+    """Stores the turn for analysis (app/services/interaction_store.py).
+    Never fails the chat: a failed write is only logged."""
+    try:
+        item = interaction_store.build_turn_record(events=report.snapshot(), **fields)
+        metrics.count(
+            "Turns",
+            {"Outcome": item["outcome"], "GroundingStatus": item.get("grounding_status") or "NONE"},
+            [["Outcome"], ["GroundingStatus"]],
+        )
+        await asyncio.wait_for(
+            asyncio.to_thread(interaction_store.record_turn, item),
+            TURN_RECORD_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.warning(
+            json.dumps({"event": "turn_record_failed", "outcome": fields.get("outcome")}),
+            exc_info=True,
+        )
+
+
+async def _event_stream(prompt: str, session_id: str, conversation: str) -> AsyncIterator[str]:
     completion_id = f"chatcmpl-{uuid.uuid4()}"
     # A client disconnect cancels this generator (Starlette), which stops the
-    # agent loop at once; nothing of the unfinished turn is saved. The model
-    # call already in flight may still finish in Strands' worker thread.
+    # agent loop at once; nothing of the unfinished turn is saved or
+    # recorded. The model call already in flight may still finish in
+    # Strands' worker thread.
     cancel = threading.Event()
+    report = TurnReport() if settings.analytics_active else None
+    created_at = datetime.now(UTC)
+    started = time.monotonic()
+    first_output_ms: int | None = None
+    answer: Answer | None = None
+
+    async def record(outcome: str, error: str | None = None) -> None:
+        if report is None:
+            return
+        await _record_turn(
+            report,
+            turn_id=completion_id,
+            session_id=session_id,
+            conversation_id=conversation,
+            question=prompt,
+            outcome=outcome,
+            created_at=created_at,
+            latency_ms=_elapsed_ms(started),
+            first_output_ms=first_output_ms,
+            answer=answer.text if answer else None,
+            grounding_status=answer.grounding_status if answer else None,
+            citations=answer.citations if answer else None,
+            error=error,
+        )
 
     try:
         yield _sse(completion_id, {"role": "assistant"})
 
-        async for item in chat_service.stream(prompt, session_id, cancel_signal=cancel):
+        async for item in chat_service.stream(prompt, conversation, cancel_signal=cancel, report=report):
             if isinstance(item, Heartbeat):
                 # SSE comment: ignored by clients, keeps proxies from timing out.
                 yield ": keepalive\n\n"
-            elif isinstance(item, Status):
+                continue
+            if first_output_ms is None:
+                first_output_ms = _elapsed_ms(started)
+            if isinstance(item, Status):
                 yield _sse(completion_id, {"status": item.value})
             else:
+                answer = item
                 yield _sse(completion_id, {"content": item.text})
                 if item.grounding_status:
                     yield _sse(completion_id, {"grounding_status": item.grounding_status})
@@ -126,13 +195,18 @@ async def _event_stream(prompt: str, session_id: str) -> AsyncIterator[str]:
                         for c in item.citations
                     ]})
 
+        # Before "stop": the UI offers rating only after it, so a rating
+        # never arrives before its turn is stored.
+        await record("ok")
         yield _sse(completion_id, {}, finish_reason="stop")
     except TurnTimeout:
         logger.warning(json.dumps({"event": "turn_timeout", "seconds": settings.turn_timeout_seconds}))
+        await record("timeout")
         yield f"data: {json.dumps({'error': TIMEOUT_MESSAGE})}\n\n"
-    except Exception:
+    except Exception as e:
         # Headers (status 200) are already sent, so report the failure in-band.
         logger.exception("chat stream failed")
+        await record("failed", error=type(e).__name__)
         yield f"data: {json.dumps({'error': FAILED_MESSAGE})}\n\n"
     finally:
         cancel.set()
@@ -144,11 +218,53 @@ async def _event_stream(prompt: str, session_id: str) -> AsyncIterator[str]:
     "/chat/config"
 )
 async def chat_config() -> ChatConfig:
-    """Limits the UI applies to the message box before sending."""
+    """Limits the UI applies to the message box before sending, and whether
+    it offers rating answers."""
     return ChatConfig(
         max_prompt_tokens=settings.max_prompt_tokens,
         max_prompt_chars=max_prompt_chars(),
+        feedback_enabled=settings.feedback_active,
+        analytics_retention_days=settings.analytics_retention_days if settings.analytics_active else None,
     )
+
+
+@router.post(
+    "/chat/feedback",
+    status_code=204,
+    responses={
+        404: {"description": "No answer of this browser's session has this id, or rating is off"},
+        500: {"description": "The rating could not be saved"}
+    }
+)
+def rate_answer(body: FeedbackRequest, request: Request) -> None:
+    """Rates one answer: `rating` "up" or "down", or null to clear it.
+    `turn_id` is the `id` of the answer's stream chunks. Repeated calls
+    overwrite, so the call is idempotent.
+
+    Only answers of this browser's session (the session cookie) can be
+    rated; anything else is a 404, which doesn't reveal whether the id
+    exists. A sync route: the DynamoDB calls block."""
+
+    session_id = request.cookies.get(settings.session_cookie_name)
+    if not settings.feedback_active or not is_valid_session_id(session_id):
+        raise HTTPException(status_code=404, detail=FEEDBACK_NOT_FOUND)
+
+    # On the web, the session is both the turn's owner and the rater.
+    session_hash = interaction_store.hash_id(session_id)
+    try:
+        found = feedback_service.set_rating(
+            body.turn_id,
+            session_hash,
+            body.rating,
+            interaction_store.WEB,
+            session_hash=session_hash,
+        )
+    except Exception:
+        logger.exception("saving feedback failed")
+        raise HTTPException(status_code=500, detail=FEEDBACK_FAILED)
+
+    if not found:
+        raise HTTPException(status_code=404, detail=FEEDBACK_NOT_FOUND)
 
 
 @router.post(
@@ -189,7 +305,7 @@ async def chat(
         session_id = new_session_id()
 
     response = StreamingResponse(
-        _event_stream(prompt, conversation_id(session_id, tab_id)),
+        _event_stream(prompt, session_id, conversation_id(session_id, tab_id)),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -245,7 +361,11 @@ async def reset_chat(
 async def delete_history(request: Request, response: Response):
     """Deletes all of this browser's stored chat history — the conversations
     of every tab — and clears the session cookie so the next /chat call
-    starts a new session. Idempotent: succeeds when nothing is stored."""
+    starts a new session. Idempotent: succeeds when nothing is stored.
+
+    Turn and rating records kept for analysis (app/services/
+    interaction_store.py) aren't deleted; without the cookie, those answers
+    can no longer be rated."""
 
     session_id = request.cookies.get(settings.session_cookie_name)
 
