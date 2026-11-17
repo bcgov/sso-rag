@@ -79,12 +79,15 @@ def hash_id(value: str) -> str:
 
 REDACTED = "[REDACTED]"
 
-_JWT = re.compile(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
+# Linear time on any input: a match can only start where a keyword (or a JWT
+# not preceded by a token character) starts, and no two parts of a pattern can
+# match the same characters, so a failed attempt never backtracks.
+_JWT = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]++\.[A-Za-z0-9_-]++\.[A-Za-z0-9_-]*+")
 _BEARER = re.compile(r"\b(Bearer)\s+[A-Za-z0-9._~+/-]{8,}=*", re.IGNORECASE)
-# Also prefixed names such as KEYCLOAK_CLIENT_SECRET or DB_PASSWORD ("_" is a
-# word character, so \b wouldn't match before CLIENT_SECRET).
+# Only the keyword is matched, so prefixed names such as KEYCLOAK_CLIENT_SECRET
+# or DB_PASSWORD are masked too, their prefix left as it is.
 _SECRET_VALUE = re.compile(
-    r"""(?<![A-Za-z0-9])([A-Za-z0-9_-]*?(?:client[_-]?secret|password|passwd))(["']?\s*[:=]\s*["']?)[^\s"'&,;]+""",
+    r"""(client[_-]?secret|password|passwd)(["']?\s*[:=]\s*["']?)[^\s"'&,;]+""",
     re.IGNORECASE,
 )
 # Keycloak's installation JSON: "credentials": {"secret": "..."}. Only the

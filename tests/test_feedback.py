@@ -2,6 +2,7 @@
 table (no AWS access)."""
 
 import json
+import time
 from datetime import UTC, date, datetime
 
 import pytest
@@ -171,6 +172,19 @@ def test_turn_date_is_the_bc_date():
 ])
 def test_credentials_are_masked(text, expected):
     assert interaction_store.mask_credentials(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "a_" * 15_000,                   # name characters with no keyword
+    "eyJ-" * 25_000,                 # JWT starts with no dots
+    "password_" * 10_000,            # keywords with no separator
+])
+def test_masking_takes_linear_time(text):
+    # Quadratic patterns took seconds on these; masking runs before the
+    # stream's "stop" chunk, on the event loop.
+    started = time.perf_counter()
+    interaction_store.mask_credentials(text)
+    assert time.perf_counter() - started < 0.5
 
 
 def test_stored_turn_masks_credentials_everywhere():
