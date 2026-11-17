@@ -191,10 +191,13 @@ sso-rag/
 │   ├── common/
 │   │   ├── config.py
 │   │   ├── constants.py      # acronym expansions
-│   │   └── logging.py
+│   │   ├── logging.py
+│   │   ├── metrics.py        # CloudWatch metrics (EMF log lines)
+│   │   └── turn_report.py    # per-turn pipeline values (evals, turn records)
 │   │
 │   ├── jobs/
-│   │   └── cleanup_sessions.py  # one-off session cleanup CLI
+│   │   ├── cleanup_sessions.py  # one-off session cleanup CLI
+│   │   └── feedback_report.py   # lists rated answers (👍/👎)
 │   │
 │   ├── prompts/
 │   │   └── system_prompt.py
@@ -206,7 +209,9 @@ sso-rag/
 │   │
 │   ├── services/
 │   │   ├── chat_service.py
-│   │   └── session_cleanup.py   # deletes inactive sessions
+│   │   ├── feedback_service.py    # thumbs up/down ratings
+│   │   ├── interaction_store.py   # turn and rating records (DynamoDB)
+│   │   └── session_cleanup.py     # deletes inactive sessions
 │   │
 │   ├── tools/
 │   │   └── knowledge_base_tool.py
@@ -217,11 +222,12 @@ sso-rag/
 │
 ├── chunker/                  # docs preprocessor (chunks for the KB)
 ├── legacy/                   # earlier POCs
-├── terraform/                # AWS infrastructure (ECS, ALB, API Gateway, IAM, ECR)
+├── terraform/                # AWS infrastructure (ECS, ALB, API Gateway, IAM, ECR, DynamoDB)
 ├── ui/                       # chat UI (React + nginx)
 ├── .github/workflows/
 │   └── build-push-deploy.yml # build images, terraform apply, roll out
 ├── Dockerfile                # API image
+├── docker-compose.yml        # local UI + API + DynamoDB Local
 ├── .dockerignore
 ├── main.py
 ├── pyproject.toml
@@ -380,6 +386,12 @@ RERANKER_MODEL_ARN=<reranker-model-arn>
 | `SESSION_COOKIE_SECURE` | `true` | Send the cookie over HTTPS only; set `false` for plain-HTTP localhost |
 | `SESSION_RETENTION_DAYS` | `3` | Delete stored conversations with no activity for longer than this many days |
 | `SESSION_CLEANUP_INTERVAL_HOURS` | `24` | How often the API runs the session cleanup; `0` disables the in-process job |
+| `ANALYTICS_ENABLED` | `true` | Store every `/chat` turn for analysis (see [Turn records and ratings](#turn-records-and-ratings)). With `ENVIRONMENT=local`, only when `AWS_ENDPOINT_URL_DYNAMODB` is set, so dev turns never reach a real table |
+| `ANALYTICS_TABLE_NAME` | `sso-rag-interactions` | DynamoDB table of turns and ratings |
+| `ANALYTICS_RETENTION_DAYS` | `180` | Days turns and their ratings are kept (DynamoDB TTL) |
+| `FEEDBACK_ENABLED` | `true` | Allow rating answers (`POST /chat/feedback`, the UI's 👍/👎); needs turns to be stored |
+| `AWS_ENDPOINT_URL_DYNAMODB` | unset | Points only the DynamoDB client at DynamoDB Local (e.g. `http://localhost:8001`); also read from `.env` |
+| `APP_VERSION` | unset | Git SHA stored on each turn; set by the image build (`--build-arg APP_VERSION=…`) |
 | `KEYCLOAK_ISSUER_URL` | – (required) | Keycloak realm URL, e.g. `https://<host>/auth/realms/<realm>`. Must be `https` and equal the tokens' `iss` exactly; signing keys are fetched from `<issuer>/protocol/openid-connect/certs` |
 | `KEYCLOAK_AUDIENCE` | – (required) | Value the tokens' `aud` claim must contain |
 | `KEYCLOAK_AUTHORIZED_PARTY` | – (required) | Client ID of the service account allowed to call the API; must equal the tokens' `azp` |
@@ -530,8 +542,10 @@ search queries are written in English too.
 GET /chat/config
 ```
 
-Returns the limits the UI applies before sending:
-`{"max_prompt_tokens": 200, "max_prompt_chars": 800}`.
+Returns the limits and features the UI applies:
+`{"max_prompt_tokens": 200, "max_prompt_chars": 800, "feedback_enabled": true,
+"analytics_retention_days": 180}` (`analytics_retention_days` is `null` when
+turns aren't stored).
 
 The response is a `text/event-stream` of OpenAI-compatible
 `chat.completion.chunk` events, ending with `data: [DONE]`:
@@ -693,6 +707,62 @@ To run it from an external scheduler instead, set
 python -m app.jobs.cleanup_sessions            # uses SESSION_RETENTION_DAYS
 python -m app.jobs.cleanup_sessions --days 30
 ```
+
+```http
+POST /chat/feedback
+```
+
+Rates one answer, thumbs up or down:
+
+```json
+{"turn_id": "chatcmpl-…", "rating": "down"}
+```
+
+`turn_id` is the `id` of the answer's stream chunks; `rating` is `up`, `down`
+or `null` (clears it). Returns `204`; repeated calls overwrite. Only answers of
+the same browser session (the cookie) can be rated: any other id, a missing
+cookie, or `FEEDBACK_ENABLED=false` gets `404`. A storage failure is a `500`
+with a `detail`. The UI shows the buttons after an answer finishes, except on
+greetings, clarifying questions and errors (no `grounding_status`).
+
+### Turn records and ratings
+
+Every `/chat` turn is stored in the DynamoDB table `ANALYTICS_TABLE_NAME` for
+`ANALYTICS_RETENTION_DAYS` (default 180, DynamoDB TTL), separately from the
+conversation history, so it survives the 3-day session cleanup and
+`DELETE /chat/history`. Point-in-time recovery keeps deleted items restorable
+for 35 more days. The design is in
+[docs/plans/plan_feedback_analytics.md](docs/plans/plan_feedback_analytics.md);
+the data model, lifecycle and example queries are in
+[docs/components/analytics.md](docs/components/analytics.md).
+
+- **Turn item** (`pk = TURN#<turn id>`, `sk = META`): question and delivered
+  answer, outcome (`ok`, `timeout`, `failed`), grounding status, rejected
+  replies and repair attempts, the rewrite, searches (URIs and scores, not
+  chunk text), citations, model ids, token usage, latencies, `app_version`
+  and the SHA-256 of the session and conversation ids. JWTs, bearer tokens,
+  client secret / password values (also prefixed, e.g.
+  `KEYCLOAK_CLIENT_SECRET=`) and Keycloak's `"secret"` JSON key are replaced
+  with `[REDACTED]`.
+  Written before the `stop` chunk with a 5s limit; a failed write is logged
+  (`turn_record_failed`) and never breaks the chat. Turns abandoned by a
+  client disconnect aren't recorded.
+- **Rating item** (`sk = FB#<rater hash>`, the session hash on the web): `up`
+  or `down`, expiring with its turn. Its `gsi1` keys
+  (`RATING#<rating>#<YYYY-MM>`, `<date>#<created_at>`, dates in
+  `America/Vancouver`) list rated turns by day or range without a scan.
+
+Review rated answers with your own AWS credentials (the
+`sso-rag-feedback-reader` policy):
+
+```bash
+uv run python -m app.jobs.feedback_report --rating down --date 2026-11-16
+uv run python -m app.jobs.feedback_report --rating all --days 30 --json   # JSON lines
+```
+
+Each turn and each rating also logs a CloudWatch metric (namespace `SsoRag`,
+Embedded Metric Format): `Turns` by `Outcome` and `GroundingStatus`, and
+`Feedback` by `Rating` (and `GroundingStatus`).
 
 ---
 
@@ -917,12 +987,42 @@ Redoc:
 http://localhost:8000/redoc
 ```
 
+## Docker Compose
+
+`docker-compose.yml` runs the UI, the API and DynamoDB Local (turn and rating
+records) together. The API still calls real Bedrock, so export credentials
+first; settings come from `.env`, with `ENVIRONMENT=local`,
+`AUTH_LOCAL_BYPASS=true` and `SESSION_COOKIE_SECURE=false` set by the compose
+file.
+
+```bash
+eval "$(aws configure export-credentials --profile <profile> --format env)"
+docker compose up --build                   # UI on http://localhost:8080, API on :8000
+docker compose --profile tools up --build   # also dynamodb-admin on http://localhost:8002
+```
+
+SSO session credentials expire; export them again and restart the `api`
+service when they do. Conversations and DynamoDB data live in named volumes
+(`docker compose down -v` removes them).
+
+To run the API on the host instead, start only DynamoDB Local and point the
+API at it (the table is created at startup):
+
+```bash
+docker compose up dynamodb
+AWS_ENDPOINT_URL_DYNAMODB=http://localhost:8001 ENVIRONMENT=local ... uv run uvicorn main:app --reload
+```
+
+Without `AWS_ENDPOINT_URL_DYNAMODB`, a local API doesn't store turns and the
+UI shows no rating buttons.
+
 ---
 
 # Testing
 
 Unit tests (query rewriter parsing and fail-open, multi-query search, the
-search tool) mock all Bedrock calls and run with:
+search tool) mock all Bedrock calls; turn records and ratings run against an
+in-memory DynamoDB ([moto](https://docs.getmoto.org/)). They run with:
 
 ```bash
 uv sync
@@ -972,7 +1072,8 @@ API service
   ├── Bedrock Knowledge Base (Retrieve)
   ├── Bedrock Rerank
   ├── Bedrock agent model (ConverseStream)
-  └── S3 agent storage bucket (conversation history)
+  ├── S3 agent storage bucket (conversation history)
+  └── DynamoDB interactions table (turn and rating records)
 ```
 
 | Resource | Name | File |
@@ -984,7 +1085,9 @@ API service
 | API Gateway REST API + stage + VPC Link v2 | `sso-rag-api-gw`, stage `<environment>` | `apigateway.tf` |
 | API Gateway CloudWatch role (account setting, for access logs) | `sso-rag-apigw-cloudwatch` | `apigateway.tf` |
 | Agent storage bucket | `<environment>-sso-rag-agent-context-store` | `s3.tf` |
+| Turns and ratings table | `sso-rag-interactions` | `dynamodb.tf` |
 | Task roles | `sso-rag-api-task`, `sso-rag-ui-task` | `iam.tf` |
+| Rating reviewer policy (attach to reviewers) | `sso-rag-feedback-reader` | `iam.tf` |
 | Log groups | `/ecs/sso-rag/api`, `/ecs/sso-rag/ui`, `/aws/apigateway/sso-rag` | `ecs.tf`, `apigateway.tf` |
 
 Networking uses an existing VPC: subnets are looked up by their `Name` tag
@@ -1001,6 +1104,7 @@ The root `Dockerfile` builds the API image:
   only the virtualenv, `main.py` and `app/`.
 - Starts `uvicorn main:app` with 2 workers on port 8000, with keep-alive (125s)
   longer than the ALB idle timeout to avoid 502s.
+- `APP_VERSION` (build arg, the git SHA in CI) is stored on each turn record.
 
 `.dockerignore` keeps `.env`, `.venv`, `.git`, `legacy/`, `ui/`, `terraform/`
 and `chunker/` out of the build context. Configuration comes from ECS task
@@ -1024,7 +1128,8 @@ docker run --rm -p 8000:8000 --env-file .env \
 Steps:
 
 1. Assume the deploy role via GitHub OIDC.
-2. Build and push the API image (repo root) and UI image (`ui/`) to ECR as `:latest`.
+2. Build and push the API image (repo root, with `APP_VERSION` set to the
+   commit SHA) and UI image (`ui/`) to ECR as `:latest`.
 3. `terraform init` with the S3 backend, then `plan` and `apply`.
 4. Force a new deployment of `sso-rag-api` and `sso-rag-ui` so ECS pulls the
    new `:latest` images, and wait until both services are stable.
@@ -1064,6 +1169,7 @@ variables. See `terraform/terraform.tfvars.example`.
 | `number_of_reranked_results` | `6` | → `NUMBER_OF_RERANKED_RESULTS` |
 | `min_rerank_score` | `0.05` | → `MIN_RERANK_SCORE` |
 | `search_type` | `SEMANTIC` | → `SEARCH_TYPE` |
+| `analytics_retention_days` | `180` | → `ANALYTICS_RETENTION_DAYS` |
 | `keycloak_issuer_url` | – (required) | → `KEYCLOAK_ISSUER_URL` (CI: `Development` environment variable `KEYCLOAK_ISSUER_URL`) |
 | `keycloak_audience` | – (required) | → `KEYCLOAK_AUDIENCE` (CI: `Development` environment variable `KEYCLOAK_AUDIENCE`) |
 | `keycloak_authorized_party` | – (required) | → `KEYCLOAK_AUTHORIZED_PARTY` (CI: `Development` environment variable `KEYCLOAK_AUTHORIZED_PARTY`) |
@@ -1155,12 +1261,22 @@ bedrock:GetInferenceProfile            # cross-region inference profile
 bedrock:Rerank                         # reranking merged results
 s3:GetObject, s3:PutObject             # conversation history (agent storage bucket)
 s3:DeleteObject, s3:ListBucket         # DELETE /chat, DELETE /chat/history, session cleanup
+dynamodb:PutItem                       # turn records (interactions table)
+dynamodb:GetItem, dynamodb:UpdateItem  # rating an answer (owner check, set)
+dynamodb:DeleteItem, dynamodb:Query    # clearing a rating, a turn's ratings
 ```
 
 These are defined for the API task role in `terraform/iam.tf`. Model
 permissions are not pinned to one region because cross-region inference
 profiles route to models in other regions; `Rerank` does not support
-resource-level permissions.
+resource-level permissions. The table uses the AWS managed KMS key, so no KMS
+permissions are needed.
+
+Reviewing ratings (`app.jobs.feedback_report`) needs `dynamodb:Query` on the
+table's `gsi1` index and `dynamodb:BatchGetItem` (plus `dynamodb:Scan` for ad
+hoc analysis); Terraform creates them as the `sso-rag-feedback-reader` policy
+(output `feedback_reader_policy_arn`) to attach to reviewers, not to the API.
+The Terraform deploy role needs permission to create the DynamoDB table.
 
 ## Secrets
 

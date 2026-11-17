@@ -38,6 +38,14 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# Git SHA of the build, stored on each turn record (set by the workflow).
+ARG APP_VERSION=""
+ENV APP_VERSION=${APP_VERSION}
+
+# Local conversation store (ENVIRONMENT=local, e.g. docker-compose.yml): a
+# named volume mounted here inherits this owner, so the app user can write it.
+RUN mkdir -p /app/.agent-store && chown appuser:appgroup /app/.agent-store
+
 # Drop privileges
 USER appuser
 

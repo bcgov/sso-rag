@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.common.config import settings
+from app.services import interaction_store
 from app.services.session_cleanup import run_session_cleanup_loop
 
 from app.api.routes.chat import (
@@ -30,21 +31,45 @@ if settings.auth_bypassed:
     logger.warning("AUTH_LOCAL_BYPASS is on: API requests are NOT authenticated")
 
 
+LOCAL_TABLE_ATTEMPTS = 30
+
+
+async def create_local_analytics_table() -> None:
+    """Creates the turn/rating table in DynamoDB Local, retrying while it
+    starts (docker-compose.yml). Deployed tables come from Terraform."""
+    for attempt in range(1, LOCAL_TABLE_ATTEMPTS + 1):
+        try:
+            await asyncio.to_thread(interaction_store.ensure_table)
+            return
+        except Exception as e:
+            if attempt == LOCAL_TABLE_ATTEMPTS:
+                logger.warning("could not create the local analytics table: %s", e)
+                return
+            await asyncio.sleep(1)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    background = []
+
     # Periodically delete conversations older than SESSION_RETENTION_DAYS.
-    cleanup = None
     if settings.session_cleanup_interval_hours > 0:
-        cleanup = asyncio.create_task(
+        background.append(asyncio.create_task(
             run_session_cleanup_loop(settings.session_cleanup_interval_hours)
-        )
+        ))
+
+    # In the background, so the API serves while DynamoDB Local starts.
+    if settings.is_local and settings.analytics_active:
+        background.append(asyncio.create_task(create_local_analytics_table()))
+    elif settings.is_local and settings.analytics_enabled:
+        logger.info("turns are not stored: set AWS_ENDPOINT_URL_DYNAMODB to use DynamoDB Local")
 
     yield
 
-    if cleanup:
-        cleanup.cancel()
+    for task in background:
+        task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await cleanup
+            await task
 
 
 app = FastAPI(

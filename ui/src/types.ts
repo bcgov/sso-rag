@@ -48,6 +48,18 @@ export interface ChatConfig {
   max_prompt_tokens: number;
   /** The token limit as characters (~4 per token). */
   max_prompt_chars: number;
+  /** Whether answers can be rated (POST /chat/feedback). */
+  feedback_enabled: boolean;
+  /** How long questions and answers are kept; null when they aren't. */
+  analytics_retention_days: number | null;
+}
+
+export type Rating = "up" | "down";
+
+/** POST /chat/feedback; a null rating clears it. */
+export interface FeedbackRequest {
+  turn_id: string;
+  rating: Rating | null;
 }
 
 /** In-band error event sent if the stream fails after it has started. */
@@ -88,4 +100,9 @@ export interface ChatMessage {
   /** Latest progress update, shown until the answer text arrives */
   status?: ProgressStatus;
   groundingStatus?: GroundingStatus;
+  /** The stream chunks' `id`: what a rating refers to */
+  turnId?: string;
+  rating?: Rating | null;
+  /** True while a rating is being saved */
+  ratingPending?: boolean;
 }

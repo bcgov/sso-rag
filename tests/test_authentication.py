@@ -412,6 +412,7 @@ PROTECTED = [
     ("DELETE", "/chat", {}),
     ("DELETE", "/chat/history", {}),
     ("GET", "/documents/search", {"params": {"query": "integration"}}),
+    ("POST", "/chat/feedback", {"json": {"turn_id": "chatcmpl-11111111-1111-4111-8111-111111111111", "rating": "up"}}),
 ]
 
 SESSION = "session_11111111-1111-4111-8111-111111111111"
@@ -427,7 +428,7 @@ def api(monkeypatch):
 
     work = []
 
-    async def stream(question, session_id, cancel_signal=None):
+    async def stream(question, session_id, cancel_signal=None, report=None):
         work.append("chat")
         yield Answer("ok", None, [])
 

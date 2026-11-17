@@ -79,6 +79,8 @@ resource "aws_ecs_task_definition" "api" {
         { name = "QUERY_REWRITER_STEP_BACK_ENABLED", value = var.query_rewriter_step_back_enabled },
         { name = "QUERY_REWRITER_DECOMPOSITION_ENABLED", value = var.query_rewriter_decomposition_enabled },
         { name = "QUERY_REWRITER_RETRY_ENABLED", value = var.query_rewriter_retry_enabled },
+        { name = "ANALYTICS_TABLE_NAME", value = aws_dynamodb_table.interactions.name },
+        { name = "ANALYTICS_RETENTION_DAYS", value = var.analytics_retention_days },
         # AUTH_LOCAL_BYPASS is never set here: deployed tasks always authenticate.
         { name = "KEYCLOAK_ISSUER_URL", value = var.keycloak_issuer_url },
         { name = "KEYCLOAK_AUDIENCE", value = var.keycloak_audience },

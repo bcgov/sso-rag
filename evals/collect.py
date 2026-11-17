@@ -134,6 +134,8 @@ def _prepare_environment(store_dir: str) -> None:
     os.environ["ENVIRONMENT"] = "local"
     os.environ["DEBUG_TRACE"] = "false"
     os.environ["AGENT_STORE_DIR"] = store_dir
+    # Eval turns are not real user turns.
+    os.environ["ANALYTICS_ENABLED"] = "false"
 
 
 def _check_isolated_storage(store_dir: str) -> None:

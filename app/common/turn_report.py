@@ -1,11 +1,12 @@
 """Optional per-turn report of the pipeline's intermediate values, for the
-evaluation harness (evals/collect.py).
+evaluation harness (evals/collect.py) and the stored turn records
+(app/services/interaction_store.py).
 
 The rewriter's output, the search the tool ran, each model call's token use,
 and each reply attempt with its grounding verdict are only visible inside
 ChatService, the search tool and the rewriter. When a TurnReport is attached
-with `capture()`, `record()` appends them to it; otherwise (always, in the
-deployed service) `record()` returns at once.
+with `capture()` (evals) or passed to `ChatService.stream` (the /chat route),
+`record()` appends them to it; otherwise `record()` returns at once.
 
 The report lives in a ContextVar, so concurrent turns (asyncio tasks) each see
 their own. asyncio tasks and `asyncio.to_thread` (how Strands runs sync tools)
@@ -38,6 +39,11 @@ class TurnReport:
         found = self.of(event)
         return found[-1] if found else None
 
+    def snapshot(self) -> list[dict]:
+        """A copy of the events so far; threads may still be adding to it."""
+        with self._lock:
+            return list(self.events)
+
 
 _current: ContextVar[TurnReport | None] = ContextVar("turn_report", default=None)
 
@@ -52,6 +58,13 @@ def capture() -> Iterator[TurnReport]:
         yield report
     finally:
         _current.reset(token)
+
+
+def attach(report: TurnReport) -> None:
+    """Attaches `report` for the rest of the current context, without
+    detaching it again: only for a context that ends with the turn, such as
+    the task ChatService runs a turn in."""
+    _current.set(report)
 
 
 def record(event: str, **fields) -> None:

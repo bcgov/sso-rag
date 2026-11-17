@@ -5,12 +5,14 @@ interface Props {
   disabled: boolean;
   /** Longest message the API accepts, in characters; null while unknown. */
   maxChars?: number | null;
+  /** Shown under the input, e.g. how long messages are kept. */
+  notice?: string | null;
 }
 
 // Show the length counter once the message reaches this share of the limit.
 const COUNTER_FROM = 0.8;
 
-export function ChatInput({ onSend, disabled, maxChars = null }: Props) {
+export function ChatInput({ onSend, disabled, maxChars = null, notice = null }: Props) {
   const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const length = value.trim().length;
@@ -84,6 +86,7 @@ export function ChatInput({ onSend, disabled, maxChars = null }: Props) {
             : `${length.toLocaleString()} / ${maxChars.toLocaleString()} characters`}
         </p>
       )}
+      {notice && <p className="mt-1 text-xs text-gray-400">{notice}</p>}
     </form>
   );
 }

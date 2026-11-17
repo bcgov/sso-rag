@@ -6,15 +6,29 @@ import { useChat } from "./hooks/useChat";
 
 const NOTICE_MS = 4000;
 
+// "Questions and answers are kept for 6 months…" (days in whole months when
+// they divide evenly).
+function retentionNotice(days: number | null): string | null {
+  if (days === null) return null;
+  const months = days / 30;
+  const period = Number.isInteger(months)
+    ? `${months} month${months === 1 ? "" : "s"}`
+    : `${days} day${days === 1 ? "" : "s"}`;
+  return `Questions and answers are kept for ${period} to improve this service.`;
+}
+
 export default function App() {
   const {
     messages,
     isStreaming,
     error,
     maxPromptChars,
+    feedbackEnabled,
+    retentionDays,
     sendMessage,
     clearMessages,
     deleteHistory,
+    rateMessage,
   } = useChat();
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -118,7 +132,11 @@ export default function App() {
           </div>
         ) : (
           messages.map((msg) => (
-            <ChatMessageBubble key={msg.id} message={msg} />
+            <ChatMessageBubble
+              key={msg.id}
+              message={msg}
+              onRate={feedbackEnabled ? rateMessage : undefined}
+            />
           ))
         )}
 
@@ -132,7 +150,12 @@ export default function App() {
       </main>
 
       {/* Input */}
-      <ChatInput onSend={sendMessage} disabled={isStreaming} maxChars={maxPromptChars} />
+      <ChatInput
+        onSend={sendMessage}
+        disabled={isStreaming}
+        maxChars={maxPromptChars}
+        notice={retentionNotice(retentionDays)}
+      />
     </div>
   );
 }

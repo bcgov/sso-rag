@@ -2,11 +2,18 @@ import { memo } from "react";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { stabilizeStreamingMarkdown } from "../lib/markdown";
-import type { ChatMessage, Citation, ProgressStatus } from "../types";
+import type { ChatMessage, Citation, ProgressStatus, Rating } from "../types";
 
 interface Props {
   message: ChatMessage;
+  /** Rates the answer (null clears it); no buttons when omitted. */
+  onRate?: (message: ChatMessage, rating: Rating | null) => void;
 }
+
+const RATING_OPTIONS: { value: Rating; label: string; icon: string }[] = [
+  { value: "up", label: "Helpful", icon: "👍" },
+  { value: "down", label: "Not helpful", icon: "👎" },
+];
 
 const PROGRESS_LABELS: Record<ProgressStatus | "thinking", string> = {
   thinking: "Thinking…",
@@ -31,8 +38,14 @@ const markdownComponents: Components = {
 // object and skip re-parsing their Markdown on every frame.
 export const ChatMessageBubble = memo(function ChatMessageBubble({
   message,
+  onRate,
 }: Props) {
   const isUser = message.role === "user";
+  // Only checked answers: not greetings, clarifying questions or errors.
+  const canRate =
+    !message.streaming &&
+    message.turnId !== undefined &&
+    message.groundingStatus !== undefined;
 
   return (
     <div className={`flex w-full ${isUser ? "justify-end" : "justify-start"}`}>
@@ -95,10 +108,47 @@ export const ChatMessageBubble = memo(function ChatMessageBubble({
           message.citations.length > 0 && (
             <CitationList citations={message.citations} />
           )}
+
+        {onRate && canRate && <RatingButtons message={message} onRate={onRate} />}
       </div>
     </div>
   );
 });
+
+function RatingButtons({
+  message,
+  onRate,
+}: {
+  message: ChatMessage;
+  onRate: (message: ChatMessage, rating: Rating | null) => void;
+}) {
+  return (
+    <div role="group" aria-label="Rate this answer" className="mt-2 flex items-center gap-1">
+      {RATING_OPTIONS.map(({ value, label, icon }) => {
+        const selected = message.rating === value;
+        return (
+          <button
+            key={value}
+            type="button"
+            aria-label={label}
+            aria-pressed={selected}
+            title={selected ? `${label} (click again to clear)` : label}
+            disabled={message.ratingPending}
+            // Clicking the selected thumb again clears the rating.
+            onClick={() => onRate(message, selected ? null : value)}
+            className={`rounded-md px-1.5 py-0.5 text-sm transition focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-wait ${
+              selected
+                ? "bg-white opacity-100 ring-1 ring-gray-300"
+                : "opacity-50 grayscale hover:bg-white hover:opacity-100 hover:grayscale-0"
+            }`}
+          >
+            <span aria-hidden="true">{icon}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 function CitationList({ citations }: { citations: Citation[] }) {
   return (

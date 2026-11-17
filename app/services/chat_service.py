@@ -18,7 +18,7 @@ from app.agents.rag_agent import (
 from app.common.config import settings
 from app.common.constants import LINK_ONLY_RESPONSE, NO_DOCUMENTATION_RESPONSE
 from app.common.trace import preview, trace
-from app.common.turn_report import record
+from app.common.turn_report import TurnReport, attach, record
 from app.prompts.system_prompt import repair_request, search_request, shorten_request
 from app.services.grounding import NOT_SUPPORTED, Verdict, grounding_block, verify
 from app.services.prompt_policy import is_links_only
@@ -198,7 +198,11 @@ class _Failed:
 _END = object()
 
 
-async def _with_heartbeats(source: AsyncIterator, timeout: float) -> AsyncIterator:
+async def _with_heartbeats(
+    source: AsyncIterator,
+    timeout: float,
+    report: TurnReport | None = None,
+) -> AsyncIterator:
     """Passes on `source`'s items, adding a Heartbeat whenever nothing was
     sent for HEARTBEAT_SECONDS (also while the agent is silent: a tool run,
     a reasoning model before its first token, a storage call), and raising
@@ -206,11 +210,13 @@ async def _with_heartbeats(source: AsyncIterator, timeout: float) -> AsyncIterat
 
     `source` runs in a task of its own, so it keeps one context throughout;
     it is cancelled when this generator stops early (client disconnect or
-    timeout)."""
+    timeout). `report`, if given, is attached in that task's context."""
 
     queue: asyncio.Queue = asyncio.Queue()
 
     async def pump() -> None:
+        if report is not None:
+            attach(report)
         try:
             async with contextlib.aclosing(source) as items:
                 async for item in items:
@@ -486,7 +492,8 @@ class ChatService:
         self,
         question: str,
         session_id: str,
-        cancel_signal: threading.Event | None = None
+        cancel_signal: threading.Event | None = None,
+        report: TurnReport | None = None,
     ) -> AsyncIterator[Status | Heartbeat | Answer]:
         """One turn: progress (Status, and a Heartbeat whenever nothing else
         was sent for HEARTBEAT_SECONDS), then exactly one Answer. Raises
@@ -494,11 +501,13 @@ class ChatService:
 
         History is saved once, when the turn completes, with the delivered
         reply; a turn that is cancelled (client disconnect), times out or
-        fails saves nothing."""
+        fails saves nothing. `report` collects the turn's pipeline values
+        (app/common/turn_report.py)."""
 
         async for item in _with_heartbeats(
             self._turn(question, session_id, cancel_signal),
             settings.turn_timeout_seconds,
+            report,
         ):
             yield item
 

@@ -56,7 +56,7 @@ jobs:
           AWS_ECR_SSO_RAG_API_REPO_URI: ${{ secrets.AWS_ECR_SSO_RAG_API_REPO_URI }}
         working-directory: .
         run: |
-          docker build -t ${{ env.AWS_ECR_SSO_RAG_API_REPO_URI }}:latest .
+          docker build --build-arg APP_VERSION=${{ github.sha }} -t ${{ env.AWS_ECR_SSO_RAG_API_REPO_URI }}:latest .
           docker push ${{ env.AWS_ECR_SSO_RAG_API_REPO_URI }}:latest
 
       - name: Build, Tag, and Push UI Image to ECR

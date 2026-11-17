@@ -12,3 +12,7 @@ os.environ.setdefault("KEYCLOAK_ISSUER_URL", "https://keycloak.test/auth/realms/
 os.environ.setdefault("KEYCLOAK_AUDIENCE", "sso-rag-api")
 os.environ.setdefault("KEYCLOAK_AUTHORIZED_PARTY", "sso-rag-client")
 os.environ["AUTH_LOCAL_BYPASS"] = "false"
+# Turns are never stored by the suite; tests/test_feedback.py turns storage
+# on against moto.
+os.environ["ANALYTICS_ENABLED"] = "false"
+os.environ.pop("AWS_ENDPOINT_URL_DYNAMODB", None)
